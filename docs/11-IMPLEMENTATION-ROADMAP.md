@@ -1,0 +1,274 @@
+# July Workspace — Implementation Roadmap
+
+## Phase 0 — Project Foundation
+
+### Deliverables
+- new Rust repository/project;
+- `Cargo.toml`;
+- accepted domain vocabulary;
+- accepted ADRs;
+- canonical tech-stack document;
+- module dependency rules;
+- initial CI.
+
+### Rust foundation
+- Rust edition/toolchain policy documented;
+- minimal dependencies only;
+- `cargo fmt --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`;
+- `cargo test --workspace`;
+- tracing/error conventions;
+- raw provider/ACP types forbidden from `domain`.
+
+### Architecture decisions that must be frozen
+- SQLite is canonical durable storage;
+- ACP is the initial transport;
+- no Beads;
+- no terminal dependency;
+- no headless fallback initially;
+- Room is namespace;
+- Thread is working context;
+- DM is first-class;
+- Agent identity != session;
+- Results cross boundaries, transcripts do not.
+
+### DoD
+A developer can clone the new repository and understand the project without reading any previous July codebase.
+
+---
+
+## Phase 1 — SQLite + Core Domain
+Implement:
+- schema migrations;
+- Agent;
+- Room/member;
+- Conversation/member;
+- Message;
+- WorkItem;
+- Result;
+- Dependency;
+- SessionBinding;
+- Checkpoint/Memory records.
+
+DoD:
+- persistence survives restart;
+- transaction tests pass;
+- domain has no ACP/provider imports;
+- schema begins at the new project baseline; no historical migrations.
+
+---
+
+## Phase 2 — AgentTransport + ACP
+Status: complete. Deterministic acceptance uses a test-only ACP JSON-RPC
+subprocess; provider-authenticated prompt smoke remains opt-in.
+
+Implement:
+- `AgentTransport` trait;
+- `ACPTransport`;
+- `SessionManager`.
+
+Prove:
+- connect;
+- create session;
+- send;
+- streaming events;
+- resume;
+- cancel;
+- close;
+- permission request.
+
+Rust-specific checks:
+- ACP tasks run under Tokio with explicit cancellation;
+- raw ACP SDK types remain inside transport/infrastructure boundaries;
+- streams have a backpressure strategy;
+- errors map into typed July errors.
+
+DoD:
+- no stdout scraping;
+- no terminal-control dependency;
+- session binding persists in SQLite.
+
+---
+
+## Phase 3 — DM MVP
+Implement:
+```text
+july dm <agent>
+```
+
+Features:
+- create/open DM;
+- create/resume remote session;
+- persist messages;
+- direct explicit routing;
+- project-root scoping;
+- restart continuity.
+
+DoD:
+- no July LLM call for explicit target;
+- session resumes after restart;
+- remote-session loss has a defined error/recovery path;
+- token overhead baseline measured against direct agent usage.
+
+---
+
+## Phase 4 — Room + Thread MVP
+Implement:
+- rooms;
+- room membership;
+- thread creation/open;
+- thread members;
+- separate agent session per conversation.
+
+DoD:
+- same agent can join multiple threads without context leakage;
+- room history is not injected wholesale;
+- non-member agents do not receive thread context.
+
+---
+
+## Phase 5 — Agent-to-Agent Messaging
+Implement:
+- agent DM;
+- thread mentions;
+- dynamic member join;
+- offline message persistence/delivery.
+
+DoD:
+- explicit routing is deterministic;
+- no semantic coordinator for explicit recipient;
+- target receives only relevant context/capsule.
+
+---
+
+## Phase 6 — Work / Result / Publish / Dependency
+Implement:
+- WorkItem lifecycle;
+- structured Result;
+- Result version/supersede semantics;
+- Publish;
+- dependency graph;
+- READY propagation.
+
+DoD:
+- Thread A can unblock Thread B;
+- publish transfers structured Result, not transcript;
+- dependency transitions are transactional/idempotent.
+
+---
+
+
+## Phase 6.5 — Agent Deliberation & Decision Protocol
+
+Detailed plan:
+
+```text
+16-AGENT-DELIBERATION-UPGRADE-PLAN.md
+```
+
+Prerequisites:
+
+- Phase 4 — Room + Thread;
+- Phase 5 — Agent-to-Agent Messaging;
+- Phase 6 — Work / Result / Publish / Dependency.
+
+Implement:
+
+- Handoff / ownership negotiation;
+- ACCEPT / REJECT / PARTIAL / DISPUTED;
+- evidence-backed ownership responses;
+- bounded dispute rounds;
+- Proposal + SUPPORT / CHALLENGE / AMEND / REJECT;
+- durable Decision;
+- optional `decision_owner`;
+- Decision → WorkItem conversion;
+- escalation to `NEEDS_DECISION`.
+
+Do not:
+
+- create unrestricted agent debate loops;
+- introduce a generic Meeting framework;
+- require an LLM facilitator;
+- use voting as the default decision mechanism.
+
+DoD:
+
+- two agents can dispute ownership without infinite ping-pong;
+- evidence and provenance survive the discussion;
+- unresolved disputes escalate deterministically;
+- a proposal can become a durable Decision;
+- Decision can generate WorkItems/dependencies;
+- all state survives restart;
+- normal DM/Thread workflows remain unaffected.
+
+---
+
+## Phase 7 — Memory + Session Recovery
+Implement:
+- checkpoint creation;
+- memory promotion;
+- recovery capsule;
+- replacement session generation;
+- bounded recent-message replay.
+
+DoD:
+- remote session can be intentionally deleted;
+- replacement session continues work from durable state;
+- full transcript replay is unnecessary;
+- unverified hypotheses are not promoted automatically.
+
+---
+
+## Phase 8 — CLI / REPL
+Implement:
+```text
+/dm
+/room
+/thread
+/back
+/members
+/status
+/publish
+```
+
+Also support machine-readable `--json` where operationally useful.
+
+DoD:
+- common workflow is faster than manually juggling multiple coding-agent terminals;
+- switching UI context does not merge LLM contexts.
+
+---
+
+## Phase 9 — Packaging / Release
+Implement:
+- release build;
+- macOS target(s) used for development;
+- version/checksum output;
+- safe install/uninstall behavior;
+- optional Homebrew packaging when stable.
+
+DoD:
+- July runs as one release binary;
+- no Python runtime required;
+- SQLite migrations run/check automatically on startup;
+- `july --version` works;
+- uninstall does not remove workspace data accidentally.
+
+---
+
+## Cross-phase metrics
+
+### DM overhead
+Compare July DM token/context overhead with direct agent use.
+
+### Context isolation
+Measure irrelevant-context leakage.
+
+### Recovery efficiency
+Compare recovery capsule size with full transcript size.
+
+### Collaboration efficiency
+Count manual copy/paste/context-switch operations avoided.
+
+### Reliability
+Track failed delivery, lost session, duplicate publish and invalid state transition rates.

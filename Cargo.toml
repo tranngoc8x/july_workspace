@@ -1,0 +1,22 @@
+[package]
+name = "july-workspace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+
+[lib]
+name = "july_workspace"
+path = "src/lib.rs"
+
+[[bin]]
+name = "july"
+path = "src/main.rs"
+
+[dependencies]
+agent-client-protocol = { version = "=2.0.0", default-features = false }
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.19"
+tokio = { version = "=1.53.1", features = ["macros", "rt", "sync", "time"] }
+tracing = "=0.1.44"
+ulid = "=3.0.0"
