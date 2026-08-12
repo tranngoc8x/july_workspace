@@ -16,6 +16,10 @@ pub struct SessionManager<T: AgentTransport> {
 }
 
 impl<T: AgentTransport> SessionManager<T> {
+    pub(super) fn storage(&self) -> &StorageWorker {
+        &self.storage
+    }
+
     pub async fn connect(
         mut transport: T,
         storage: StorageWorker,

@@ -3,6 +3,7 @@
 ## Phase 0 — Project Foundation
 
 ### Deliverables
+
 - new Rust repository/project;
 - `Cargo.toml`;
 - accepted domain vocabulary;
@@ -12,6 +13,7 @@
 - initial CI.
 
 ### Rust foundation
+
 - Rust edition/toolchain policy documented;
 - minimal dependencies only;
 - `cargo fmt --check`;
@@ -21,6 +23,7 @@
 - raw provider/ACP types forbidden from `domain`.
 
 ### Architecture decisions that must be frozen
+
 - SQLite is canonical durable storage;
 - ACP is the initial transport;
 - no Beads;
@@ -33,12 +36,15 @@
 - Results cross boundaries, transcripts do not.
 
 ### DoD
+
 A developer can clone the new repository and understand the project without reading any previous July codebase.
 
 ---
 
 ## Phase 1 — SQLite + Core Domain
+
 Implement:
+
 - schema migrations;
 - Agent;
 - Room/member;
@@ -51,6 +57,7 @@ Implement:
 - Checkpoint/Memory records.
 
 DoD:
+
 - persistence survives restart;
 - transaction tests pass;
 - domain has no ACP/provider imports;
@@ -59,15 +66,18 @@ DoD:
 ---
 
 ## Phase 2 — AgentTransport + ACP
+
 Status: complete. Deterministic acceptance uses a test-only ACP JSON-RPC
 subprocess; provider-authenticated prompt smoke remains opt-in.
 
 Implement:
+
 - `AgentTransport` trait;
 - `ACPTransport`;
 - `SessionManager`.
 
 Prove:
+
 - connect;
 - create session;
 - send;
@@ -78,12 +88,14 @@ Prove:
 - permission request.
 
 Rust-specific checks:
+
 - ACP tasks run under Tokio with explicit cancellation;
 - raw ACP SDK types remain inside transport/infrastructure boundaries;
 - streams have a backpressure strategy;
 - errors map into typed July errors.
 
 DoD:
+
 - no stdout scraping;
 - no terminal-control dependency;
 - session binding persists in SQLite.
@@ -91,12 +103,15 @@ DoD:
 ---
 
 ## Phase 3 — DM MVP
+
 Implement:
+
 ```text
 july dm <agent>
 ```
 
 Features:
+
 - create/open DM;
 - create/resume remote session;
 - persist messages;
@@ -105,6 +120,7 @@ Features:
 - restart continuity.
 
 DoD:
+
 - no July LLM call for explicit target;
 - session resumes after restart;
 - remote-session loss has a defined error/recovery path;
@@ -113,7 +129,9 @@ DoD:
 ---
 
 ## Phase 4 — Room + Thread MVP
+
 Implement:
+
 - rooms;
 - room membership;
 - thread creation/open;
@@ -121,6 +139,7 @@ Implement:
 - separate agent session per conversation.
 
 DoD:
+
 - same agent can join multiple threads without context leakage;
 - room history is not injected wholesale;
 - non-member agents do not receive thread context.
@@ -128,13 +147,16 @@ DoD:
 ---
 
 ## Phase 5 — Agent-to-Agent Messaging
+
 Implement:
+
 - agent DM;
 - thread mentions;
 - dynamic member join;
 - offline message persistence/delivery.
 
 DoD:
+
 - explicit routing is deterministic;
 - no semantic coordinator for explicit recipient;
 - target receives only relevant context/capsule.
@@ -142,7 +164,9 @@ DoD:
 ---
 
 ## Phase 6 — Work / Result / Publish / Dependency
+
 Implement:
+
 - WorkItem lifecycle;
 - structured Result;
 - Result version/supersede semantics;
@@ -151,12 +175,12 @@ Implement:
 - READY propagation.
 
 DoD:
+
 - Thread A can unblock Thread B;
 - publish transfers structured Result, not transcript;
 - dependency transitions are transactional/idempotent.
 
 ---
-
 
 ## Phase 6.5 — Agent Deliberation & Decision Protocol
 
@@ -204,7 +228,9 @@ DoD:
 ---
 
 ## Phase 7 — Memory + Session Recovery
+
 Implement:
+
 - checkpoint creation;
 - memory promotion;
 - recovery capsule;
@@ -212,6 +238,7 @@ Implement:
 - bounded recent-message replay.
 
 DoD:
+
 - remote session can be intentionally deleted;
 - replacement session continues work from durable state;
 - full transcript replay is unnecessary;
@@ -220,7 +247,9 @@ DoD:
 ---
 
 ## Phase 8 — CLI / REPL
+
 Implement:
+
 ```text
 /dm
 /room
@@ -234,13 +263,16 @@ Implement:
 Also support machine-readable `--json` where operationally useful.
 
 DoD:
+
 - common workflow is faster than manually juggling multiple coding-agent terminals;
 - switching UI context does not merge LLM contexts.
 
 ---
 
 ## Phase 9 — Packaging / Release
+
 Implement:
+
 - release build;
 - macOS target(s) used for development;
 - version/checksum output;
@@ -248,6 +280,7 @@ Implement:
 - optional Homebrew packaging when stable.
 
 DoD:
+
 - July runs as one release binary;
 - no Python runtime required;
 - SQLite migrations run/check automatically on startup;
@@ -259,16 +292,21 @@ DoD:
 ## Cross-phase metrics
 
 ### DM overhead
+
 Compare July DM token/context overhead with direct agent use.
 
 ### Context isolation
+
 Measure irrelevant-context leakage.
 
 ### Recovery efficiency
+
 Compare recovery capsule size with full transcript size.
 
 ### Collaboration efficiency
+
 Count manual copy/paste/context-switch operations avoided.
 
 ### Reliability
+
 Track failed delivery, lost session, duplicate publish and invalid state transition rates.

@@ -1,9 +1,9 @@
 use super::{StoreError, records};
 use crate::domain::{
-    Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationMember,
-    Memory, MemoryId, Message, MessageId, PermissionDecision, PermissionOutcome, Publish,
-    PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult,
+    Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
+    ConversationMember, MemberType, Memory, MemoryId, Message, MessageId, PermissionDecision,
+    PermissionOutcome, Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding,
+    SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::path::Path;
@@ -50,6 +50,17 @@ impl SqliteStore {
                     metadata_json, created_at, updated_at
              FROM agents WHERE id = ?1",
             params![id.to_string()],
+            records::agent,
+        )
+    }
+
+    pub fn get_agent_by_name(&self, name: &str) -> Result<Option<Agent>, StoreError> {
+        query_optional(
+            &self.connection,
+            "SELECT id, name, project_root, transport_type, transport_config_json, status,
+                    metadata_json, created_at, updated_at
+             FROM agents WHERE name = ?1",
+            params![name],
             records::agent,
         )
     }
@@ -185,6 +196,86 @@ impl SqliteStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn get_or_create_dm(
+        &mut self,
+        user_id: &str,
+        agent_id: AgentId,
+        now: &str,
+    ) -> Result<Conversation, StoreError> {
+        let conversation = Conversation {
+            id: ConversationId::new(),
+            kind: ConversationKind::Dm,
+            room_id: None,
+            title: None,
+            goal: None,
+            parent_conversation_id: None,
+            origin_conversation_id: None,
+            status: "open".into(),
+            created_at: now.into(),
+            updated_at: now.into(),
+        };
+        let members = [
+            ConversationMember {
+                conversation_id: conversation.id,
+                member_type: MemberType::User,
+                member_id: user_id.into(),
+                joined_at: now.into(),
+                left_at: None,
+            },
+            ConversationMember {
+                conversation_id: conversation.id,
+                member_type: MemberType::Agent,
+                member_id: agent_id.to_string(),
+                joined_at: now.into(),
+                left_at: None,
+            },
+        ];
+        conversation.validate()?;
+        for member in &members {
+            member.validate()?;
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = query_optional(
+            &transaction,
+            "SELECT c.id, c.type, c.room_id, c.title, c.goal, c.parent_conversation_id,
+                    c.origin_conversation_id, c.status, c.created_at, c.updated_at
+             FROM conversations c
+             WHERE c.type = 'dm' AND c.status = 'open'
+               AND EXISTS (
+                   SELECT 1 FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.member_type = 'user'
+                     AND m.member_id = ?1 AND m.left_at IS NULL
+               )
+               AND EXISTS (
+                   SELECT 1 FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.member_type = 'agent'
+                     AND m.member_id = ?2 AND m.left_at IS NULL
+               )
+               AND 2 = (
+                   SELECT COUNT(*) FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.left_at IS NULL
+               )
+             ORDER BY c.created_at, c.id
+             LIMIT 1",
+            params![user_id, agent_id.to_string()],
+            records::conversation,
+        )?;
+        if let Some(existing) = existing {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+
+        insert_conversation(&transaction, &conversation)?;
+        for member in &members {
+            insert_conversation_member(&transaction, member)?;
+        }
+        transaction.commit()?;
+        Ok(conversation)
     }
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
@@ -416,6 +507,24 @@ impl SqliteStore {
              FROM session_bindings
              WHERE conversation_id = ?1 AND agent_id = ?2
                AND status IN ('active', 'disconnected')",
+            params![conversation_id.to_string(), agent_id.to_string()],
+            records::session_binding,
+        )
+    }
+
+    pub fn get_latest_session_binding(
+        &self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+    ) -> Result<Option<SessionBinding>, StoreError> {
+        query_optional(
+            &self.connection,
+            "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
+                    generation, status, created_at, last_used_at
+             FROM session_bindings
+             WHERE conversation_id = ?1 AND agent_id = ?2
+             ORDER BY generation DESC
+             LIMIT 1",
             params![conversation_id.to_string(), agent_id.to_string()],
             records::session_binding,
         )

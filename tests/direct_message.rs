@@ -1,0 +1,711 @@
+use july_workspace::application::{
+    DirectMessageError, DirectMessageEvent, DirectMessagePermissionRequestId, DirectMessageRuntime,
+    DirectMessageRuntimeEvent, DirectMessageService, OpenedDirectMessage,
+};
+use july_workspace::domain::{
+    Agent, AgentId, ConversationId, MemberType, Message, PermissionOption, PermissionOutcome,
+    SessionBinding, SessionBindingId, SessionBindingStatus,
+};
+use july_workspace::runtime::{AgentDirectMessageRuntime, StorageWorker};
+use july_workspace::storage::SqliteStore;
+use july_workspace::transport::{
+    AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionRequestId,
+    PermissionResponse, ResumeSession, SendMessage, SessionCreated, SessionRef, SessionResumed,
+    TransportError, TransportEvent, TransportEvents,
+};
+use serde_json::json;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+const NOW: &str = "2026-08-11T10:00:00Z";
+const LATER: &str = "2026-08-11T11:00:00Z";
+
+struct TestDatabase {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl TestDatabase {
+    fn new() -> Self {
+        let directory =
+            std::env::temp_dir().join(format!("july-dm-runtime-{}", ulid::Ulid::generate()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.db");
+        Self { directory, path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TestDatabase {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[derive(Default)]
+struct ObservedTransport {
+    connections: Vec<AgentConnection>,
+    creates: Vec<CreateSession>,
+    resumes: Vec<ResumeSession>,
+    messages: Vec<SendMessage>,
+    permissions: Vec<PermissionResponse>,
+    shutdowns: usize,
+}
+
+struct FakeTransport {
+    events: Option<tokio::sync::mpsc::Receiver<TransportEvent>>,
+    observed: Arc<Mutex<ObservedTransport>>,
+    resume_lost: bool,
+}
+
+impl FakeTransport {
+    fn new() -> (
+        Self,
+        tokio::sync::mpsc::Sender<TransportEvent>,
+        Arc<Mutex<ObservedTransport>>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let observed = Arc::new(Mutex::new(ObservedTransport::default()));
+        (
+            Self {
+                events: Some(receiver),
+                observed: observed.clone(),
+                resume_lost: false,
+            },
+            sender,
+            observed,
+        )
+    }
+}
+
+impl AgentTransport for FakeTransport {
+    async fn connect(&mut self, agent: &AgentConnection) -> Result<(), TransportError> {
+        self.observed
+            .lock()
+            .unwrap()
+            .connections
+            .push(agent.clone());
+        Ok(())
+    }
+
+    async fn create_session(
+        &mut self,
+        request: CreateSession,
+    ) -> Result<SessionCreated, TransportError> {
+        self.observed.lock().unwrap().creates.push(request.clone());
+        Ok(SessionCreated {
+            session: SessionRef {
+                binding_id: request.binding_id,
+                remote_session_id: "remote-dm".into(),
+            },
+        })
+    }
+
+    async fn resume_session(
+        &mut self,
+        request: ResumeSession,
+    ) -> Result<SessionResumed, TransportError> {
+        self.observed.lock().unwrap().resumes.push(request.clone());
+        if self.resume_lost {
+            Err(TransportError::SessionLost(
+                request.session.remote_session_id,
+            ))
+        } else {
+            Ok(SessionResumed {
+                session: request.session,
+            })
+        }
+    }
+
+    async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError> {
+        self.observed.lock().unwrap().messages.push(request);
+        Ok(())
+    }
+
+    async fn cancel_turn(&mut self, _session: SessionRef) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn respond_permission(
+        &mut self,
+        response: PermissionResponse,
+    ) -> Result<(), TransportError> {
+        self.observed.lock().unwrap().permissions.push(response);
+        Ok(())
+    }
+
+    async fn close_session(&mut self, _session: SessionRef) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TransportError> {
+        self.observed.lock().unwrap().shutdowns += 1;
+        Ok(())
+    }
+
+    fn subscribe(&mut self) -> Result<TransportEvents, TransportError> {
+        self.events
+            .take()
+            .map(TransportEvents::new)
+            .ok_or(TransportError::AlreadySubscribed)
+    }
+}
+
+fn seed_agent(database: &TestDatabase) -> Agent {
+    let agent = Agent {
+        id: Default::default(),
+        name: "codex".into(),
+        project_root: "/workspace/exact root".into(),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    let store = SqliteStore::open(database.path()).unwrap();
+    store.insert_agent(&agent).unwrap();
+    agent
+}
+
+fn runtime(
+    database: &TestDatabase,
+    transport: FakeTransport,
+) -> AgentDirectMessageRuntime<FakeTransport> {
+    AgentDirectMessageRuntime::new(transport, StorageWorker::open(database.path()).unwrap())
+}
+
+#[tokio::test]
+async fn sends_exact_content_and_persists_both_message_directions() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let (transport, events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    let opened = service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+
+    let original = "  preserve me byte-for-byte\n";
+    service
+        .send_message(original.into(), NOW.into())
+        .await
+        .unwrap();
+    assert_eq!(observed.lock().unwrap().messages[0].content, original);
+    assert_eq!(
+        observed.lock().unwrap().connections[0].project_root,
+        PathBuf::from(&agent.project_root)
+    );
+
+    let session = observed.lock().unwrap().messages[0].session.clone();
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: session.clone(),
+            text: "Hello ".into(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::PermissionRequested(PermissionRequest {
+            session: session.clone(),
+            request_id: PermissionRequestId::from("permission-1"),
+            options: vec![PermissionOption {
+                id: "allow".into(),
+                label: "Allow".into(),
+            }],
+        }))
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: session.clone(),
+            text: "Tony".into(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::AgentMessageCompleted { session })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("Hello ".into()))
+    );
+    let request_id = match service.next_event(NOW.into()).await.unwrap() {
+        Some(DirectMessageEvent::PermissionRequested {
+            request_id,
+            options,
+        }) => {
+            assert_eq!(options[0].id, "allow");
+            request_id
+        }
+        other => panic!("unexpected permission event: {other:?}"),
+    };
+    service
+        .respond_permission(
+            request_id,
+            PermissionOutcome::Selected("allow".into()),
+            NOW.into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("Tony".into()))
+    );
+    let completed = match service.next_event(NOW.into()).await.unwrap() {
+        Some(DirectMessageEvent::MessageCompleted(message)) => message,
+        other => panic!("unexpected completion event: {other:?}"),
+    };
+    assert_eq!(completed.body, "Hello Tony");
+    assert_eq!(completed.sender_type, MemberType::Agent);
+    assert_eq!(completed.sender_id, agent.id.to_string());
+
+    service.shutdown(LATER.into()).await.unwrap();
+    let store = SqliteStore::open(database.path()).unwrap();
+    let messages = store.list_messages(opened.conversation_id).unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].body, original);
+    assert_eq!(
+        messages[0].metadata,
+        json!({"july": {"schema": 1, "channel": "dm", "direction": "outbound"}})
+    );
+    assert_eq!(messages[1], completed);
+    assert_eq!(
+        messages[1].metadata,
+        json!({"july": {"schema": 1, "channel": "dm", "direction": "inbound"}})
+    );
+}
+
+#[tokio::test]
+async fn restart_reuses_dm_and_resumes_without_replaying_history() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let (first_transport, _events, first_observed) = FakeTransport::new();
+    let mut first = DirectMessageService::new(runtime(&database, first_transport));
+    let first_open = first
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    first
+        .send_message("remembered".into(), NOW.into())
+        .await
+        .unwrap();
+    let binding_id = first_observed.lock().unwrap().creates[0].binding_id;
+    first.shutdown(NOW.into()).await.unwrap();
+
+    let (second_transport, _events, second_observed) = FakeTransport::new();
+    let mut second = DirectMessageService::new(runtime(&database, second_transport));
+    let second_open = second
+        .open("tony".into(), "codex".into(), LATER.into())
+        .await
+        .unwrap();
+
+    assert_eq!(second_open.conversation_id, first_open.conversation_id);
+    assert_eq!(second_open.messages.len(), 1);
+    {
+        let observed = second_observed.lock().unwrap();
+        assert!(observed.creates.is_empty());
+        assert!(
+            observed.messages.is_empty(),
+            "history was replayed to the agent"
+        );
+        assert_eq!(observed.resumes[0].session.binding_id, binding_id);
+        assert_eq!(observed.resumes[0].session.remote_session_id, "remote-dm");
+        assert_eq!(
+            observed.resumes[0].project_root,
+            PathBuf::from(&agent.project_root)
+        );
+    }
+    second.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn lost_or_closed_binding_is_not_replaced() {
+    for status in [SessionBindingStatus::Lost, SessionBindingStatus::Closed] {
+        let database = TestDatabase::new();
+        let agent = seed_agent(&database);
+        let mut store = SqliteStore::open(database.path()).unwrap();
+        let dm = store.get_or_create_dm("tony", agent.id, NOW).unwrap();
+        let binding = SessionBinding {
+            id: SessionBindingId::new(),
+            conversation_id: dm.id,
+            agent_id: agent.id,
+            transport_type: "acp".into(),
+            remote_session_id: Some("remote-old".into()),
+            generation: 1,
+            status,
+            created_at: NOW.into(),
+            last_used_at: NOW.into(),
+        };
+        store.insert_session_binding(&binding).unwrap();
+        drop(store);
+        let (transport, _events, observed) = FakeTransport::new();
+        let mut service = DirectMessageService::new(runtime(&database, transport));
+
+        let error = service
+            .open("tony".into(), "codex".into(), LATER.into())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if status == SessionBindingStatus::Lost {
+                DirectMessageError::SessionLost
+            } else {
+                DirectMessageError::SessionUnavailable(SessionBindingStatus::Closed)
+            }
+        );
+        assert!(observed.lock().unwrap().connections.is_empty());
+        service.shutdown(LATER.into()).await.unwrap();
+        let store = SqliteStore::open(database.path()).unwrap();
+        assert_eq!(
+            store.get_latest_session_binding(dm.id, agent.id).unwrap(),
+            Some(binding)
+        );
+    }
+}
+
+#[tokio::test]
+async fn active_binding_without_remote_session_becomes_lost() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let dm = store.get_or_create_dm("tony", agent.id, NOW).unwrap();
+    let binding = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: dm.id,
+        agent_id: agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: None,
+        generation: 1,
+        status: SessionBindingStatus::Active,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    store.insert_session_binding(&binding).unwrap();
+    drop(store);
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+
+    assert_eq!(
+        service
+            .open("tony".into(), "codex".into(), LATER.into())
+            .await
+            .unwrap_err(),
+        DirectMessageError::SessionLost
+    );
+    assert!(observed.lock().unwrap().connections.is_empty());
+    service.shutdown(LATER.into()).await.unwrap();
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(
+        store
+            .get_latest_session_binding(dm.id, agent.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Lost
+    );
+}
+
+#[tokio::test]
+async fn provider_missing_remote_session_marks_the_same_binding_lost() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let dm = store.get_or_create_dm("tony", agent.id, NOW).unwrap();
+    let binding = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: dm.id,
+        agent_id: agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: Some("remote-missing".into()),
+        generation: 1,
+        status: SessionBindingStatus::Disconnected,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    store.insert_session_binding(&binding).unwrap();
+    drop(store);
+    let (mut transport, _events, observed) = FakeTransport::new();
+    transport.resume_lost = true;
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+
+    assert_eq!(
+        service
+            .open("tony".into(), "codex".into(), LATER.into())
+            .await
+            .unwrap_err(),
+        DirectMessageError::SessionLost
+    );
+    assert_eq!(observed.lock().unwrap().resumes.len(), 1);
+    service.shutdown(LATER.into()).await.unwrap();
+    let store = SqliteStore::open(database.path()).unwrap();
+    let latest = store
+        .get_latest_session_binding(dm.id, agent.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, binding.id);
+    assert_eq!(latest.generation, 1);
+    assert_eq!(latest.status, SessionBindingStatus::Lost);
+}
+
+#[tokio::test]
+async fn rejects_blank_messages_and_foreign_session_events() {
+    let database = TestDatabase::new();
+    seed_agent(&database);
+    let (transport, events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.send_message(" \n".into(), NOW.into()).await,
+        Err(DirectMessageError::EmptyMessage)
+    );
+    assert!(observed.lock().unwrap().messages.is_empty());
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: SessionRef {
+                binding_id: SessionBindingId::new(),
+                remote_session_id: "remote-dm".into(),
+            },
+            text: "foreign".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::SessionMismatch)
+    );
+    service.shutdown(LATER.into()).await.unwrap();
+    service.shutdown(LATER.into()).await.unwrap();
+    assert_eq!(observed.lock().unwrap().shutdowns, 1);
+}
+
+#[derive(Default)]
+struct PersistenceObserved {
+    attempts: Vec<Message>,
+    persisted: Vec<Message>,
+    event_reads: usize,
+    shutdowns: usize,
+}
+
+#[derive(Default)]
+struct FailingPersistencePort {
+    opened: Option<OpenedDirectMessage>,
+    events: VecDeque<DirectMessageRuntimeEvent>,
+    observed: Arc<Mutex<PersistenceObserved>>,
+    fail_next_persist: bool,
+}
+
+impl DirectMessageRuntime for FailingPersistencePort {
+    async fn open(
+        &mut self,
+        _user_id: String,
+        _agent_name: String,
+        _opened_at: String,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        self.opened.take().ok_or(DirectMessageError::AlreadyOpen)
+    }
+
+    async fn persist_message(&mut self, message: Message) -> Result<(), DirectMessageError> {
+        self.observed.lock().unwrap().attempts.push(message.clone());
+        if self.fail_next_persist {
+            self.fail_next_persist = false;
+            Err(DirectMessageError::Runtime("fixture write failure".into()))
+        } else {
+            self.observed.lock().unwrap().persisted.push(message);
+            Ok(())
+        }
+    }
+
+    async fn send_exact(&mut self, _content: String) -> Result<(), DirectMessageError> {
+        Ok(())
+    }
+
+    async fn next_runtime_event(
+        &mut self,
+        _observed_at: String,
+    ) -> Result<Option<DirectMessageRuntimeEvent>, DirectMessageError> {
+        self.observed.lock().unwrap().event_reads += 1;
+        Ok(self.events.pop_front())
+    }
+
+    async fn respond_permission(
+        &mut self,
+        _request_id: DirectMessagePermissionRequestId,
+        _outcome: PermissionOutcome,
+        _decided_at: String,
+    ) -> Result<(), DirectMessageError> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self, _stopped_at: String) -> Result<(), DirectMessageError> {
+        self.observed.lock().unwrap().shutdowns += 1;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn completed_message_persistence_retries_before_reading_another_event() {
+    let agent_id = AgentId::new();
+    let observed = Arc::new(Mutex::new(PersistenceObserved::default()));
+    let port = FailingPersistencePort {
+        opened: Some(OpenedDirectMessage {
+            conversation_id: ConversationId::new(),
+            agent_id,
+            agent_name: "codex".into(),
+            messages: vec![],
+        }),
+        events: VecDeque::from([
+            DirectMessageRuntimeEvent::TextDelta("answer".into()),
+            DirectMessageRuntimeEvent::AgentMessageCompleted,
+            DirectMessageRuntimeEvent::TextDelta("must remain queued".into()),
+        ]),
+        observed: observed.clone(),
+        fail_next_persist: true,
+    };
+    let mut service = DirectMessageService::new(port);
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("answer".into()))
+    );
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::Runtime("fixture write failure".into()))
+    );
+
+    let completed = service.next_event(LATER.into()).await.unwrap().unwrap();
+    let DirectMessageEvent::MessageCompleted(message) = completed else {
+        panic!("expected completed message");
+    };
+    assert_eq!(message.body, "answer");
+    assert_eq!(message.sender_id, agent_id.to_string());
+    assert_eq!(message.created_at, NOW);
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.event_reads, 2);
+    assert_eq!(observed.attempts, vec![message.clone(), message.clone()]);
+    assert_eq!(observed.persisted, vec![message]);
+}
+
+#[tokio::test]
+async fn shutdown_retries_pending_completion_before_stopping_runtime() {
+    let agent_id = AgentId::new();
+    let observed = Arc::new(Mutex::new(PersistenceObserved::default()));
+    let port = FailingPersistencePort {
+        opened: Some(OpenedDirectMessage {
+            conversation_id: ConversationId::new(),
+            agent_id,
+            agent_name: "codex".into(),
+            messages: vec![],
+        }),
+        events: VecDeque::from([
+            DirectMessageRuntimeEvent::TextDelta("answer".into()),
+            DirectMessageRuntimeEvent::AgentMessageCompleted,
+        ]),
+        observed: observed.clone(),
+        fail_next_persist: true,
+    };
+    let mut service = DirectMessageService::new(port);
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    service.next_event(NOW.into()).await.unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::Runtime("fixture write failure".into()))
+    );
+
+    service.shutdown(LATER.into()).await.unwrap();
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.shutdowns, 1);
+    assert_eq!(observed.attempts.len(), 2);
+    assert_eq!(observed.attempts[0], observed.attempts[1]);
+    assert_eq!(observed.persisted, vec![observed.attempts[0].clone()]);
+    assert_eq!(observed.persisted[0].body, "answer");
+    assert_eq!(observed.persisted[0].sender_id, agent_id.to_string());
+    assert_eq!(observed.persisted[0].created_at, NOW);
+}
+
+#[tokio::test]
+async fn foreign_session_error_does_not_clear_valid_accumulated_text() {
+    let database = TestDatabase::new();
+    seed_agent(&database);
+    let (transport, events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    let session = SessionRef {
+        binding_id: observed.lock().unwrap().creates[0].binding_id,
+        remote_session_id: "remote-dm".into(),
+    };
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: session.clone(),
+            text: "Hello ".into(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: SessionRef {
+                binding_id: SessionBindingId::new(),
+                remote_session_id: "remote-dm".into(),
+            },
+            text: "foreign".into(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: session.clone(),
+            text: "Tony".into(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::AgentMessageCompleted { session })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("Hello ".into()))
+    );
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::SessionMismatch)
+    );
+    assert_eq!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("Tony".into()))
+    );
+    assert!(matches!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::MessageCompleted(ref message)) if message.body == "Hello Tony"
+    ));
+    service.shutdown(LATER.into()).await.unwrap();
+}
+
+#[test]
+fn application_dm_types_are_transport_neutral() {
+    let source = include_str!("../src/application/dm.rs");
+    assert!(!source.contains("agent_client_protocol"));
+    assert!(!source.contains("crate::transport"));
+    assert!(!std::any::type_name::<DirectMessagePermissionRequestId>().contains("acp"));
+    let _conversation_id: Option<ConversationId> = None;
+}

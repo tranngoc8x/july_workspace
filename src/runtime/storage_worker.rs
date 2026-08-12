@@ -1,7 +1,7 @@
 use super::RuntimeError;
 use crate::domain::{
-    AgentId, ConversationId, PermissionDecision, SessionBinding, SessionBindingId,
-    SessionBindingStatus,
+    Agent, AgentId, Conversation, ConversationId, Message, PermissionDecision, SessionBinding,
+    SessionBindingId, SessionBindingStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -11,8 +11,25 @@ use tokio::sync::{mpsc, oneshot};
 const STORAGE_CAPACITY: usize = 64;
 
 enum Command {
+    GetAgentByName(String, oneshot::Sender<Result<Option<Agent>, StoreError>>),
+    GetOrCreateDm(
+        String,
+        AgentId,
+        String,
+        oneshot::Sender<Result<Conversation, StoreError>>,
+    ),
+    InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
+    ListMessages(
+        ConversationId,
+        oneshot::Sender<Result<Vec<Message>, StoreError>>,
+    ),
     InsertBinding(SessionBinding, oneshot::Sender<Result<(), StoreError>>),
     GetCurrentBinding(
+        ConversationId,
+        AgentId,
+        oneshot::Sender<Result<Option<SessionBinding>, StoreError>>,
+    ),
+    GetLatestBinding(
         ConversationId,
         AgentId,
         oneshot::Sender<Result<Option<SessionBinding>, StoreError>>,
@@ -74,6 +91,34 @@ impl StorageWorker {
         })
     }
 
+    pub async fn get_agent_by_name(&self, name: String) -> Result<Option<Agent>, RuntimeError> {
+        self.request(|reply| Command::GetAgentByName(name, reply))
+            .await
+    }
+
+    pub async fn get_or_create_dm(
+        &self,
+        user_id: String,
+        agent_id: AgentId,
+        now: String,
+    ) -> Result<Conversation, RuntimeError> {
+        self.request(|reply| Command::GetOrCreateDm(user_id, agent_id, now, reply))
+            .await
+    }
+
+    pub async fn insert_message(&self, message: Message) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::InsertMessage(message, reply))
+            .await
+    }
+
+    pub async fn list_messages(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<Message>, RuntimeError> {
+        self.request(|reply| Command::ListMessages(conversation_id, reply))
+            .await
+    }
+
     pub async fn insert_session_binding(
         &self,
         binding: SessionBinding,
@@ -88,6 +133,15 @@ impl StorageWorker {
         agent_id: AgentId,
     ) -> Result<Option<SessionBinding>, RuntimeError> {
         self.request(|reply| Command::GetCurrentBinding(conversation_id, agent_id, reply))
+            .await
+    }
+
+    pub async fn get_latest_session_binding(
+        &self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+    ) -> Result<Option<SessionBinding>, RuntimeError> {
+        self.request(|reply| Command::GetLatestBinding(conversation_id, agent_id, reply))
             .await
     }
 
@@ -179,14 +233,29 @@ impl Drop for StorageWorker {
     }
 }
 
-fn run(store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
+fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
     while let Some(command) = commands.blocking_recv() {
         match command {
+            Command::GetAgentByName(name, reply) => {
+                let _ = reply.send(store.get_agent_by_name(&name));
+            }
+            Command::GetOrCreateDm(user_id, agent_id, now, reply) => {
+                let _ = reply.send(store.get_or_create_dm(&user_id, agent_id, &now));
+            }
+            Command::InsertMessage(message, reply) => {
+                let _ = reply.send(store.insert_message(&message));
+            }
+            Command::ListMessages(conversation_id, reply) => {
+                let _ = reply.send(store.list_messages(conversation_id));
+            }
             Command::InsertBinding(binding, reply) => {
                 let _ = reply.send(store.insert_session_binding(&binding));
             }
             Command::GetCurrentBinding(conversation_id, agent_id, reply) => {
                 let _ = reply.send(store.get_current_session_binding(conversation_id, agent_id));
+            }
+            Command::GetLatestBinding(conversation_id, agent_id, reply) => {
+                let _ = reply.send(store.get_latest_session_binding(conversation_id, agent_id));
             }
             Command::ListCurrentBindings(agent_id, reply) => {
                 let _ = reply.send(store.list_current_session_bindings_for_agent(agent_id));
