@@ -105,9 +105,9 @@ fn full_graph_round_trips_after_reopen() {
         goal: Some("Persist the whole graph".into()),
         parent_conversation_id: Some(direct.id),
         origin_conversation_id: Some(direct.id),
-        status: "working".into(),
+        status: "open".into(),
         created_at: CREATED.into(),
-        updated_at: LATER.into(),
+        updated_at: CREATED.into(),
     };
     let conversation_member = ConversationMember {
         conversation_id: thread.id,
@@ -140,13 +140,13 @@ fn full_graph_round_trips_after_reopen() {
     let upstream = WorkItem {
         id: Default::default(),
         conversation_id: thread.id,
-        title: "Implement storage".into(),
-        goal: Some("Durable records".into()),
-        status: WorkStatus::Working,
-        owner_agent_id: Some(worker.id),
+        title: "Storage rollout".into(),
+        goal: Some("Persist the whole graph".into()),
+        status: WorkStatus::Open,
+        owner_agent_id: None,
         is_primary: true,
         created_at: CREATED.into(),
-        updated_at: LATER.into(),
+        updated_at: CREATED.into(),
         completed_at: None,
     };
     let downstream = WorkItem {
@@ -241,18 +241,21 @@ fn full_graph_round_trips_after_reopen() {
     };
 
     {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         store.insert_agent(&worker).unwrap();
         store.insert_room(&operations).unwrap();
-        store.insert_room_member(&room_member).unwrap();
-        store.insert_conversation(&direct).unwrap();
-        store.insert_conversation(&thread).unwrap();
         store
-            .insert_conversation_member(&conversation_member)
+            .add_room_member(operations.id, worker.id, Some("owner"), CREATED)
+            .unwrap();
+        store.insert_conversation(&direct).unwrap();
+        store
+            .create_thread_with_primary_work(&thread, upstream.id, "tony", &[worker.id])
+            .unwrap();
+        store
+            .remove_thread_member(thread.id, worker.id, LATER)
             .unwrap();
         store.insert_message(&null_message).unwrap();
         store.insert_message(&json_message).unwrap();
-        store.insert_work_item(&upstream).unwrap();
         store.insert_work_item(&downstream).unwrap();
         store.insert_work_dependency(&dependency).unwrap();
         store.insert_work_result(&first_result).unwrap();
@@ -279,7 +282,10 @@ fn full_graph_round_trips_after_reopen() {
     assert_eq!(
         store
             .list_conversation_members(conversation_member.conversation_id)
-            .unwrap(),
+            .unwrap()
+            .into_iter()
+            .filter(|member| member.member_type == MemberType::Agent)
+            .collect::<Vec<_>>(),
         vec![conversation_member]
     );
     assert_eq!(
@@ -365,7 +371,7 @@ fn agent_update_persists_and_duplicate_name_is_rejected() {
 #[test]
 fn same_agent_can_join_multiple_rooms() {
     let database = TestDatabase::new();
-    let store = SqliteStore::open(database.path()).unwrap();
+    let mut store = SqliteStore::open(database.path()).unwrap();
     let worker = agent("multi-room-worker");
     let first_room = room("first-room");
     let second_room = room("second-room");
@@ -389,8 +395,12 @@ fn same_agent_can_join_multiple_rooms() {
     store.insert_agent(&worker).unwrap();
     store.insert_room(&first_room).unwrap();
     store.insert_room(&second_room).unwrap();
-    store.insert_room_member(&first_membership).unwrap();
-    store.insert_room_member(&second_membership).unwrap();
+    store
+        .add_room_member(first_room.id, worker.id, None, CREATED)
+        .unwrap();
+    store
+        .add_room_member(second_room.id, worker.id, Some("reviewer"), LATER)
+        .unwrap();
 
     assert_eq!(
         store.list_room_members(first_room.id).unwrap(),
@@ -543,19 +553,7 @@ fn room_batch_rejects_member_for_a_different_room_before_inserting_parent() {
 #[test]
 fn conversation_batch_rolls_back_parent_when_a_member_insert_fails() {
     let database = TestDatabase::new();
-    let parent_room = room("conversation-batch-room");
-    let parent = Conversation {
-        id: ConversationId::new(),
-        kind: ConversationKind::Thread,
-        room_id: Some(parent_room.id),
-        title: Some("Atomic conversation".into()),
-        goal: None,
-        parent_conversation_id: None,
-        origin_conversation_id: None,
-        status: "open".into(),
-        created_at: CREATED.into(),
-        updated_at: CREATED.into(),
-    };
+    let parent = dm_conversation();
     let duplicate = ConversationMember {
         conversation_id: parent.id,
         member_type: MemberType::User,
@@ -566,7 +564,6 @@ fn conversation_batch_rolls_back_parent_when_a_member_insert_fails() {
     };
     let members = [duplicate.clone(), duplicate];
     let mut store = SqliteStore::open(database.path()).unwrap();
-    store.insert_room(&parent_room).unwrap();
 
     assert!(
         store
@@ -625,16 +622,11 @@ fn conversation_batch_rejects_member_for_a_different_conversation_before_inserti
     };
     let mut store = SqliteStore::open(database.path()).unwrap();
     assert_eq!(store.get_conversation(parent.id).unwrap(), None);
-    store
-        .insert_conversation_with_members(&parent, std::slice::from_ref(&valid_member))
-        .unwrap();
-    assert_eq!(store.get_conversation(parent.id).unwrap(), Some(parent));
-    assert_eq!(
-        store
-            .list_conversation_members(valid_member.conversation_id)
-            .unwrap(),
-        vec![valid_member]
-    );
+    assert!(matches!(
+        store.insert_conversation_with_members(&parent, std::slice::from_ref(&valid_member)),
+        Err(StoreError::ThreadAggregateRequired(id)) if id == parent.id
+    ));
+    assert_eq!(store.get_conversation(parent.id).unwrap(), None);
 }
 
 #[test]

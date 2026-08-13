@@ -4,8 +4,10 @@ use crate::domain::{
     ConversationMember, MemberType, Memory, MemoryId, Message, MessageId, PermissionDecision,
     PermissionOutcome, Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding,
     SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult,
+    WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -95,6 +97,32 @@ impl SqliteStore {
         insert_room(&self.connection, room)
     }
 
+    pub fn create_room(&mut self, room: &Room) -> Result<(), StoreError> {
+        room.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1)",
+            params![room.id.to_string()],
+            |row| row.get(0),
+        )?;
+        if id_exists {
+            return Err(StoreError::RoomIdConflict(room.id));
+        }
+        let name_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rooms WHERE name = ?1)",
+            params![room.name],
+            |row| row.get(0),
+        )?;
+        if name_exists {
+            return Err(StoreError::RoomNameConflict(room.name.clone()));
+        }
+        insert_room(&transaction, room)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn get_room(&self, id: RoomId) -> Result<Option<Room>, StoreError> {
         query_optional(
             &self.connection,
@@ -105,8 +133,24 @@ impl SqliteStore {
         )
     }
 
-    pub fn insert_room_member(&self, member: &RoomMember) -> Result<(), StoreError> {
-        insert_room_member(&self.connection, member)
+    pub fn get_room_by_name(&self, name: &str) -> Result<Option<Room>, StoreError> {
+        query_optional(
+            &self.connection,
+            "SELECT id, name, description, status, created_at, updated_at
+             FROM rooms WHERE name = ?1",
+            params![name],
+            records::room,
+        )
+    }
+
+    pub fn list_rooms(&self) -> Result<Vec<Room>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, name, description, status, created_at, updated_at
+             FROM rooms ORDER BY name, id",
+            [],
+            records::room,
+        )
     }
 
     pub fn list_room_members(&self, room_id: RoomId) -> Result<Vec<RoomMember>, StoreError> {
@@ -117,6 +161,81 @@ impl SqliteStore {
             params![room_id.to_string()],
             records::room_member,
         )
+    }
+
+    pub fn add_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        role: Option<&str>,
+        now: &str,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM room_members
+                WHERE room_id = ?1 AND agent_id = ?2 AND left_at IS NULL
+            )",
+            params![room_id.to_string(), agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if active {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        require_active_room(&transaction, room_id)?;
+        require_active_agent(&transaction, agent_id)?;
+        let generation = next_room_membership_generation(&transaction, room_id, agent_id)?;
+        insert_room_member(
+            &transaction,
+            &RoomMember {
+                room_id,
+                agent_id,
+                role: role.map(str::to_owned),
+                generation,
+                joined_at: now.into(),
+                left_at: None,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn remove_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        now: &str,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_room(&transaction, room_id)?;
+        require_agent(&transaction, agent_id)?;
+        let blocked: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM conversation_members member
+                JOIN conversations conversation ON conversation.id = member.conversation_id
+                WHERE conversation.type = 'thread' AND conversation.room_id = ?1
+                  AND member.member_type = 'agent' AND member.member_id = ?2
+                  AND member.left_at IS NULL
+            )",
+            params![room_id.to_string(), agent_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if blocked {
+            return Err(StoreError::RoomRemovalBlocked { room_id, agent_id });
+        }
+        let changed = transaction.execute(
+            "UPDATE room_members SET left_at = ?3
+             WHERE room_id = ?1 AND agent_id = ?2 AND left_at IS NULL",
+            params![room_id.to_string(), agent_id.to_string(), now],
+        )? != 0;
+        transaction.commit()?;
+        Ok(changed)
     }
 
     pub fn insert_room_with_members(
@@ -130,11 +249,21 @@ impl SqliteStore {
                 found: member.room_id,
             });
         }
+        if room.status != "active" {
+            return Err(StoreError::RoomInactive(room.id));
+        }
+        if members
+            .iter()
+            .any(|member| member.generation != 1 || member.left_at.is_some())
+        {
+            return Err(StoreError::MembershipTransitionRequired("room membership"));
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         insert_room(&transaction, room)?;
         for member in members {
+            require_active_agent(&transaction, member.agent_id)?;
             insert_room_member(&transaction, member)?;
         }
         transaction.commit()?;
@@ -142,6 +271,9 @@ impl SqliteStore {
     }
 
     pub fn insert_conversation(&self, conversation: &Conversation) -> Result<(), StoreError> {
+        if conversation.kind == ConversationKind::Thread {
+            return Err(StoreError::ThreadAggregateRequired(conversation.id));
+        }
         insert_conversation(&self.connection, conversation)
     }
 
@@ -156,11 +288,28 @@ impl SqliteStore {
         )
     }
 
-    pub fn insert_conversation_member(
-        &self,
-        member: &ConversationMember,
-    ) -> Result<(), StoreError> {
-        insert_conversation_member(&self.connection, member)
+    pub fn get_thread(&self, id: ConversationId) -> Result<Option<Conversation>, StoreError> {
+        query_optional(
+            &self.connection,
+            "SELECT id, type, room_id, title, goal, parent_conversation_id,
+                    origin_conversation_id, status, created_at, updated_at
+             FROM conversations WHERE id = ?1 AND type = 'thread'",
+            params![id.to_string()],
+            records::conversation,
+        )
+    }
+
+    pub fn list_threads(&self, room_id: RoomId) -> Result<Vec<Conversation>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, type, room_id, title, goal, parent_conversation_id,
+                    origin_conversation_id, status, created_at, updated_at
+             FROM conversations
+             WHERE type = 'thread' AND room_id = ?1
+             ORDER BY created_at, id",
+            params![room_id.to_string()],
+            records::conversation,
+        )
     }
 
     pub fn list_conversation_members(
@@ -177,6 +326,163 @@ impl SqliteStore {
         )
     }
 
+    pub fn add_thread_member(
+        &mut self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+        now: &str,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let member_id = agent_id.to_string();
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_members
+                WHERE conversation_id = ?1 AND member_type = 'agent'
+                  AND member_id = ?2 AND left_at IS NULL
+            )",
+            params![conversation_id.to_string(), member_id],
+            |row| row.get(0),
+        )?;
+        if active {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let thread = require_open_thread(&transaction, conversation_id)?;
+        let room_id = thread.room_id.expect("validated thread has a room");
+        require_active_room(&transaction, room_id)?;
+        require_active_agent(&transaction, agent_id)?;
+        require_active_room_membership(&transaction, room_id, agent_id)?;
+        let generation = next_thread_membership_generation(
+            &transaction,
+            conversation_id,
+            MemberType::Agent,
+            &member_id,
+        )?;
+        insert_conversation_member(
+            &transaction,
+            &ConversationMember {
+                conversation_id,
+                member_type: MemberType::Agent,
+                member_id,
+                generation,
+                joined_at: now.into(),
+                left_at: None,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn remove_thread_member(
+        &mut self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+        now: &str,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_thread(&transaction, conversation_id)?;
+        require_agent(&transaction, agent_id)?;
+        let changed = transaction.execute(
+            "UPDATE conversation_members SET left_at = ?3
+             WHERE conversation_id = ?1 AND member_type = 'agent'
+               AND member_id = ?2 AND left_at IS NULL",
+            params![conversation_id.to_string(), agent_id.to_string(), now],
+        )? != 0;
+        transaction.commit()?;
+        Ok(changed)
+    }
+
+    pub fn create_thread_with_primary_work(
+        &mut self,
+        thread: &Conversation,
+        primary_work_id: WorkItemId,
+        user_id: &str,
+        initial_agents: &[AgentId],
+    ) -> Result<WorkItem, StoreError> {
+        thread.validate()?;
+        if thread.kind != ConversationKind::Thread {
+            return Err(StoreError::NotThread(thread.id));
+        }
+        if thread.status != "open" {
+            return Err(StoreError::ThreadNotOpen(thread.id));
+        }
+        let room_id = thread.room_id.expect("validated thread has a room");
+        let user = ConversationMember {
+            conversation_id: thread.id,
+            member_type: MemberType::User,
+            member_id: user_id.into(),
+            generation: 1,
+            joined_at: thread.created_at.clone(),
+            left_at: None,
+        };
+        user.validate()?;
+        let work = WorkItem {
+            id: primary_work_id,
+            conversation_id: thread.id,
+            title: thread.title.clone().expect("validated thread has a title"),
+            goal: thread.goal.clone(),
+            status: WorkStatus::Open,
+            owner_agent_id: None,
+            is_primary: true,
+            created_at: thread.created_at.clone(),
+            updated_at: thread.created_at.clone(),
+            completed_at: None,
+        };
+        work.validate()?;
+        let initial_agents: BTreeSet<_> = initial_agents.iter().copied().collect();
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let thread_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+            params![thread.id.to_string()],
+            |row| row.get(0),
+        )?;
+        if thread_exists {
+            return Err(StoreError::ThreadIdConflict(thread.id));
+        }
+        require_active_room(&transaction, room_id)?;
+        for agent_id in &initial_agents {
+            require_active_agent(&transaction, *agent_id)?;
+            require_active_room_membership(&transaction, room_id, *agent_id)?;
+        }
+
+        insert_conversation(&transaction, thread)?;
+        insert_conversation_member(&transaction, &user)?;
+        for agent_id in initial_agents {
+            insert_conversation_member(
+                &transaction,
+                &ConversationMember {
+                    conversation_id: thread.id,
+                    member_type: MemberType::Agent,
+                    member_id: agent_id.to_string(),
+                    generation: 1,
+                    joined_at: thread.created_at.clone(),
+                    left_at: None,
+                },
+            )?;
+        }
+        if let Err(error) = insert_work_item(&transaction, &work) {
+            let work_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM work_items WHERE id = ?1)",
+                params![primary_work_id.to_string()],
+                |row| row.get(0),
+            )?;
+            return if work_exists {
+                Err(StoreError::PrimaryWorkIdConflict(primary_work_id))
+            } else {
+                Err(error)
+            };
+        }
+        transaction.commit()?;
+        Ok(work)
+    }
+
     pub fn insert_conversation_with_members(
         &mut self,
         conversation: &Conversation,
@@ -190,6 +496,9 @@ impl SqliteStore {
                 expected: conversation.id,
                 found: member.conversation_id,
             });
+        }
+        if conversation.kind == ConversationKind::Thread {
+            return Err(StoreError::ThreadAggregateRequired(conversation.id));
         }
         let transaction = self
             .connection
@@ -341,26 +650,7 @@ impl SqliteStore {
     }
 
     pub fn insert_work_item(&self, work_item: &WorkItem) -> Result<(), StoreError> {
-        work_item.validate()?;
-        self.connection.execute(
-            "INSERT INTO work_items(
-                id, conversation_id, title, goal, status, owner_agent_id,
-                is_primary, created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                work_item.id.to_string(),
-                work_item.conversation_id.to_string(),
-                work_item.title,
-                work_item.goal,
-                work_item.status.to_string(),
-                work_item.owner_agent_id.map(|id| id.to_string()),
-                work_item.is_primary,
-                work_item.created_at,
-                work_item.updated_at,
-                work_item.completed_at,
-            ],
-        )?;
-        Ok(())
+        insert_work_item(&self.connection, work_item)
     }
 
     pub fn get_work_item(&self, id: WorkItemId) -> Result<Option<WorkItem>, StoreError> {
@@ -811,6 +1101,167 @@ fn insert_conversation_member(
         ],
     )?;
     Ok(())
+}
+
+fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(), StoreError> {
+    work_item.validate()?;
+    connection.execute(
+        "INSERT INTO work_items(
+            id, conversation_id, title, goal, status, owner_agent_id,
+            is_primary, created_at, updated_at, completed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            work_item.id.to_string(),
+            work_item.conversation_id.to_string(),
+            work_item.title,
+            work_item.goal,
+            work_item.status.to_string(),
+            work_item.owner_agent_id.map(|id| id.to_string()),
+            work_item.is_primary,
+            work_item.created_at,
+            work_item.updated_at,
+            work_item.completed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn require_room(connection: &Connection, room_id: RoomId) -> Result<String, StoreError> {
+    connection
+        .query_row(
+            "SELECT status FROM rooms WHERE id = ?1",
+            params![room_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::RoomNotFound(room_id),
+            error => error.into(),
+        })
+}
+
+fn require_active_room(connection: &Connection, room_id: RoomId) -> Result<(), StoreError> {
+    if require_room(connection, room_id)? == "active" {
+        Ok(())
+    } else {
+        Err(StoreError::RoomInactive(room_id))
+    }
+}
+
+fn require_agent(connection: &Connection, agent_id: AgentId) -> Result<String, StoreError> {
+    connection
+        .query_row(
+            "SELECT status FROM agents WHERE id = ?1",
+            params![agent_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::AgentNotFound(agent_id),
+            error => error.into(),
+        })
+}
+
+fn require_active_agent(connection: &Connection, agent_id: AgentId) -> Result<(), StoreError> {
+    if require_agent(connection, agent_id)? == "active" {
+        Ok(())
+    } else {
+        Err(StoreError::AgentInactive(agent_id))
+    }
+}
+
+fn require_thread(
+    connection: &Connection,
+    conversation_id: ConversationId,
+) -> Result<Conversation, StoreError> {
+    let conversation = query_optional(
+        connection,
+        "SELECT id, type, room_id, title, goal, parent_conversation_id,
+                origin_conversation_id, status, created_at, updated_at
+         FROM conversations WHERE id = ?1",
+        params![conversation_id.to_string()],
+        records::conversation,
+    )?
+    .ok_or(StoreError::ThreadNotFound(conversation_id))?;
+    if conversation.kind == ConversationKind::Thread {
+        Ok(conversation)
+    } else {
+        Err(StoreError::NotThread(conversation_id))
+    }
+}
+
+fn require_open_thread(
+    connection: &Connection,
+    conversation_id: ConversationId,
+) -> Result<Conversation, StoreError> {
+    let conversation = require_thread(connection, conversation_id)?;
+    if conversation.status == "open" {
+        Ok(conversation)
+    } else {
+        Err(StoreError::ThreadNotOpen(conversation_id))
+    }
+}
+
+fn require_active_room_membership(
+    connection: &Connection,
+    room_id: RoomId,
+    agent_id: AgentId,
+) -> Result<(), StoreError> {
+    let active: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM room_members
+            WHERE room_id = ?1 AND agent_id = ?2 AND left_at IS NULL
+        )",
+        params![room_id.to_string(), agent_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::RoomMembershipRequired { room_id, agent_id })
+    }
+}
+
+fn next_room_membership_generation(
+    connection: &Connection,
+    room_id: RoomId,
+    agent_id: AgentId,
+) -> Result<u32, StoreError> {
+    let generation: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1
+         FROM room_members WHERE room_id = ?1 AND agent_id = ?2",
+        params![room_id.to_string(), agent_id.to_string()],
+        |row| row.get(0),
+    )?;
+    generation
+        .try_into()
+        .map_err(|_| StoreError::IntegerOutOfRange {
+            field: "room_members.generation",
+            value: i128::from(generation),
+        })
+}
+
+fn next_thread_membership_generation(
+    connection: &Connection,
+    conversation_id: ConversationId,
+    member_type: MemberType,
+    member_id: &str,
+) -> Result<u32, StoreError> {
+    let generation: i64 = connection.query_row(
+        "SELECT COALESCE(MAX(generation), 0) + 1
+         FROM conversation_members
+         WHERE conversation_id = ?1 AND member_type = ?2 AND member_id = ?3",
+        params![
+            conversation_id.to_string(),
+            member_type.to_string(),
+            member_id
+        ],
+        |row| row.get(0),
+    )?;
+    generation
+        .try_into()
+        .map_err(|_| StoreError::IntegerOutOfRange {
+            field: "conversation_members.generation",
+            value: i128::from(generation),
+        })
 }
 
 fn query_optional<P, T>(
