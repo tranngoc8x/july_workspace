@@ -64,11 +64,19 @@ pub(super) fn room(row: &Row<'_>) -> Result<Room, StoreError> {
 }
 
 pub(super) fn room_member(row: &Row<'_>) -> Result<RoomMember, StoreError> {
+    let generation: i64 = row.get(3)?;
     Ok(RoomMember {
         room_id: id(row.get(0)?)?,
         agent_id: id(row.get(1)?)?,
         role: row.get(2)?,
-        joined_at: row.get(3)?,
+        generation: generation
+            .try_into()
+            .map_err(|_| StoreError::IntegerOutOfRange {
+                field: "room_members.generation",
+                value: i128::from(generation),
+            })?,
+        joined_at: row.get(4)?,
+        left_at: row.get(5)?,
     })
 }
 
@@ -88,12 +96,19 @@ pub(super) fn conversation(row: &Row<'_>) -> Result<Conversation, StoreError> {
 }
 
 pub(super) fn conversation_member(row: &Row<'_>) -> Result<ConversationMember, StoreError> {
+    let generation: i64 = row.get(3)?;
     Ok(ConversationMember {
         conversation_id: id(row.get(0)?)?,
         member_type: domain_enum(row.get(1)?)?,
         member_id: row.get(2)?,
-        joined_at: row.get(3)?,
-        left_at: row.get(4)?,
+        generation: generation
+            .try_into()
+            .map_err(|_| StoreError::IntegerOutOfRange {
+                field: "conversation_members.generation",
+                value: i128::from(generation),
+            })?,
+        joined_at: row.get(4)?,
+        left_at: row.get(5)?,
     })
 }
 
@@ -119,9 +134,10 @@ pub(super) fn work_item(row: &Row<'_>) -> Result<WorkItem, StoreError> {
         goal: row.get(3)?,
         status: domain_enum(row.get(4)?)?,
         owner_agent_id: optional_id(row.get(5)?)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        completed_at: row.get(8)?,
+        is_primary: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        completed_at: row.get(9)?,
     })
 }
 

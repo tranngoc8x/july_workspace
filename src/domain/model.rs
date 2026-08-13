@@ -132,11 +132,16 @@ pub struct RoomMember {
     pub room_id: RoomId,
     pub agent_id: AgentId,
     pub role: Option<String>,
+    pub generation: u32,
     pub joined_at: String,
+    pub left_at: Option<String>,
 }
 
 impl RoomMember {
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self.generation == 0 {
+            return Err(DomainError::InvalidMembershipGeneration);
+        }
         require_text(&self.joined_at, "room_member.joined_at")
     }
 }
@@ -183,12 +188,16 @@ pub struct ConversationMember {
     pub conversation_id: ConversationId,
     pub member_type: MemberType,
     pub member_id: String,
+    pub generation: u32,
     pub joined_at: String,
     pub left_at: Option<String>,
 }
 
 impl ConversationMember {
     pub fn validate(&self) -> Result<(), DomainError> {
+        if self.generation == 0 {
+            return Err(DomainError::InvalidMembershipGeneration);
+        }
         require_text(&self.member_id, "conversation_member.member_id")?;
         require_text(&self.joined_at, "conversation_member.joined_at")
     }
@@ -222,6 +231,7 @@ pub struct WorkItem {
     pub goal: Option<String>,
     pub status: WorkStatus,
     pub owner_agent_id: Option<AgentId>,
+    pub is_primary: bool,
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
@@ -511,6 +521,7 @@ mod tests {
             goal: None,
             status: WorkStatus::Open,
             owner_agent_id: None,
+            is_primary: false,
             created_at: "2026-08-09T00:00:00Z".into(),
             updated_at: "2026-08-09T00:00:00Z".into(),
             completed_at: None,
@@ -584,7 +595,9 @@ mod tests {
             room_id: RoomId::new(),
             agent_id: AgentId::new(),
             role: None,
+            generation: 1,
             joined_at: String::new(),
+            left_at: None,
         };
         assert_eq!(
             member.validate(),
@@ -597,6 +610,7 @@ mod tests {
             conversation_id: ConversationId::new(),
             member_type: MemberType::User,
             member_id: String::new(),
+            generation: 1,
             joined_at: "2026-08-09T00:00:00Z".into(),
             left_at: None,
         };
@@ -699,6 +713,35 @@ mod tests {
         assert!(checkpoint.validate().is_ok());
 
         rejects_blank!(valid_memory(), created_at, "memory.created_at");
+    }
+
+    #[test]
+    fn membership_generations_must_be_positive() {
+        let room_member = RoomMember {
+            room_id: RoomId::new(),
+            agent_id: AgentId::new(),
+            role: None,
+            generation: 0,
+            joined_at: "2026-08-09T00:00:00Z".into(),
+            left_at: None,
+        };
+        assert_eq!(
+            room_member.validate(),
+            Err(DomainError::InvalidMembershipGeneration)
+        );
+
+        let conversation_member = ConversationMember {
+            conversation_id: ConversationId::new(),
+            member_type: MemberType::Agent,
+            member_id: AgentId::new().to_string(),
+            generation: 0,
+            joined_at: "2026-08-09T00:00:00Z".into(),
+            left_at: None,
+        };
+        assert_eq!(
+            conversation_member.validate(),
+            Err(DomainError::InvalidMembershipGeneration)
+        );
     }
 
     #[test]

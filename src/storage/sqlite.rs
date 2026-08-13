@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -18,6 +18,10 @@ const MIGRATIONS: [Migration; 2] = [
     Migration {
         version: 2,
         sql: include_str!("migrations/0002_session_runtime.sql"),
+    },
+    Migration {
+        version: 3,
+        sql: include_str!("migrations/0003_collaboration_membership.sql"),
     },
 ];
 
@@ -108,8 +112,8 @@ impl SqliteStore {
     pub fn list_room_members(&self, room_id: RoomId) -> Result<Vec<RoomMember>, StoreError> {
         query_all(
             &self.connection,
-            "SELECT room_id, agent_id, role, joined_at
-             FROM room_members WHERE room_id = ?1 ORDER BY joined_at, agent_id",
+            "SELECT room_id, agent_id, role, generation, joined_at, left_at
+             FROM room_members WHERE room_id = ?1 ORDER BY generation, agent_id",
             params![room_id.to_string()],
             records::room_member,
         )
@@ -165,9 +169,9 @@ impl SqliteStore {
     ) -> Result<Vec<ConversationMember>, StoreError> {
         query_all(
             &self.connection,
-            "SELECT conversation_id, member_type, member_id, joined_at, left_at
+            "SELECT conversation_id, member_type, member_id, generation, joined_at, left_at
              FROM conversation_members WHERE conversation_id = ?1
-             ORDER BY joined_at, member_type, member_id",
+             ORDER BY generation, member_type, member_id",
             params![conversation_id.to_string()],
             records::conversation_member,
         )
@@ -221,6 +225,7 @@ impl SqliteStore {
                 conversation_id: conversation.id,
                 member_type: MemberType::User,
                 member_id: user_id.into(),
+                generation: 1,
                 joined_at: now.into(),
                 left_at: None,
             },
@@ -228,6 +233,7 @@ impl SqliteStore {
                 conversation_id: conversation.id,
                 member_type: MemberType::Agent,
                 member_id: agent_id.to_string(),
+                generation: 1,
                 joined_at: now.into(),
                 left_at: None,
             },
@@ -339,8 +345,8 @@ impl SqliteStore {
         self.connection.execute(
             "INSERT INTO work_items(
                 id, conversation_id, title, goal, status, owner_agent_id,
-                created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                is_primary, created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 work_item.id.to_string(),
                 work_item.conversation_id.to_string(),
@@ -348,6 +354,7 @@ impl SqliteStore {
                 work_item.goal,
                 work_item.status.to_string(),
                 work_item.owner_agent_id.map(|id| id.to_string()),
+                work_item.is_primary,
                 work_item.created_at,
                 work_item.updated_at,
                 work_item.completed_at,
@@ -360,7 +367,7 @@ impl SqliteStore {
         query_optional(
             &self.connection,
             "SELECT id, conversation_id, title, goal, status, owner_agent_id,
-                    created_at, updated_at, completed_at
+                    is_primary, created_at, updated_at, completed_at
              FROM work_items WHERE id = ?1",
             params![id.to_string()],
             records::work_item,
@@ -745,13 +752,15 @@ fn insert_room(connection: &Connection, room: &Room) -> Result<(), StoreError> {
 fn insert_room_member(connection: &Connection, member: &RoomMember) -> Result<(), StoreError> {
     member.validate()?;
     connection.execute(
-        "INSERT INTO room_members(room_id, agent_id, role, joined_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO room_members(room_id, agent_id, role, generation, joined_at, left_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             member.room_id.to_string(),
             member.agent_id.to_string(),
             member.role,
+            member.generation,
             member.joined_at,
+            member.left_at,
         ],
     )?;
     Ok(())
@@ -790,12 +799,13 @@ fn insert_conversation_member(
     member.validate()?;
     connection.execute(
         "INSERT INTO conversation_members(
-            conversation_id, member_type, member_id, joined_at, left_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            conversation_id, member_type, member_id, generation, joined_at, left_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             member.conversation_id.to_string(),
             member.member_type.to_string(),
             member.member_id,
+            member.generation,
             member.joined_at,
             member.left_at,
         ],
@@ -951,11 +961,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_two() {
+    fn fresh_database_has_schema_version_three() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -1087,6 +1097,9 @@ mod tests {
             "idx_memory_scope",
             "idx_session_binding_generation",
             "uq_session_bindings_current",
+            "uq_room_members_active",
+            "uq_conversation_members_active",
+            "uq_work_items_primary_conversation",
         ];
 
         for index in expected {
@@ -1314,15 +1327,153 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            2
+            3
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            2
+            3
         );
+    }
+
+    #[test]
+    fn migration_three_preserves_v2_membership_and_work_rows() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..2]).unwrap();
+        seed_session_parent_rows(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO rooms(id, name, status, created_at, updated_at)
+                 VALUES ('room-1', 'room-one', 'active', 'now', 'now');
+                 INSERT INTO room_members(room_id, agent_id, role, joined_at)
+                 VALUES ('room-1', 'agent-1', 'reviewer', 'joined');
+                 INSERT INTO conversation_members(
+                     conversation_id, member_type, member_id, joined_at, left_at
+                 ) VALUES ('conversation-1', 'agent', 'agent-1', 'joined', 'left');
+                 INSERT INTO work_items(
+                     id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES ('work-1', 'conversation-1', 'legacy work', 'open', 'now', 'now');
+                 INSERT INTO work_results(
+                     id, work_id, status, summary, created_at
+                 ) VALUES ('result-1', 'work-1', 'done', 'kept', 'now');",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 3);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT role, generation, joined_at, left_at
+                     FROM room_members WHERE room_id = 'room-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (Some("reviewer".into()), 1, "joined".into(), None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT member_type, member_id, generation, joined_at, left_at
+                     FROM conversation_members
+                     WHERE conversation_id = 'conversation-1'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "agent".into(),
+                "agent-1".into(),
+                1,
+                "joined".into(),
+                Some("left".into())
+            )
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT is_primary FROM work_items WHERE id = 'work-1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT work_id FROM work_results WHERE id = 'result-1'",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .unwrap(),
+            "work-1"
+        );
+    }
+
+    #[test]
+    fn phase_four_membership_and_primary_work_constraints_are_enforced() {
+        let database = TestDatabase::new();
+        let store = SqliteStore::open(database.path()).unwrap();
+        seed_session_parent_rows(&store.connection);
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO rooms(id, name, status, created_at, updated_at)
+                 VALUES ('room-1', 'room-one', 'active', 'now', 'now');
+                 INSERT INTO room_members(
+                     room_id, agent_id, role, generation, joined_at, left_at
+                 ) VALUES ('room-1', 'agent-1', NULL, 1, 'joined-1', 'left-1');
+                 INSERT INTO room_members(
+                     room_id, agent_id, role, generation, joined_at, left_at
+                 ) VALUES ('room-1', 'agent-1', NULL, 2, 'joined-2', NULL);
+                 INSERT INTO conversation_members(
+                     conversation_id, member_type, member_id, generation, joined_at, left_at
+                 ) VALUES ('conversation-1', 'agent', 'agent-1', 1, 'joined-1', 'left-1');
+                 INSERT INTO conversation_members(
+                     conversation_id, member_type, member_id, generation, joined_at, left_at
+                 ) VALUES ('conversation-1', 'agent', 'agent-1', 2, 'joined-2', NULL);
+                 INSERT INTO work_items(
+                     id, conversation_id, title, status, is_primary, created_at, updated_at
+                 ) VALUES ('work-1', 'conversation-1', 'primary', 'open', 1, 'now', 'now');",
+            )
+            .unwrap();
+
+        for statement in [
+            "INSERT INTO room_members(room_id, agent_id, generation, joined_at)
+             VALUES ('room-1', 'agent-1', 3, 'joined-3')",
+            "INSERT INTO conversation_members(
+                 conversation_id, member_type, member_id, generation, joined_at
+             ) VALUES ('conversation-1', 'agent', 'agent-1', 3, 'joined-3')",
+            "INSERT INTO work_items(
+                 id, conversation_id, title, status, is_primary, created_at, updated_at
+             ) VALUES ('work-2', 'conversation-1', 'second', 'open', 1, 'now', 'now')",
+        ] {
+            assert!(store.connection.execute(statement, []).is_err());
+        }
     }
 
     #[test]
@@ -1356,15 +1507,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (3);",
+                 INSERT INTO schema_migrations(version) VALUES (4);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 3,
-                supported: 2,
+                found: 4,
+                supported: 3,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

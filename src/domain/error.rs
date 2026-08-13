@@ -14,6 +14,8 @@ pub enum DomainError {
     SelfDependency,
     #[error("session generation must be greater than zero")]
     InvalidSessionGeneration,
+    #[error("membership generation must be greater than zero")]
+    InvalidMembershipGeneration,
     #[error("permission option was not advertised: {0}")]
     PermissionOptionNotAdvertised(String),
     #[error("invalid {kind}: {value}")]

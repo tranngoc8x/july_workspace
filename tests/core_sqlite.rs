@@ -92,7 +92,9 @@ fn full_graph_round_trips_after_reopen() {
         room_id: operations.id,
         agent_id: worker.id,
         role: Some("owner".into()),
+        generation: 1,
         joined_at: CREATED.into(),
+        left_at: None,
     };
     let direct = dm_conversation();
     let thread = Conversation {
@@ -111,6 +113,7 @@ fn full_graph_round_trips_after_reopen() {
         conversation_id: thread.id,
         member_type: MemberType::Agent,
         member_id: worker.id.to_string(),
+        generation: 1,
         joined_at: CREATED.into(),
         left_at: Some(LATER.into()),
     };
@@ -141,6 +144,7 @@ fn full_graph_round_trips_after_reopen() {
         goal: Some("Durable records".into()),
         status: WorkStatus::Working,
         owner_agent_id: Some(worker.id),
+        is_primary: true,
         created_at: CREATED.into(),
         updated_at: LATER.into(),
         completed_at: None,
@@ -152,6 +156,7 @@ fn full_graph_round_trips_after_reopen() {
         goal: None,
         status: WorkStatus::Done,
         owner_agent_id: None,
+        is_primary: false,
         created_at: CREATED.into(),
         updated_at: LATER.into(),
         completed_at: Some(LATER.into()),
@@ -368,13 +373,17 @@ fn same_agent_can_join_multiple_rooms() {
         room_id: first_room.id,
         agent_id: worker.id,
         role: None,
+        generation: 1,
         joined_at: CREATED.into(),
+        left_at: None,
     };
     let second_membership = RoomMember {
         room_id: second_room.id,
         agent_id: worker.id,
         role: Some("reviewer".into()),
+        generation: 1,
         joined_at: LATER.into(),
+        left_at: None,
     };
 
     store.insert_agent(&worker).unwrap();
@@ -463,13 +472,17 @@ fn room_batch_rolls_back_parent_when_a_member_insert_fails() {
             room_id: parent.id,
             agent_id: worker.id,
             role: None,
+            generation: 1,
             joined_at: CREATED.into(),
+            left_at: None,
         },
         RoomMember {
             room_id: parent.id,
             agent_id: AgentId::new(),
             role: None,
+            generation: 1,
             joined_at: LATER.into(),
+            left_at: None,
         },
     ];
     let mut store = SqliteStore::open(database.path()).unwrap();
@@ -492,7 +505,9 @@ fn room_batch_rejects_member_for_a_different_room_before_inserting_parent() {
         room_id: existing_room.id,
         agent_id: worker.id,
         role: None,
+        generation: 1,
         joined_at: CREATED.into(),
+        left_at: None,
     };
     let mut store = SqliteStore::open(database.path()).unwrap();
     store.insert_agent(&worker).unwrap();
@@ -509,7 +524,9 @@ fn room_batch_rejects_member_for_a_different_room_before_inserting_parent() {
         room_id: parent.id,
         agent_id: worker.id,
         role: Some("owner".into()),
+        generation: 1,
         joined_at: LATER.into(),
+        left_at: None,
     };
     let mut store = SqliteStore::open(database.path()).unwrap();
     assert_eq!(store.get_room(parent.id).unwrap(), None);
@@ -543,6 +560,7 @@ fn conversation_batch_rolls_back_parent_when_a_member_insert_fails() {
         conversation_id: parent.id,
         member_type: MemberType::User,
         member_id: "tony".into(),
+        generation: 1,
         joined_at: CREATED.into(),
         left_at: None,
     };
@@ -582,6 +600,7 @@ fn conversation_batch_rejects_member_for_a_different_conversation_before_inserti
         conversation_id: existing_conversation.id,
         member_type: MemberType::User,
         member_id: "tony".into(),
+        generation: 1,
         joined_at: CREATED.into(),
         left_at: None,
     };
@@ -600,6 +619,7 @@ fn conversation_batch_rejects_member_for_a_different_conversation_before_inserti
         conversation_id: parent.id,
         member_type: MemberType::User,
         member_id: "tony".into(),
+        generation: 1,
         joined_at: LATER.into(),
         left_at: None,
     };
