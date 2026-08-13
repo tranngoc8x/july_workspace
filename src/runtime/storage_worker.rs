@@ -1,7 +1,11 @@
 use super::RuntimeError;
+use crate::application::{
+    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState,
+};
 use crate::domain::{
-    Agent, AgentId, Conversation, ConversationId, Message, PermissionDecision, SessionBinding,
-    SessionBindingId, SessionBindingStatus,
+    Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, PermissionDecision,
+    Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkItem,
+    WorkItemId,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -10,8 +14,29 @@ use tokio::sync::{mpsc, oneshot};
 
 const STORAGE_CAPACITY: usize = 64;
 
+type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
+
 enum Command {
-    GetAgentByName(String, oneshot::Sender<Result<Option<Agent>, StoreError>>),
+    GetAgent(AgentId, Reply<Option<Agent>>),
+    GetAgentByName(String, Reply<Option<Agent>>),
+    CreateRoom(Room, Reply<()>),
+    GetRoom(RoomId, Reply<Option<Room>>),
+    GetRoomByName(String, Reply<Option<Room>>),
+    ListRooms(Reply<Vec<Room>>),
+    ListRoomMembers(RoomId, Reply<Vec<RoomMember>>),
+    AddRoomMember(RoomId, AgentId, Option<String>, String, Reply<bool>),
+    RemoveRoomMember(RoomId, AgentId, String, Reply<bool>),
+    CreateThread(
+        Conversation,
+        WorkItemId,
+        String,
+        Vec<AgentId>,
+        Reply<WorkItem>,
+    ),
+    ListThreads(RoomId, Reply<Vec<Conversation>>),
+    ListThreadMembers(ConversationId, Reply<Vec<ConversationMember>>),
+    AddThreadMember(ConversationId, AgentId, String, Reply<bool>),
+    RemoveThreadMember(ConversationId, AgentId, String, Reply<bool>),
     GetOrCreateDm(
         String,
         AgentId,
@@ -210,6 +235,21 @@ impl StorageWorker {
         Ok(response.await.map_err(|_| RuntimeError::ChannelClosed)??)
     }
 
+    async fn collaboration_request<R>(
+        &self,
+        build: impl FnOnce(Reply<R>) -> Command,
+    ) -> Result<R, CollaborationError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| CollaborationError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| CollaborationError::Runtime("storage owner channel closed".into()))?
+            .map_err(map_store_error)
+    }
+
     fn join(&mut self) -> Result<(), RuntimeError> {
         if let Some(thread) = self.thread.take() {
             thread
@@ -217,6 +257,146 @@ impl StorageWorker {
                 .map_err(|_| RuntimeError::StorageWorkerPanicked)?;
         }
         Ok(())
+    }
+}
+
+impl CollaborationRuntime for StorageWorker {
+    async fn create_room(&mut self, room: Room) -> Result<(), CollaborationError> {
+        self.collaboration_request(|reply| Command::CreateRoom(room, reply))
+            .await
+    }
+
+    async fn get_room(&mut self, room_id: RoomId) -> Result<Option<Room>, CollaborationError> {
+        self.collaboration_request(|reply| Command::GetRoom(room_id, reply))
+            .await
+    }
+
+    async fn get_room_by_name(&mut self, name: String) -> Result<Option<Room>, CollaborationError> {
+        self.collaboration_request(|reply| Command::GetRoomByName(name, reply))
+            .await
+    }
+
+    async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
+        self.collaboration_request(Command::ListRooms).await
+    }
+
+    async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError> {
+        self.collaboration_request(|reply| Command::GetAgent(agent_id, reply))
+            .await
+    }
+
+    async fn get_agent_by_name(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Agent>, CollaborationError> {
+        self.collaboration_request(|reply| Command::GetAgentByName(name, reply))
+            .await
+    }
+
+    async fn list_room_members(
+        &mut self,
+        room_id: RoomId,
+    ) -> Result<Vec<RoomMember>, CollaborationError> {
+        self.collaboration_request(|reply| Command::ListRoomMembers(room_id, reply))
+            .await
+    }
+
+    async fn add_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        role: Option<String>,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        let changed = self
+            .collaboration_request(|reply| {
+                Command::AddRoomMember(room_id, agent_id, role, changed_at, reply)
+            })
+            .await?;
+        Ok(MembershipChange {
+            state: MembershipState::Active,
+            changed,
+        })
+    }
+
+    async fn remove_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        let changed = self
+            .collaboration_request(|reply| {
+                Command::RemoveRoomMember(room_id, agent_id, changed_at, reply)
+            })
+            .await?;
+        Ok(MembershipChange {
+            state: MembershipState::Left,
+            changed,
+        })
+    }
+
+    async fn create_thread(
+        &mut self,
+        thread: Conversation,
+        primary_work_id: WorkItemId,
+        user_id: String,
+        initial_agents: Vec<AgentId>,
+    ) -> Result<WorkItem, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::CreateThread(thread, primary_work_id, user_id, initial_agents, reply)
+        })
+        .await
+    }
+
+    async fn list_threads(
+        &mut self,
+        room_id: RoomId,
+    ) -> Result<Vec<Conversation>, CollaborationError> {
+        self.collaboration_request(|reply| Command::ListThreads(room_id, reply))
+            .await
+    }
+
+    async fn list_thread_members(
+        &mut self,
+        thread_id: ConversationId,
+    ) -> Result<Vec<ConversationMember>, CollaborationError> {
+        self.collaboration_request(|reply| Command::ListThreadMembers(thread_id, reply))
+            .await
+    }
+
+    async fn add_thread_member(
+        &mut self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        let changed = self
+            .collaboration_request(|reply| {
+                Command::AddThreadMember(thread_id, agent_id, changed_at, reply)
+            })
+            .await?;
+        Ok(MembershipChange {
+            state: MembershipState::Active,
+            changed,
+        })
+    }
+
+    async fn remove_thread_member(
+        &mut self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        let changed = self
+            .collaboration_request(|reply| {
+                Command::RemoveThreadMember(thread_id, agent_id, changed_at, reply)
+            })
+            .await?;
+        Ok(MembershipChange {
+            state: MembershipState::Left,
+            changed,
+        })
     }
 }
 
@@ -236,8 +416,61 @@ impl Drop for StorageWorker {
 fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
     while let Some(command) = commands.blocking_recv() {
         match command {
+            Command::GetAgent(agent_id, reply) => {
+                let _ = reply.send(store.get_agent(agent_id));
+            }
             Command::GetAgentByName(name, reply) => {
                 let _ = reply.send(store.get_agent_by_name(&name));
+            }
+            Command::CreateRoom(room, reply) => {
+                let _ = reply.send(store.create_room(&room));
+            }
+            Command::GetRoom(room_id, reply) => {
+                let _ = reply.send(store.get_room(room_id));
+            }
+            Command::GetRoomByName(name, reply) => {
+                let _ = reply.send(store.get_room_by_name(&name));
+            }
+            Command::ListRooms(reply) => {
+                let _ = reply.send(store.list_rooms());
+            }
+            Command::ListRoomMembers(room_id, reply) => {
+                let _ = reply.send(store.list_room_members(room_id));
+            }
+            Command::AddRoomMember(room_id, agent_id, role, changed_at, reply) => {
+                let _ = reply.send(store.add_room_member(
+                    room_id,
+                    agent_id,
+                    role.as_deref(),
+                    &changed_at,
+                ));
+            }
+            Command::RemoveRoomMember(room_id, agent_id, changed_at, reply) => {
+                let _ = reply.send(store.remove_room_member(room_id, agent_id, &changed_at));
+            }
+            Command::CreateThread(thread, primary_work_id, user_id, initial_agents, reply) => {
+                let _ = reply.send(store.create_thread_with_primary_work(
+                    &thread,
+                    primary_work_id,
+                    &user_id,
+                    &initial_agents,
+                ));
+            }
+            Command::ListThreads(room_id, reply) => {
+                let _ = reply.send(store.list_threads(room_id));
+            }
+            Command::ListThreadMembers(thread_id, reply) => {
+                let result = store.get_thread(thread_id).and_then(|thread| match thread {
+                    Some(_) => store.list_conversation_members(thread_id),
+                    None => Err(StoreError::ThreadNotFound(thread_id)),
+                });
+                let _ = reply.send(result);
+            }
+            Command::AddThreadMember(thread_id, agent_id, changed_at, reply) => {
+                let _ = reply.send(store.add_thread_member(thread_id, agent_id, &changed_at));
+            }
+            Command::RemoveThreadMember(thread_id, agent_id, changed_at, reply) => {
+                let _ = reply.send(store.remove_thread_member(thread_id, agent_id, &changed_at));
             }
             Command::GetOrCreateDm(user_id, agent_id, now, reply) => {
                 let _ = reply.send(store.get_or_create_dm(&user_id, agent_id, &now));
@@ -280,5 +513,30 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                 return;
             }
         }
+    }
+}
+
+fn map_store_error(error: StoreError) -> CollaborationError {
+    match error {
+        StoreError::RoomNotFound(id) => CollaborationError::RoomNotFound(id.to_string()),
+        StoreError::RoomInactive(id) => CollaborationError::RoomInactive(id),
+        StoreError::RoomIdConflict(id) => CollaborationError::RoomIdConflict(id),
+        StoreError::RoomNameConflict(name) => CollaborationError::RoomNameConflict(name),
+        StoreError::AgentNotFound(id) => CollaborationError::AgentNotFound(id.to_string()),
+        StoreError::AgentInactive(id) => CollaborationError::AgentInactive(id),
+        StoreError::ThreadNotFound(id) | StoreError::NotThread(id) => {
+            CollaborationError::ThreadNotFound(id)
+        }
+        StoreError::ThreadNotOpen(id) => CollaborationError::ThreadNotOpen(id),
+        StoreError::RoomMembershipRequired { room_id, agent_id } => {
+            CollaborationError::RoomMembershipRequired { room_id, agent_id }
+        }
+        StoreError::RoomRemovalBlocked { room_id, agent_id } => {
+            CollaborationError::RoomRemovalBlocked { room_id, agent_id }
+        }
+        StoreError::ThreadIdConflict(id) => CollaborationError::ThreadIdConflict(id),
+        StoreError::PrimaryWorkIdConflict(id) => CollaborationError::PrimaryWorkIdConflict(id),
+        StoreError::Domain(error) => CollaborationError::InvalidCommand(error.to_string()),
+        error => CollaborationError::Runtime(error.to_string()),
     }
 }
