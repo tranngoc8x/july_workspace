@@ -53,6 +53,7 @@ struct ObservedTransport {
     resumes: Vec<ResumeSession>,
     messages: Vec<SendMessage>,
     permissions: Vec<PermissionResponse>,
+    cancellations: Vec<SessionRef>,
     shutdowns: usize,
 }
 
@@ -126,7 +127,8 @@ impl AgentTransport for FakeTransport {
         Ok(())
     }
 
-    async fn cancel_turn(&mut self, _session: SessionRef) -> Result<(), TransportError> {
+    async fn cancel_turn(&mut self, session: SessionRef) -> Result<(), TransportError> {
+        self.observed.lock().unwrap().cancellations.push(session);
         Ok(())
     }
 
@@ -547,10 +549,32 @@ impl DirectMessageRuntime for FailingPersistencePort {
         Ok(())
     }
 
+    async fn cancel_turn(&mut self, _cancelled_at: String) -> Result<(), DirectMessageError> {
+        Ok(())
+    }
+
     async fn shutdown(&mut self, _stopped_at: String) -> Result<(), DirectMessageError> {
         self.observed.lock().unwrap().shutdowns += 1;
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn cancel_turn_uses_the_hidden_active_session() {
+    let database = TestDatabase::new();
+    seed_agent(&database);
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+
+    service.cancel_turn(LATER.into()).await.unwrap();
+
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.cancellations.len(), 1);
+    assert_eq!(observed.cancellations[0].remote_session_id, "remote-dm");
 }
 
 #[tokio::test]

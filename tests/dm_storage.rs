@@ -223,6 +223,38 @@ fn concurrent_get_or_create_dm_returns_one_conversation() {
     assert_eq!(first.id, second.id);
 }
 
+#[test]
+fn message_insert_is_idempotent_only_for_the_exact_record() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let target = agent("codex");
+    store.insert_agent(&target).unwrap();
+    let conversation = store.get_or_create_dm("tony", target.id, NOW).unwrap();
+    let message = Message {
+        id: MessageId::new(),
+        conversation_id: conversation.id,
+        sender_type: MemberType::Agent,
+        sender_id: target.id.to_string(),
+        body: "answer".into(),
+        reply_to: None,
+        metadata: json!({"july": {"schema": 1}}),
+        created_at: LATER.into(),
+    };
+
+    store.insert_message(&message).unwrap();
+    store.insert_message(&message).unwrap();
+
+    let conflicting = Message {
+        body: "different answer".into(),
+        ..message.clone()
+    };
+    assert!(matches!(
+        store.insert_message(&conflicting),
+        Err(StoreError::MessageConflict { id }) if id == message.id
+    ));
+    assert_eq!(store.get_message(message.id).unwrap(), Some(message));
+}
+
 #[tokio::test]
 async fn storage_worker_persists_dm_messages_and_returns_latest_binding() {
     let database = TestDatabase::new();
