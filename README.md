@@ -11,14 +11,17 @@ documents.
 
 ## Current Status
 
-Phases 0-2 are implemented. The crate contains typed ULID domain records, a
+Phases 0-3 are implemented. The crate contains typed ULID domain records, a
 concrete synchronous `rusqlite` store, typed session lifecycle and permission
 audit persistence, an official-SDK ACP adapter, and a Tokio-owned
-`SessionManager` backed by a bounded SQLite worker.
+`SessionManager` backed by a bounded SQLite worker. `july dm <agent>` opens or
+reuses one durable user-to-agent DM, resumes its isolated remote session,
+streams replies, handles permissions fail-closed, and persists both message
+directions.
 
-Phase 2 does not implement a DM or Room workflow, message persistence through
-an agent session, work/result behavior, dependency propagation, memory
-promotion, recovery, or a CLI workflow. Those remain later phases.
+Phase 3 does not implement Room/Thread collaboration, agent-to-agent messaging,
+work/result behavior, deliberation, dependency propagation, memory promotion,
+replacement-session recovery, or the full CLI/REPL. Those remain later phases.
 
 July Workspace is not a Slack clone, project-management suite, workflow engine,
 Git host, IDE, terminal multiplexer, memory SaaS, agent replacement harness,
@@ -55,16 +58,19 @@ headless CLI fallback, or an agent framework.
 - Pinned toolchain: `1.96.0` from `rust-toolchain.toml`.
 - `Cargo.lock` is tracked.
 - Phase 1 uses `ulid`, bundled `rusqlite`, `serde_json`, and `thiserror`. Phase 2
-  adds the exact `agent-client-protocol` 2.0.0 SDK, Tokio, and `tracing`.
+  adds the exact `agent-client-protocol` 2.0.0 SDK, Tokio, and `tracing`. Phase 3
+  adds `chrono` for durable UTC timestamps and only the Tokio I/O/signal
+  features needed by the DM command.
   Dependencies are introduced only in the phase that needs them.
 
 ## Current Boundaries
 
 The current package exposes `domain`, `application`, `runtime`, `transport`,
-and `storage`. `transport` owns all raw ACP SDK types. `runtime` owns session
+`cli`, and `storage`. `transport` owns all raw ACP SDK types. `runtime` owns session
 lifecycle and the SQLite worker; it mutates durable state only through
-July-owned values. `application` remains a boundary for later use cases. The
-`july` binary is the current presentation entry point.
+July-owned values. `application` owns the deterministic DM policy and exposes a
+transport-neutral runtime port. The `july` binary is the presentation entry
+point and currently accepts only `july dm <agent>`.
 
 The dependency direction is:
 
@@ -101,10 +107,16 @@ Use `tracing` structured fields, not ad-hoc prints. Useful fields include
   test-only ACP subprocess.
 - `tests/session_runtime.rs` covers the bounded SQLite owner and durable session
   manager effects.
+- `tests/dm_storage.rs` covers atomic stable-DM reuse, concurrent creation,
+  message persistence, and binding lookup.
+- `tests/direct_message.rs` covers exact routing, metadata, response durability,
+  restart continuity, context isolation, cancellation, and session loss.
+- `tests/cli_dm.rs` drives the real `july` binary against the deterministic ACP
+  subprocess and verifies the resulting SQLite state.
 - `tests/integration/` is reserved for broader cross-module contracts introduced
   by later phases.
-- `tests/e2e/` will cover user-visible workflows such as DM, collaboration,
-  publish/dependency flow, isolation, and session recovery in later phases.
+- `tests/e2e/` remains reserved for broader collaboration, publish/dependency,
+  and recovery workflows introduced by later phases.
 
 ## Local Verification
 
