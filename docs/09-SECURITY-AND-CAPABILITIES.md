@@ -65,6 +65,20 @@ Room membership means:
 It does not mean:
 - can read/write every room member's codebase.
 
+Thread delivery and session opening require an active Agent membership in both
+the Thread and its Room. Every open/send path rechecks these durable facts
+before transport use. Room membership never subscribes an Agent to a Thread.
+
+Only the local user may mutate membership in Phase 4. An add requires an active
+Agent and active parent scope. Removing a Room member is rejected while that
+Agent still has an active membership in any Thread in the Room; the user must
+leave those Threads explicitly. `role` is descriptive metadata and grants no
+authorization.
+
+A committed Thread removal blocks new delivery immediately. Cancellation of an
+already active turn is best-effort after commit and cannot undo the durable
+membership transition.
+
 ## Audit
 
 Persist at least:
@@ -74,5 +88,10 @@ Persist at least:
 - work status changes;
 - result creation/publish;
 - recovery events.
+
+Membership audit is represented by retained membership generations with
+`joined_at` and `left_at`. Removal closes the active generation; closed
+generations are immutable, and rejoin creates a new generation instead of
+erasing the previous interval.
 
 Do not store hidden model reasoning.

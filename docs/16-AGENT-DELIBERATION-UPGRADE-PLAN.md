@@ -739,6 +739,10 @@ structured thread artifacts
 
 Do not implement these unless trivial and naturally compatible.
 
+The locked Phase 4 primary Work marker and generational membership model are
+compatibility foundations only. Phase 4 does not add Thread phase,
+`decision_owner`, Handoff, Proposal, Decision or deliberation commands.
+
 ## Phase 5 — Agent-to-Agent Messaging
 
 This provides the communication substrate.

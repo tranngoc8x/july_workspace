@@ -35,6 +35,15 @@ Contains:
 
 Room is not one giant LLM conversation.
 
+### Membership
+
+Room and Thread membership are durable generations, not mutable presence
+flags. Each generation records `joined_at` and an optional `left_at`; rejoining
+creates a new generation. At most one generation for a member is active.
+
+Room membership is eligibility to collaborate. It does not subscribe the Agent
+to every Thread and does not grant filesystem access.
+
 ## Conversation
 
 Two concrete types:
@@ -68,7 +77,7 @@ Fields:
 - goal
 - optional parent thread
 - optional origin conversation
-- optional work item
+- one primary WorkItem
 
 ## WorkItem
 
@@ -87,7 +96,9 @@ CANCELLED
 ```
 
 A DM may have zero or more WorkItems.
-A task-oriented Thread normally has one primary WorkItem.
+Every Phase 4 Thread has exactly one primary WorkItem created atomically with
+the Thread. Phase 4 leaves its owner unset; ownership and status transitions
+remain Phase 6 work.
 
 ## Message
 

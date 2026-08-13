@@ -120,6 +120,10 @@ owner_process_id
 owner_claude_session
 ```
 
+Phase 4 chỉ tạo primary Work cùng Thread để khóa aggregate boundary. Work này
+chưa có `owner_agent_id`; requester/owner semantics và Work lifecycle vẫn được
+khóa ở Phase 6. Không dùng membership hoặc runtime session làm ownership tạm.
+
 ---
 
 # 5. Tách runtime identity khỏi Agent identity

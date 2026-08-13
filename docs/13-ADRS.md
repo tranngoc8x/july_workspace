@@ -138,3 +138,69 @@ Status: Accepted
 Tokio runtime tasks access the synchronous `SqliteStore` through one bounded
 storage worker which owns the connection. SQLite transactions never span an
 `.await`, and the runtime does not put the store behind a global mutex.
+
+## ADR-021 — Phase 4 collaboration commands are explicit and stateless
+Status: Accepted
+
+Phase 4 exposes deterministic application commands for Room and Thread
+creation, listing, membership changes and opening one Thread for one Agent.
+Thread IDs are canonical `ConversationId` values; titles are not identifiers.
+Room and Agent references resolve only by exact case-sensitive name or their
+canonical typed ID.
+
+`OpenThreadForAgent(thread_id, agent_id)` requires an active Agent, active Room,
+open Thread and active Agent membership in both scopes. It addresses exactly
+one Agent. It never broadcasts, joins an Agent implicitly, copies another
+conversation transcript or uses an LLM to choose a recipient. The future CLI
+maps this command to `july thread open <thread-id> --agent <agent>`.
+
+The full REPL, `room use`, implicit current context and `--json` remain Phase 8.
+Mentions, Agent-originated membership changes and dynamic joins remain Phase 5.
+
+## ADR-022 — Membership is a durable generational state machine
+Status: Accepted
+
+Room and Thread membership use retained generations. At most one generation
+for a member is active at a time:
+
+```text
+Absent or Left + add    -> Active in generation N+1
+Active + add            -> Active, unchanged
+Active + remove         -> Left with left_at
+Absent or Left + remove -> unchanged
+```
+
+An Agent must be active to join an active Room. An Agent must also be an active
+Room member before joining an open Thread in that Room. Room membership never
+implies Thread membership. Removing an Agent from a Room is rejected while the
+Agent has any active Thread membership in that Room; July never cascades that
+removal implicitly. Thread removal does not alter Room membership.
+
+Only the local user may mutate membership in Phase 4. `role` remains descriptive
+and grants no authorization. One command timestamp is used for every row it
+changes. Repeated target-state commands preserve the original timestamps.
+Membership removal immediately blocks new open/send operations after commit;
+transport cancellation of an in-flight turn is best-effort and occurs after
+the durable transition. It does not erase messages or merge session identity
+with membership identity. Removal closes the active generation; closed
+generations are immutable and rejoin inserts a new generation.
+
+## ADR-023 — Thread and primary Work creation are one durable operation
+Status: Accepted
+
+Every Phase 4 Thread is created with exactly one primary WorkItem in one
+`BEGIN IMMEDIATE` SQLite transaction. The transaction validates the active
+Room and initial Agent memberships, inserts the open Thread, inserts the local
+user and initial Agent members, then inserts an open primary WorkItem whose
+title and goal mirror the Thread. Phase 4 leaves `owner_agent_id` null; Work
+ownership and lifecycle behavior remain Phase 6.
+
+Any validation or insert failure rolls back the Thread, memberships and primary
+Work together. Session bindings, ACP calls, capsules, Messages, Results,
+Publishes and Dependencies are outside this transaction. Agent session startup
+is lazy after commit and transport failure cannot roll back durable creation.
+
+`work_items.is_primary` plus a partial unique index guarantees at most one
+primary WorkItem per conversation. The aggregate creation operation guarantees
+exactly one for each new Thread. A circular `conversations.primary_work_id`
+foreign key is not introduced.

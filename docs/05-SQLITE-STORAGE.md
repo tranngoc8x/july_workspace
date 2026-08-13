@@ -252,11 +252,20 @@ PRAGMA busy_timeout=5000;
 ## Transactions
 
 Phase 1 implements atomic Room/member and Conversation/member batch inserts.
+Phase 4 replaces Thread creation with one aggregate `BEGIN IMMEDIATE`
+transaction that validates the active Room and initial Agent memberships, then
+inserts the open Thread, local-user membership, initial Agent memberships and
+one open primary WorkItem. The Work title and goal mirror the Thread; its owner
+is null until Phase 6. Any failure rolls back the complete aggregate.
+
+Session bindings, ACP calls, capsules, Messages, Results, Publishes and
+Dependencies never participate in the Thread creation transaction. Session
+startup is lazy after commit.
+
 The following operation groups remain requirements for the phases that add
 their lifecycle behavior.
 
 Must be atomic:
-- thread + members + primary work creation;
 - work completion + result creation;
 - result publish;
 - dependency update;
@@ -387,6 +396,65 @@ END;
 objects. Raw
 ACP payloads, tool arguments, secrets and hidden reasoning are not stored.
 The migration is one transaction through the existing migration runner.
+
+### Phase 4 migration `0003`
+
+The locked Phase 4 migration rebuilds both membership tables as generational
+history. Existing rows become generation `1`. Existing `conversation_members`
+retain their current `left_at`; existing `room_members` remain active because
+the v1 table has no leave column.
+
+```text
+room_members new columns:
+  generation INTEGER NOT NULL CHECK (generation > 0)
+  left_at TEXT
+
+room_members primary key:
+  (room_id, agent_id, generation)
+
+conversation_members new column:
+  generation INTEGER NOT NULL CHECK (generation > 0)
+
+conversation_members primary key:
+  (conversation_id, member_type, member_id, generation)
+```
+
+Partial unique indexes allow at most one active generation for each natural
+membership key:
+
+```sql
+CREATE UNIQUE INDEX uq_room_members_active
+ON room_members(room_id, agent_id)
+WHERE left_at IS NULL;
+
+CREATE UNIQUE INDEX uq_conversation_members_active
+ON conversation_members(conversation_id, member_type, member_id)
+WHERE left_at IS NULL;
+```
+
+The rebuild preserves `role`, `joined_at`, existing `left_at` values and every
+restrictive foreign key. An add while active is a no-op; a rejoin inserts
+generation `MAX(generation) + 1`; removal sets `left_at` only on the active
+generation. All membership transitions use one application-generated UTC
+timestamp, and no transition deletes or rewrites a historical generation.
+
+`0003` also adds the primary marker without rebuilding `work_items`:
+
+```sql
+ALTER TABLE work_items
+ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0
+CHECK (is_primary IN (0, 1));
+
+CREATE UNIQUE INDEX uq_work_items_primary_conversation
+ON work_items(conversation_id)
+WHERE is_primary = 1;
+```
+
+Using `ALTER TABLE` preserves `idx_work_conversation` and avoids rebuilding a
+table already referenced by dependencies and results. Existing WorkItems
+migrate with `is_primary = 0`; July does not infer historical primary
+ownership. The aggregate Phase 4 create operation is responsible for inserting
+one primary WorkItem for every new Thread.
 
 ## No dual source of truth
 

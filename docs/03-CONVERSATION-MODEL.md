@@ -62,7 +62,15 @@ members: cashpoint, pay, infra, mobile
 
 Infra/mobile are not woken and do not receive the thread transcript.
 
+An Agent may join a Thread only while actively belonging to its Room. Room
+removal is rejected while the Agent still has an active membership in any
+Thread in that Room. July requires those Thread exits to be explicit rather
+than cascading them silently.
+
 ## Dynamic thread membership
+
+Dynamic membership through mentions is a Phase 5 feature. Phase 4 membership
+changes are explicit local-user commands.
 
 If Cashpoint says:
 

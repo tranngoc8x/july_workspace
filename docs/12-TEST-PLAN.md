@@ -8,16 +8,20 @@ Agent:
 
 Room:
 - create;
-- membership;
+- membership generation add/no-op/remove/no-op/rejoin;
 - same agent in multiple rooms.
 
 Conversation:
 - DM;
 - Thread;
+- active Room membership required for Agent Thread membership;
+- Room removal rejected while active Thread membership exists;
+- local user automatically joins a new Thread;
 - parent/child;
 - origin relation.
 
 Work:
+- exactly one primary Work is created with each new Thread;
 - valid transitions;
 - invalid transition rejection.
 
@@ -134,6 +138,13 @@ Interrupt:
 - session replacement.
 
 Restart and verify no partial state.
+
+Phase 4 migration tests prove membership generation history, at most one active
+generation per natural key, preservation of existing rows as generation `1`,
+and at most one primary Work per conversation. Aggregate tests interrupt or
+fail each Thread creation insert and prove that Thread, members and primary
+Work are either all committed or all absent. Transport startup failure after
+commit must leave the durable aggregate intact and retryable.
 
 ## 9. Permission tests
 

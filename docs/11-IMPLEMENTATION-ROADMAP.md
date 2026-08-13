@@ -139,19 +139,36 @@ IDs and lifecycle bookkeeping are not injected into the prompt.
 
 ## Phase 4 — Room + Thread MVP
 
+Locked design; implementation has not started.
+
 Implement:
 
-- rooms;
-- room membership;
-- thread creation/open;
-- thread members;
+- explicit application commands for Room/Thread create, list and membership;
+- generational Room and Thread membership with idempotent add/remove;
+- targeted `OpenThreadForAgent(thread_id, agent_id)`;
+- atomic Thread + members + primary Work creation;
 - separate agent session per conversation.
+
+The primary Work starts `Open`, mirrors the Thread title/goal and has no owner
+until Phase 6. Session/ACP startup occurs lazily after the durable create
+transaction commits. The locked future CLI uses explicit `--room` and
+`--agent`; `room use`, REPL context and `--json` remain Phase 8.
+
+Do not implement in Phase 4:
+
+- mentions or dynamic join;
+- Agent-originated membership mutation;
+- Work ownership/lifecycle behavior;
+- A2A, deliberation or structured decision artifacts.
 
 DoD:
 
 - same agent can join multiple threads without context leakage;
 - room history is not injected wholesale;
-- non-member agents do not receive thread context.
+- non-member agents do not receive thread context;
+- Thread creation cannot leave partial members or primary Work;
+- rejoin preserves prior membership history;
+- Room removal cannot silently cascade active Thread memberships.
 
 ---
 
