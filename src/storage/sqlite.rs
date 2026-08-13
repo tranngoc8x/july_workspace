@@ -285,11 +285,12 @@ impl SqliteStore {
         } else {
             Some(serde_json::to_string(&message.metadata)?)
         };
-        self.connection.execute(
+        let inserted = self.connection.execute(
             "INSERT INTO messages(
                 id, conversation_id, sender_type, sender_id, body, reply_to,
                 metadata_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO NOTHING",
             params![
                 message.id.to_string(),
                 message.conversation_id.to_string(),
@@ -301,7 +302,11 @@ impl SqliteStore {
                 message.created_at,
             ],
         )?;
-        Ok(())
+        if inserted == 1 || self.get_message(message.id)?.as_ref() == Some(message) {
+            Ok(())
+        } else {
+            Err(StoreError::MessageConflict { id: message.id })
+        }
     }
 
     pub fn get_message(&self, id: MessageId) -> Result<Option<Message>, StoreError> {

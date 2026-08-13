@@ -115,6 +115,8 @@ pub trait DirectMessageRuntime {
         decided_at: String,
     ) -> Result<(), DirectMessageError>;
 
+    async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), DirectMessageError>;
+
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), DirectMessageError>;
 }
 
@@ -261,6 +263,10 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
         self.runtime
             .respond_permission(request_id, outcome, decided_at)
             .await
+    }
+
+    pub async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), DirectMessageError> {
+        self.runtime.cancel_turn(cancelled_at).await
     }
 
     pub async fn shutdown(&mut self, stopped_at: String) -> Result<(), DirectMessageError> {

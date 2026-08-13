@@ -3,13 +3,18 @@ use crate::application::{
     DirectMessageError, DirectMessageFailureKind, DirectMessagePermissionRequestId,
     DirectMessageRuntime, DirectMessageRuntimeEvent, OpenedDirectMessage,
 };
-use crate::domain::{AgentId, Message, PermissionOutcome, SessionBinding, SessionBindingStatus};
-use crate::transport::{
-    AgentConnection, AgentTransport, PermissionRequestId, PermissionResponse, SessionRef,
-    TransportError, TransportEvent, TransportFailureKind,
+use crate::domain::{
+    Agent, AgentId, Message, PermissionOutcome, SessionBinding, SessionBindingStatus,
 };
-use std::collections::HashMap;
-use std::path::PathBuf;
+use crate::storage::SqliteStore;
+use crate::transport::{
+    AcpAgentConfig, AcpTransport, AgentConnection, AgentTransport, PermissionRequestId,
+    PermissionResponse, SessionRef, TransportError, TransportEvent, TransportFailureKind,
+};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 struct ActiveDirectMessage {
     agent_id: AgentId,
@@ -22,6 +27,7 @@ pub struct AgentDirectMessageRuntime<T: AgentTransport> {
     storage: Option<StorageWorker>,
     manager: Option<SessionManager<T>>,
     active: Option<ActiveDirectMessage>,
+    agent: Option<Agent>,
     stopped: bool,
 }
 
@@ -32,8 +38,15 @@ impl<T: AgentTransport> AgentDirectMessageRuntime<T> {
             storage: Some(storage),
             manager: None,
             active: None,
+            agent: None,
             stopped: false,
         }
+    }
+
+    fn with_agent(transport: T, storage: StorageWorker, agent: Agent) -> Self {
+        let mut runtime = Self::new(transport, storage);
+        runtime.agent = Some(agent);
+        runtime
     }
 
     fn require_active(&self) -> Result<&ActiveDirectMessage, DirectMessageError> {
@@ -50,6 +63,126 @@ impl<T: AgentTransport> AgentDirectMessageRuntime<T> {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum DirectMessageBootstrapError {
+    #[error("agent {0} does not exist")]
+    AgentNotFound(String),
+    #[error("agent {agent} is not active")]
+    AgentInactive { agent: String },
+    #[error("agent {agent} uses unsupported transport {transport}")]
+    UnsupportedTransport { agent: String, transport: String },
+    #[error("invalid ACP transport configuration: {0}")]
+    InvalidConfiguration(String),
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    Storage(#[from] crate::storage::StoreError),
+}
+
+pub fn open_acp_direct_message(
+    database_path: impl AsRef<Path>,
+    agent_name: &str,
+) -> Result<AgentDirectMessageRuntime<AcpTransport>, DirectMessageBootstrapError> {
+    let store = SqliteStore::open(database_path.as_ref())?;
+    let agent = store
+        .get_agent_by_name(agent_name)?
+        .ok_or_else(|| DirectMessageBootstrapError::AgentNotFound(agent_name.into()))?;
+    if agent.status != "active" {
+        return Err(DirectMessageBootstrapError::AgentInactive { agent: agent.name });
+    }
+    if agent.transport_type != "acp" {
+        return Err(DirectMessageBootstrapError::UnsupportedTransport {
+            agent: agent.name,
+            transport: agent.transport_type,
+        });
+    }
+    let config = parse_acp_config(&agent.transport_config)?;
+    drop(store);
+    let storage = StorageWorker::open(database_path)?;
+    Ok(AgentDirectMessageRuntime::with_agent(
+        AcpTransport::new(config),
+        storage,
+        agent,
+    ))
+}
+
+fn parse_acp_config(value: &Value) -> Result<AcpAgentConfig, DirectMessageBootstrapError> {
+    const FIELDS: [&str; 6] = [
+        "executable",
+        "arguments",
+        "environment",
+        "state_directory",
+        "expected_agent_name",
+        "expected_agent_version",
+    ];
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("expected an object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !FIELDS.contains(&field.as_str()))
+    {
+        return Err(invalid(format!("unknown field `{field}`")));
+    }
+    Ok(AcpAgentConfig {
+        executable: string(object, "executable")?.into(),
+        arguments: strings(object, "arguments")?,
+        environment: string_map(object, "environment")?,
+        state_directory: string(object, "state_directory")?.into(),
+        expected_agent_name: string(object, "expected_agent_name")?,
+        expected_agent_version: string(object, "expected_agent_version")?,
+    })
+}
+
+fn string(object: &Map<String, Value>, field: &str) -> Result<String, DirectMessageBootstrapError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid(format!("field `{field}` must be a non-empty string")))
+}
+
+fn strings(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Vec<String>, DirectMessageBootstrapError> {
+    object
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid(format!("field `{field}` must be an array")))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid(format!("field `{field}` must contain only strings")))
+        })
+        .collect()
+}
+
+fn string_map(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<BTreeMap<String, String>, DirectMessageBootstrapError> {
+    object
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| invalid(format!("field `{field}` must be an object")))?
+        .iter()
+        .map(|(key, value)| {
+            value
+                .as_str()
+                .map(|value| (key.clone(), value.to_owned()))
+                .ok_or_else(|| invalid(format!("field `{field}` values must be strings")))
+        })
+        .collect()
+}
+
+fn invalid(message: impl Into<String>) -> DirectMessageBootstrapError {
+    DirectMessageBootstrapError::InvalidConfiguration(message.into())
+}
+
 impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
     async fn open(
         &mut self,
@@ -61,11 +194,18 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
             return Err(DirectMessageError::AlreadyOpen);
         }
         let storage = self.storage.as_ref().ok_or(DirectMessageError::NotOpen)?;
-        let agent = storage
-            .get_agent_by_name(agent_name.clone())
-            .await
-            .map_err(runtime_error)?
-            .ok_or(DirectMessageError::AgentNotFound(agent_name))?;
+        let agent = match self.agent.take() {
+            Some(agent) if agent.name == agent_name => agent,
+            Some(agent) => {
+                self.agent = Some(agent);
+                return Err(DirectMessageError::AgentNotFound(agent_name));
+            }
+            None => storage
+                .get_agent_by_name(agent_name.clone())
+                .await
+                .map_err(runtime_error)?
+                .ok_or(DirectMessageError::AgentNotFound(agent_name))?,
+        };
         let conversation = storage
             .get_or_create_dm(user_id, agent.id, opened_at.clone())
             .await
@@ -280,6 +420,16 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 },
                 decided_at,
             )
+            .await
+            .map_err(runtime_error)
+    }
+
+    async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), DirectMessageError> {
+        let session = self.require_active()?.session.clone();
+        self.manager
+            .as_mut()
+            .ok_or(DirectMessageError::NotOpen)?
+            .cancel_turn(session, cancelled_at)
             .await
             .map_err(runtime_error)
     }

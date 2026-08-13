@@ -9,6 +9,9 @@ pub mod domain;
 /// Deterministic use cases coordinating domain concepts and ports.
 pub mod application;
 
+/// Minimal terminal presentation for the current roadmap phase.
+pub mod cli;
+
 /// Long-lived process and session lifecycle ownership.
 pub mod runtime;
 

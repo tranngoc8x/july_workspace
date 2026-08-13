@@ -1,4 +1,4 @@
-use crate::domain::{ConversationId, DomainError, RoomId};
+use crate::domain::{ConversationId, DomainError, MessageId, RoomId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -22,6 +22,8 @@ pub enum StoreError {
         expected: ConversationId,
         found: ConversationId,
     },
+    #[error("message {id} already exists with different content")]
+    MessageConflict { id: MessageId },
     #[error("database schema version {found} is newer than supported version {supported}")]
     DatabaseTooNew { found: i64, supported: i64 },
 }
