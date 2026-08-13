@@ -11,13 +11,20 @@ Core must run with no:
 
 ## Initial mode
 
-Start as a normal CLI/REPL.
+Phase 3 starts with one normal interactive command:
 
 ```bash
-july
+july dm <agent>
 ```
 
-No full TUI required.
+The target name is exact and resolves an Agent already stored in SQLite. The
+database path is `JULY_WORKSPACE_DB` when set, otherwise
+`$HOME/.july/workspace.db`. The Agent supplies the project root and a strict ACP
+configuration; the CLI never writes SQLite directly and does not invoke an LLM
+to route an explicit target.
+
+The full top-level REPL and other command families below remain Phase 8. No full
+TUI is required.
 
 ## Core commands
 
@@ -33,6 +40,13 @@ july agent show cashpoint
 ```bash
 july dm cashpoint
 ```
+
+The Phase 3 command preserves the submitted line exactly except for the
+terminal newline. `/quit` or EOF exits. Permission choices are displayed as a
+numbered list; invalid, blank, EOF or interrupted input resolves explicitly to
+`Cancelled`. Shutdown disconnects the current binding so the next process can
+resume it. A `Lost` binding is reported and is not replaced or replayed before
+Phase 7.
 
 ### Rooms
 

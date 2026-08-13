@@ -279,6 +279,10 @@ non-null metadata and all array/object payload columns must contain valid JSON.
 All foreign keys use SQLite's restrictive default action. Parent rows cannot
 be deleted while durable child records still reference them.
 
+Phase 3 message writes are exact-idempotent by `message.id`: retrying the same
+record succeeds after an ambiguous worker acknowledgement, while a different
+record with the same ID returns a typed conflict and leaves SQLite unchanged.
+
 ## Schema migrations
 
 Use immutable numbered migrations and:

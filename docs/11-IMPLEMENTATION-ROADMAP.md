@@ -104,6 +104,10 @@ DoD:
 
 ## Phase 3 — DM MVP
 
+Status: complete. The deterministic suite drives the real `july` binary through
+the official ACP SDK against a test-only ACP subprocess; authenticated provider
+prompts remain opt-in.
+
 Implement:
 
 ```text
@@ -125,6 +129,11 @@ DoD:
 - session resumes after restart;
 - remote-session loss has a defined error/recovery path;
 - token overhead baseline measured against direct agent usage.
+
+Baseline: for an explicit target, July sends the user's exact message body with
+zero July-injected bytes. Therefore the model-visible prompt-content token delta
+against sending the identical text directly is zero; SQLite metadata, routing
+IDs and lifecycle bookkeeping are not injected into the prompt.
 
 ---
 

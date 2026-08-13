@@ -18,13 +18,18 @@ This is an architectural choice for a long-running, stateful local developer run
 | Database | SQLite | canonical durable workspace state |
 | SQLite binding | rusqlite | explicit low-level SQLite access |
 | Serialization | serde + serde_json | config, protocol/domain metadata JSON |
-| CLI | clap | commands/subcommands/options |
+| CLI | stdlib parser in Phase 3; clap later | one current DM command; broader Phase 8 CLI |
 | Observability | tracing + tracing-subscriber | structured runtime logs/spans |
 | Domain errors | thiserror | typed library/domain errors |
 | Application boundary errors | anyhow (sparingly) | CLI/bootstrap context-rich errors |
 | IDs | ULID | stable, locally sortable identifiers; add a crate when Phase 1 implements IDs |
 
 Do not add dependencies just because they appear in this table; add them in the phase where they become necessary.
+
+Phase 3 uses `chrono` only for UTC RFC 3339 millisecond timestamps and enables
+Tokio's standard-I/O and signal features for `july dm <agent>`. It does not add
+`clap`, `anyhow` or `tracing-subscriber`; those remain unnecessary for the
+single-command surface.
 
 ## 3. Why Rust fits July Workspace
 
