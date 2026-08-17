@@ -139,7 +139,10 @@ IDs and lifecycle bookkeeping are not injected into the prompt.
 
 ## Phase 4 — Room + Thread MVP
 
-Locked design; implementation has not started.
+Implemented and verified. Phase 4 adds migration `0003`, the explicit
+application command surface, guarded SQLite membership/aggregate operations,
+and targeted isolated Thread session startup. Room/Thread shell commands remain
+deferred to Phase 8.
 
 Implement:
 
@@ -169,6 +172,11 @@ DoD:
 - Thread creation cannot leave partial members or primary Work;
 - rejoin preserves prior membership history;
 - Room removal cannot silently cascade active Thread memberships.
+
+Coverage lives in `tests/phase4_storage.rs`, `tests/phase4_application.rs` and
+`tests/thread_runtime.rs`. The runtime tests also prove that admission happens
+before transport, transport startup failure leaves the durable aggregate
+intact, and no Room or other-Thread transcript is injected.
 
 ---
 

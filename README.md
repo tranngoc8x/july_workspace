@@ -82,13 +82,14 @@ July is designed to sit around coding agents such as Codex, Claude Code, and oth
 
 ## Current Status
 
-July Workspace is currently under active development.
-
-The core workspace, persistence, agent runtime, and direct project-agent workflow are already being built and tested.
+July Workspace is currently under active development. Core roadmap Phases 0-4
+are implemented and tested: durable agent/DM state, ACP session lifecycle,
+Room/Thread membership, atomic Thread creation with primary Work, and targeted
+isolated Thread sessions. The executable remains intentionally limited to
+`july dm <agent>` until the broader command surface lands in Phase 8.
 
 Next milestones focus on:
 
-- Rooms and Threads
 - cross-agent collaboration
 - structured Results
 - dependencies between agents
