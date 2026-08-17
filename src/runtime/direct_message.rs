@@ -353,6 +353,10 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 TransportEvent::PermissionRequested(request) => {
                     self.require_session(&request.session)?;
                     let request_id = request.request_id.to_string();
+                    self.manager
+                        .as_mut()
+                        .expect("manager checked")
+                        .track_permission(request.clone());
                     self.active
                         .as_mut()
                         .expect("active checked")
@@ -384,6 +388,12 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 }
                 TransportEvent::SessionLost { session } => {
                     self.require_session(&session)?;
+                    self.manager
+                        .as_ref()
+                        .expect("manager checked")
+                        .mark_session_lost(&session, observed_at.clone())
+                        .await
+                        .map_err(runtime_error)?;
                     return Ok(Some(DirectMessageRuntimeEvent::SessionLost));
                 }
                 TransportEvent::TurnStarted { session }

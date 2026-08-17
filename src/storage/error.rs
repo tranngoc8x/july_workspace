@@ -46,6 +46,11 @@ pub enum StoreError {
     MembershipTransitionRequired(&'static str),
     #[error("agent {agent_id} must be an active member of room {room_id}")]
     RoomMembershipRequired { room_id: RoomId, agent_id: AgentId },
+    #[error("agent {agent_id} must be an active member of thread {thread_id}")]
+    ThreadMembershipRequired {
+        thread_id: ConversationId,
+        agent_id: AgentId,
+    },
     #[error("agent {agent_id} still has an active thread membership in room {room_id}")]
     RoomRemovalBlocked { room_id: RoomId, agent_id: AgentId },
     #[error("thread id {0} already exists")]

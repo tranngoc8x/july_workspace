@@ -37,6 +37,12 @@ enum Command {
     ListThreadMembers(ConversationId, Reply<Vec<ConversationMember>>),
     AddThreadMember(ConversationId, AgentId, String, Reply<bool>),
     RemoveThreadMember(ConversationId, AgentId, String, Reply<bool>),
+    AdmitThreadSession(
+        ConversationId,
+        AgentId,
+        String,
+        Reply<(Agent, Conversation, Option<SessionBinding>)>,
+    ),
     GetOrCreateDm(
         String,
         AgentId,
@@ -119,6 +125,18 @@ impl StorageWorker {
     pub async fn get_agent_by_name(&self, name: String) -> Result<Option<Agent>, RuntimeError> {
         self.request(|reply| Command::GetAgentByName(name, reply))
             .await
+    }
+
+    pub(crate) async fn admit_thread_session(
+        &self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        admitted_at: String,
+    ) -> Result<(Agent, Conversation, Option<SessionBinding>), CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply)
+        })
+        .await
     }
 
     pub async fn get_or_create_dm(
@@ -472,6 +490,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::RemoveThreadMember(thread_id, agent_id, changed_at, reply) => {
                 let _ = reply.send(store.remove_thread_member(thread_id, agent_id, &changed_at));
             }
+            Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply) => {
+                let _ = reply.send(store.admit_thread_session(thread_id, agent_id, &admitted_at));
+            }
             Command::GetOrCreateDm(user_id, agent_id, now, reply) => {
                 let _ = reply.send(store.get_or_create_dm(&user_id, agent_id, &now));
             }
@@ -531,6 +552,13 @@ fn map_store_error(error: StoreError) -> CollaborationError {
         StoreError::RoomMembershipRequired { room_id, agent_id } => {
             CollaborationError::RoomMembershipRequired { room_id, agent_id }
         }
+        StoreError::ThreadMembershipRequired {
+            thread_id,
+            agent_id,
+        } => CollaborationError::ThreadMembershipRequired {
+            thread_id,
+            agent_id,
+        },
         StoreError::RoomRemovalBlocked { room_id, agent_id } => {
             CollaborationError::RoomRemovalBlocked { room_id, agent_id }
         }

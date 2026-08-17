@@ -285,6 +285,187 @@ async fn sends_exact_content_and_persists_both_message_directions() {
 }
 
 #[tokio::test]
+async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let (transport, events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    let session = SessionRef {
+        binding_id: observed.lock().unwrap().creates[0].binding_id,
+        remote_session_id: "remote-dm".into(),
+    };
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let foreign_dm = store.get_or_create_dm("other-user", agent.id, NOW).unwrap();
+    let foreign_binding = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: foreign_dm.id,
+        agent_id: agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: Some("foreign".into()),
+        generation: 1,
+        status: SessionBindingStatus::Active,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    store.insert_session_binding(&foreign_binding).unwrap();
+    drop(store);
+
+    for correlation_id in ["invalid-option", "pending-shutdown"] {
+        events
+            .send(TransportEvent::PermissionRequested(PermissionRequest {
+                session: session.clone(),
+                request_id: PermissionRequestId::from(correlation_id),
+                options: vec![PermissionOption {
+                    id: "allow".into(),
+                    label: "Allow".into(),
+                }],
+            }))
+            .await
+            .unwrap();
+    }
+
+    let invalid = match service.next_event(NOW.into()).await.unwrap() {
+        Some(DirectMessageEvent::PermissionRequested { request_id, .. }) => request_id,
+        other => panic!("unexpected event: {other:?}"),
+    };
+    assert!(
+        service
+            .respond_permission(
+                invalid,
+                PermissionOutcome::Selected("not-advertised".into()),
+                NOW.into(),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        observed.lock().unwrap().permissions[0].outcome,
+        PermissionOutcome::Cancelled
+    );
+    assert!(matches!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::PermissionRequested { .. })
+    ));
+    events
+        .send(TransportEvent::PermissionRequested(PermissionRequest {
+            session: SessionRef {
+                binding_id: foreign_binding.id,
+                remote_session_id: "foreign".into(),
+            },
+            request_id: PermissionRequestId::from("foreign-session"),
+            options: vec![],
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::SessionMismatch)
+    );
+    events
+        .send(TransportEvent::SessionLost {
+            session: SessionRef {
+                binding_id: foreign_binding.id,
+                remote_session_id: "foreign".into(),
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::SessionMismatch)
+    );
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(foreign_binding.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Active
+    );
+    events
+        .send(TransportEvent::PermissionRequested(PermissionRequest {
+            session: session.clone(),
+            request_id: PermissionRequestId::from("queued-owned-session"),
+            options: vec![],
+        }))
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::SessionLost {
+            session: session.clone(),
+        })
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::PermissionRequested(PermissionRequest {
+            session: SessionRef {
+                binding_id: foreign_binding.id,
+                remote_session_id: "foreign".into(),
+            },
+            request_id: PermissionRequestId::from("queued-foreign-session"),
+            options: vec![],
+        }))
+        .await
+        .unwrap();
+    events
+        .send(TransportEvent::SessionLost {
+            session: SessionRef {
+                binding_id: foreign_binding.id,
+                remote_session_id: "foreign".into(),
+            },
+        })
+        .await
+        .unwrap();
+    service.shutdown(LATER.into()).await.unwrap();
+
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let cancelled: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM permission_decisions
+             WHERE correlation_id IN (
+                 'invalid-option', 'pending-shutdown', 'queued-owned-session'
+             )
+               AND outcome = 'cancelled'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cancelled, 3);
+    let foreign: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM permission_decisions
+             WHERE correlation_id IN ('foreign-session', 'queued-foreign-session')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(foreign, 0);
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(session.binding_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Lost
+    );
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(foreign_binding.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Disconnected
+    );
+}
+
+#[tokio::test]
 async fn restart_reuses_dm_and_resumes_without_replaying_history() {
     let database = TestDatabase::new();
     let agent = seed_agent(&database);

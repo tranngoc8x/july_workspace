@@ -1,6 +1,6 @@
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, Room,
-    RoomId, RoomMember, WorkItem, WorkItemId,
+    RoomId, RoomMember, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId,
 };
 use thiserror::Error;
 
@@ -83,6 +83,21 @@ pub struct RemoveThreadMember {
     pub changed_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenThreadForAgent {
+    pub thread_id: ConversationId,
+    pub agent_id: AgentId,
+    pub opened_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenedThread {
+    pub thread_id: ConversationId,
+    pub room_id: RoomId,
+    pub agent_id: AgentId,
+    pub session_binding_id: SessionBindingId,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CollaborationError {
     #[error("room {0} does not exist")]
@@ -107,12 +122,33 @@ pub enum CollaborationError {
     PrimaryWorkIdConflict(WorkItemId),
     #[error("agent {agent_id} must be an active member of room {room_id}")]
     RoomMembershipRequired { room_id: RoomId, agent_id: AgentId },
+    #[error("agent {agent_id} must be an active member of thread {thread_id}")]
+    ThreadMembershipRequired {
+        thread_id: ConversationId,
+        agent_id: AgentId,
+    },
     #[error("agent {agent_id} still has an active thread membership in room {room_id}")]
     RoomRemovalBlocked { room_id: RoomId, agent_id: AgentId },
     #[error("invalid collaboration command: {0}")]
     InvalidCommand(String),
+    #[error("a Thread is already open in this runtime")]
+    ThreadAlreadyOpen,
+    #[error("the durable Agent session was lost")]
+    SessionLost,
+    #[error("the durable Agent session is unavailable with status {0}")]
+    SessionUnavailable(SessionBindingStatus),
     #[error("collaboration runtime failed: {0}")]
     Runtime(String),
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ThreadRuntime {
+    async fn open_thread_for_agent(
+        &mut self,
+        command: OpenThreadForAgent,
+    ) -> Result<OpenedThread, CollaborationError>;
+
+    async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError>;
 }
 
 #[allow(async_fn_in_trait)]

@@ -1,18 +1,21 @@
 use super::{RuntimeError, StorageWorker};
-use crate::domain::{AgentId, PermissionDecision, SessionBinding, SessionBindingStatus};
+use crate::domain::{
+    AgentId, PermissionDecision, SessionBinding, SessionBindingId, SessionBindingStatus,
+};
 use crate::transport::{
     AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionRequestId,
     PermissionResponse, ResumeSession, SendMessage, SessionRef, TransportEvent, TransportEvents,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-pub struct SessionManager<T: AgentTransport> {
+pub(crate) struct SessionManager<T: AgentTransport> {
     transport: T,
     storage: StorageWorker,
     agent_id: AgentId,
     events: TransportEvents,
     pending_permissions: HashMap<PermissionRequestId, PermissionRequest>,
+    owned_bindings: HashSet<SessionBindingId>,
 }
 
 impl<T: AgentTransport> SessionManager<T> {
@@ -20,12 +23,15 @@ impl<T: AgentTransport> SessionManager<T> {
         &self.storage
     }
 
-    pub async fn connect(
+    pub(crate) async fn connect(
         mut transport: T,
         storage: StorageWorker,
         agent: AgentConnection,
     ) -> Result<Self, RuntimeError> {
-        transport.connect(&agent).await?;
+        if let Err(error) = transport.connect(&agent).await {
+            let _ = transport.shutdown().await;
+            return Err(error.into());
+        }
         let events = match transport.subscribe() {
             Ok(events) => events,
             Err(error) => {
@@ -39,10 +45,11 @@ impl<T: AgentTransport> SessionManager<T> {
             agent_id: agent.agent_id,
             events,
             pending_permissions: HashMap::new(),
+            owned_bindings: HashSet::new(),
         })
     }
 
-    pub async fn create_session(
+    pub(crate) async fn create_session(
         &mut self,
         mut binding: SessionBinding,
         project_root: PathBuf,
@@ -61,10 +68,11 @@ impl<T: AgentTransport> SessionManager<T> {
             let _ = self.transport.close_session(created.session.clone()).await;
             return Err(error);
         }
+        self.owned_bindings.insert(created.session.binding_id);
         Ok(created.session)
     }
 
-    pub async fn resume_session(
+    pub(crate) async fn resume_session(
         &mut self,
         binding: &SessionBinding,
         project_root: PathBuf,
@@ -90,6 +98,7 @@ impl<T: AgentTransport> SessionManager<T> {
             Ok(resumed) => {
                 self.update_binding_status(binding.id, SessionBindingStatus::Active, resumed_at)
                     .await?;
+                self.owned_bindings.insert(resumed.session.binding_id);
                 Ok(resumed.session)
             }
             Err(crate::transport::TransportError::SessionLost(_)) => {
@@ -101,7 +110,7 @@ impl<T: AgentTransport> SessionManager<T> {
         }
     }
 
-    pub async fn send_message(
+    pub(crate) async fn send_message(
         &mut self,
         session: SessionRef,
         content: String,
@@ -112,7 +121,7 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(())
     }
 
-    pub async fn cancel_turn(
+    pub(crate) async fn cancel_turn(
         &mut self,
         session: SessionRef,
         cancelled_at: String,
@@ -126,18 +135,7 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(())
     }
 
-    pub async fn close_session(
-        &mut self,
-        session: SessionRef,
-        closed_at: String,
-    ) -> Result<(), RuntimeError> {
-        self.transport.close_session(session.clone()).await?;
-        self.update_binding_status(session.binding_id, SessionBindingStatus::Closed, closed_at)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn next_event(
+    pub(crate) async fn next_event(
         &mut self,
         observed_at: &str,
     ) -> Result<Option<TransportEvent>, RuntimeError> {
@@ -145,10 +143,6 @@ impl<T: AgentTransport> SessionManager<T> {
             return Ok(None);
         };
         match &event {
-            TransportEvent::PermissionRequested(request) => {
-                self.pending_permissions
-                    .insert(request.request_id.clone(), request.clone());
-            }
             TransportEvent::TransportDisconnected { agent_id, .. }
                 if *agent_id == self.agent_id =>
             {
@@ -161,20 +155,26 @@ impl<T: AgentTransport> SessionManager<T> {
                 audit?;
                 disconnected?;
             }
-            TransportEvent::SessionLost { session } => {
-                self.update_binding_status(
-                    session.binding_id,
-                    SessionBindingStatus::Lost,
-                    observed_at.into(),
-                )
-                .await?;
-            }
             _ => {}
         }
         Ok(Some(event))
     }
 
-    pub async fn respond_permission(
+    pub(super) fn track_permission(&mut self, request: PermissionRequest) {
+        self.pending_permissions
+            .insert(request.request_id.clone(), request);
+    }
+
+    pub(super) async fn mark_session_lost(
+        &self,
+        session: &SessionRef,
+        observed_at: String,
+    ) -> Result<(), RuntimeError> {
+        self.update_binding_status(session.binding_id, SessionBindingStatus::Lost, observed_at)
+            .await
+    }
+
+    pub(crate) async fn respond_permission(
         &mut self,
         mut response: PermissionResponse,
         decided_at: String,
@@ -234,7 +234,7 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self, stopped_at: String) -> Result<(), RuntimeError> {
+    pub(crate) async fn shutdown(&mut self, stopped_at: String) -> Result<(), RuntimeError> {
         let mut first_error = self
             .audit_cancelled_permissions(None, &stopped_at)
             .await
@@ -252,6 +252,7 @@ impl<T: AgentTransport> SessionManager<T> {
                         if let Err(error) = apply_shutdown_event(
                             &self.storage,
                             self.agent_id,
+                            &self.owned_bindings,
                             event,
                             &stopped_at,
                         ).await && first_error.is_none() {
@@ -262,8 +263,14 @@ impl<T: AgentTransport> SessionManager<T> {
             }
         };
         while let Some(event) = self.events.try_recv() {
-            if let Err(error) =
-                apply_shutdown_event(&self.storage, self.agent_id, event, &stopped_at).await
+            if let Err(error) = apply_shutdown_event(
+                &self.storage,
+                self.agent_id,
+                &self.owned_bindings,
+                event,
+                &stopped_at,
+            )
+            .await
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -353,11 +360,14 @@ fn binding_session(binding: &SessionBinding) -> Result<SessionRef, RuntimeError>
 async fn apply_shutdown_event(
     storage: &StorageWorker,
     agent_id: AgentId,
+    owned_bindings: &HashSet<SessionBindingId>,
     event: TransportEvent,
     observed_at: &str,
 ) -> Result<(), RuntimeError> {
     match event {
-        TransportEvent::PermissionRequested(request) => {
+        TransportEvent::PermissionRequested(request)
+            if owned_bindings.contains(&request.session.binding_id) =>
+        {
             storage
                 .insert_permission_decision(PermissionDecision {
                     id: ulid::Ulid::generate().to_string(),
@@ -369,7 +379,7 @@ async fn apply_shutdown_event(
                 })
                 .await
         }
-        TransportEvent::SessionLost { session } => {
+        TransportEvent::SessionLost { session } if owned_bindings.contains(&session.binding_id) => {
             if storage
                 .update_session_binding_status(
                     session.binding_id,

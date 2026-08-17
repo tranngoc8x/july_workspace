@@ -326,6 +326,49 @@ impl SqliteStore {
         )
     }
 
+    pub(crate) fn admit_thread_session(
+        &mut self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        admitted_at: &str,
+    ) -> Result<(Agent, Conversation, Option<SessionBinding>), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let thread = require_open_thread(&transaction, thread_id)?;
+        let room_id = thread.room_id.expect("validated thread has a room");
+        require_active_room(&transaction, room_id)?;
+        let agent = require_active_agent_record(&transaction, agent_id)?;
+        require_active_room_membership(&transaction, room_id, agent_id)?;
+        require_active_thread_membership(&transaction, thread_id, agent_id)?;
+        let mut binding = query_optional(
+            &transaction,
+            "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
+                    generation, status, created_at, last_used_at
+             FROM session_bindings
+             WHERE conversation_id = ?1 AND agent_id = ?2
+             ORDER BY generation DESC LIMIT 1",
+            params![thread_id.to_string(), agent_id.to_string()],
+            records::session_binding,
+        )?;
+        if let Some(binding) = binding.as_mut()
+            && matches!(
+                binding.status,
+                SessionBindingStatus::Active | SessionBindingStatus::Disconnected
+            )
+            && binding.remote_session_id.is_none()
+        {
+            transaction.execute(
+                "UPDATE session_bindings SET status = 'lost', last_used_at = ?1 WHERE id = ?2",
+                params![admitted_at, binding.id.to_string()],
+            )?;
+            binding.status = SessionBindingStatus::Lost;
+            binding.last_used_at = admitted_at.into();
+        }
+        transaction.commit()?;
+        Ok((agent, thread, binding))
+    }
+
     pub fn add_thread_member(
         &mut self,
         conversation_id: ConversationId,
@@ -1168,6 +1211,26 @@ fn require_active_agent(connection: &Connection, agent_id: AgentId) -> Result<()
     }
 }
 
+fn require_active_agent_record(
+    connection: &Connection,
+    agent_id: AgentId,
+) -> Result<Agent, StoreError> {
+    let agent = query_optional(
+        connection,
+        "SELECT id, name, project_root, transport_type, transport_config_json,
+                status, metadata_json, created_at, updated_at
+         FROM agents WHERE id = ?1",
+        params![agent_id.to_string()],
+        records::agent,
+    )?
+    .ok_or(StoreError::AgentNotFound(agent_id))?;
+    if agent.status == "active" {
+        Ok(agent)
+    } else {
+        Err(StoreError::AgentInactive(agent_id))
+    }
+}
+
 fn require_thread(
     connection: &Connection,
     conversation_id: ConversationId,
@@ -1217,6 +1280,30 @@ fn require_active_room_membership(
         Ok(())
     } else {
         Err(StoreError::RoomMembershipRequired { room_id, agent_id })
+    }
+}
+
+fn require_active_thread_membership(
+    connection: &Connection,
+    thread_id: ConversationId,
+    agent_id: AgentId,
+) -> Result<(), StoreError> {
+    let active: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM conversation_members
+            WHERE conversation_id = ?1 AND member_type = 'agent'
+              AND member_id = ?2 AND left_at IS NULL
+        )",
+        params![thread_id.to_string(), agent_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::ThreadMembershipRequired {
+            thread_id,
+            agent_id,
+        })
     }
 }
 

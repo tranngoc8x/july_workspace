@@ -4,10 +4,12 @@ mod direct_message;
 mod error;
 mod session_manager;
 mod storage_worker;
+mod thread;
 
 pub use direct_message::{
     AgentDirectMessageRuntime, DirectMessageBootstrapError, open_acp_direct_message,
 };
 pub use error::RuntimeError;
-pub use session_manager::SessionManager;
+pub(crate) use session_manager::SessionManager;
 pub use storage_worker::StorageWorker;
+pub use thread::AgentThreadRuntime;
