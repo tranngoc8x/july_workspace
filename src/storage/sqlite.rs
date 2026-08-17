@@ -903,17 +903,17 @@ impl SqliteStore {
         )? != 0)
     }
 
-    pub fn mark_current_bindings_disconnected(
+    pub fn mark_binding_disconnected(
         &self,
-        agent_id: AgentId,
+        binding_id: SessionBindingId,
         last_used_at: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<bool, StoreError> {
         Ok(self.connection.execute(
             "UPDATE session_bindings
              SET status = 'disconnected', last_used_at = ?1
-             WHERE agent_id = ?2 AND status IN ('active', 'disconnected')",
-            params![last_used_at, agent_id.to_string()],
-        )?)
+             WHERE id = ?2 AND status IN ('active', 'disconnected')",
+            params![last_used_at, binding_id.to_string()],
+        )? != 0)
     }
 
     pub fn insert_permission_decision(

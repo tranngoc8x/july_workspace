@@ -461,7 +461,77 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
             .unwrap()
             .unwrap()
             .status,
+        SessionBindingStatus::Active
+    );
+}
+
+#[tokio::test]
+async fn transport_disconnect_and_shutdown_only_disconnect_the_owned_binding() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let (transport, events, observed) = FakeTransport::new();
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+    let owned_binding_id = observed.lock().unwrap().creates[0].binding_id;
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let foreign_dm = store.get_or_create_dm("other-user", agent.id, NOW).unwrap();
+    let foreign_binding = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: foreign_dm.id,
+        agent_id: agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: Some("foreign".into()),
+        generation: 1,
+        status: SessionBindingStatus::Active,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    store.insert_session_binding(&foreign_binding).unwrap();
+    drop(store);
+
+    events
+        .send(TransportEvent::TransportDisconnected {
+            agent_id: agent.id,
+            reason: "wire closed".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service.next_event(LATER.into()).await.unwrap(),
+        Some(DirectMessageEvent::Disconnected("wire closed".into()))
+    );
+
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(
+        store
+            .get_session_binding(owned_binding_id)
+            .unwrap()
+            .unwrap()
+            .status,
         SessionBindingStatus::Disconnected
+    );
+    assert_eq!(
+        store
+            .get_session_binding(foreign_binding.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Active
+    );
+    drop(store);
+
+    service.shutdown(LATER.into()).await.unwrap();
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(foreign_binding.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Active
     );
 }
 

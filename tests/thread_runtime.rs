@@ -405,6 +405,68 @@ async fn two_threads_create_distinct_sessions_without_injected_content() {
 }
 
 #[tokio::test]
+async fn shutting_down_one_thread_keeps_the_other_thread_active() {
+    let database = TestDatabase::new();
+    let first = seed(&database, true, true);
+    let second_thread = Conversation {
+        id: ConversationId::new(),
+        room_id: Some(first.room.id),
+        title: Some("Second Thread".into()),
+        ..first.thread.clone()
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .create_thread_with_primary_work(
+            &second_thread,
+            WorkItemId::new(),
+            "tony",
+            &[first.agent.id],
+        )
+        .unwrap();
+    let second = Fixture {
+        agent: first.agent.clone(),
+        room: first.room.clone(),
+        thread: second_thread,
+        primary_work_id: WorkItemId::new(),
+    };
+
+    let (first_transport, _) = FakeTransport::new("remote-thread-one");
+    let (second_transport, _) = FakeTransport::new("remote-thread-two");
+    let mut first_runtime = runtime(&database, first_transport);
+    let mut second_runtime = runtime(&database, second_transport);
+    let first_opened = first_runtime
+        .open_thread_for_agent(command(&first, NOW))
+        .await
+        .unwrap();
+    let second_opened = second_runtime
+        .open_thread_for_agent(command(&second, NOW))
+        .await
+        .unwrap();
+
+    first_runtime.shutdown(LATER.into()).await.unwrap();
+
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(
+        store
+            .get_session_binding(first_opened.session_binding_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Disconnected
+    );
+    assert_eq!(
+        store
+            .get_session_binding(second_opened.session_binding_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Active
+    );
+    drop(store);
+    second_runtime.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
 async fn transport_failure_does_not_roll_back_the_thread_aggregate() {
     for failure in ["connect", "create"] {
         let database = TestDatabase::new();

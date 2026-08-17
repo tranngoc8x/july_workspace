@@ -146,12 +146,11 @@ impl<T: AgentTransport> SessionManager<T> {
             TransportEvent::TransportDisconnected { agent_id, .. }
                 if *agent_id == self.agent_id =>
             {
-                tracing::warn!(agent_id = %agent_id, transport = "acp", "marking current session bindings disconnected");
+                tracing::warn!(agent_id = %agent_id, transport = "acp", "marking owned session bindings disconnected");
                 let audit = self.audit_cancelled_permissions(None, observed_at).await;
-                let disconnected = self
-                    .storage
-                    .mark_current_bindings_disconnected(self.agent_id, observed_at.into())
-                    .await;
+                let disconnected =
+                    disconnect_owned_bindings(&self.storage, &self.owned_bindings, observed_at)
+                        .await;
                 audit?;
                 disconnected?;
             }
@@ -276,11 +275,8 @@ impl<T: AgentTransport> SessionManager<T> {
                 first_error = Some(error);
             }
         }
-        let disconnected = self
-            .storage
-            .mark_current_bindings_disconnected(self.agent_id, stopped_at)
-            .await
-            .map(|_| ());
+        let disconnected =
+            disconnect_owned_bindings(&self.storage, &self.owned_bindings, &stopped_at).await;
         let storage = self.storage.shutdown().await;
         if let Some(error) = first_error {
             return Err(error);
@@ -396,10 +392,27 @@ async fn apply_shutdown_event(
         TransportEvent::TransportDisconnected {
             agent_id: disconnected_agent,
             ..
-        } if disconnected_agent == agent_id => storage
-            .mark_current_bindings_disconnected(agent_id, observed_at.into())
-            .await
-            .map(|_| ()),
+        } if disconnected_agent == agent_id => {
+            disconnect_owned_bindings(storage, owned_bindings, observed_at).await
+        }
         _ => Ok(()),
     }
+}
+
+async fn disconnect_owned_bindings(
+    storage: &StorageWorker,
+    owned_bindings: &HashSet<SessionBindingId>,
+    observed_at: &str,
+) -> Result<(), RuntimeError> {
+    let mut first_error = None;
+    for binding_id in owned_bindings {
+        if let Err(error) = storage
+            .mark_binding_disconnected(*binding_id, observed_at.into())
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }

@@ -75,7 +75,11 @@ enum Command {
         String,
         oneshot::Sender<Result<bool, StoreError>>,
     ),
-    MarkDisconnected(AgentId, String, oneshot::Sender<Result<usize, StoreError>>),
+    MarkDisconnected(
+        SessionBindingId,
+        String,
+        oneshot::Sender<Result<bool, StoreError>>,
+    ),
     InsertPermission(PermissionDecision, oneshot::Sender<Result<(), StoreError>>),
     GetPermission(
         String,
@@ -206,12 +210,12 @@ impl StorageWorker {
             .await
     }
 
-    pub async fn mark_current_bindings_disconnected(
+    pub async fn mark_binding_disconnected(
         &self,
-        agent_id: AgentId,
+        binding_id: SessionBindingId,
         last_used_at: String,
-    ) -> Result<usize, RuntimeError> {
-        self.request(|reply| Command::MarkDisconnected(agent_id, last_used_at, reply))
+    ) -> Result<bool, RuntimeError> {
+        self.request(|reply| Command::MarkDisconnected(binding_id, last_used_at, reply))
             .await
     }
 
@@ -517,9 +521,8 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::UpdateBindingStatus(id, status, last_used_at, reply) => {
                 let _ = reply.send(store.update_session_binding_status(id, status, &last_used_at));
             }
-            Command::MarkDisconnected(agent_id, last_used_at, reply) => {
-                let _ =
-                    reply.send(store.mark_current_bindings_disconnected(agent_id, &last_used_at));
+            Command::MarkDisconnected(binding_id, last_used_at, reply) => {
+                let _ = reply.send(store.mark_binding_disconnected(binding_id, &last_used_at));
             }
             Command::InsertPermission(decision, reply) => {
                 let _ = reply.send(store.insert_permission_decision(&decision));

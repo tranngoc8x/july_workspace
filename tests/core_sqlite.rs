@@ -736,7 +736,7 @@ fn session_lifecycle_and_permission_decision_round_trip() {
 }
 
 #[test]
-fn disconnect_marks_every_current_binding_for_an_agent() {
+fn disconnect_marks_only_the_selected_current_binding() {
     let database = TestDatabase::new();
     let store = SqliteStore::open(database.path()).unwrap();
     let worker = agent("disconnect-worker");
@@ -766,17 +766,17 @@ fn disconnect_marks_every_current_binding_for_an_agent() {
     store.insert_session_binding(&first).unwrap();
     store.insert_session_binding(&second).unwrap();
 
+    assert!(store.mark_binding_disconnected(first.id, LATER).unwrap());
+    assert_eq!(
+        store.get_session_binding(first.id).unwrap().unwrap().status,
+        SessionBindingStatus::Disconnected
+    );
     assert_eq!(
         store
-            .mark_current_bindings_disconnected(worker.id, LATER)
-            .unwrap(),
-        2
-    );
-    assert!(
-        store
-            .list_current_session_bindings_for_agent(worker.id)
+            .get_session_binding(second.id)
             .unwrap()
-            .iter()
-            .all(|binding| binding.status == SessionBindingStatus::Disconnected)
+            .unwrap()
+            .status,
+        SessionBindingStatus::Active
     );
 }
