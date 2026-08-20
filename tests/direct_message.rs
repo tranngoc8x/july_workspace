@@ -1,6 +1,6 @@
 use july_workspace::application::{
     DirectMessageError, DirectMessageEvent, DirectMessagePermissionRequestId, DirectMessageRuntime,
-    DirectMessageRuntimeEvent, DirectMessageService, OpenedDirectMessage,
+    DirectMessageRuntimeEvent, DirectMessageService, OpenAgentDirectMessage, OpenedDirectMessage,
 };
 use july_workspace::domain::{
     Agent, AgentId, ConversationId, MemberType, Message, PermissionOption, PermissionOutcome,
@@ -1045,4 +1045,110 @@ fn application_dm_types_are_transport_neutral() {
     assert!(!source.contains("crate::transport"));
     assert!(!std::any::type_name::<DirectMessagePermissionRequestId>().contains("acp"));
     let _conversation_id: Option<ConversationId> = None;
+}
+
+#[tokio::test]
+async fn explicit_agent_dm_routes_only_to_target_owner_and_persists_both_agents() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = Agent {
+        id: AgentId::new(),
+        name: "claude".into(),
+        project_root: "/workspace/target".into(),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&target)
+        .unwrap();
+    let (source_transport, _source_events, source_observed) = FakeTransport::new();
+    let (target_transport, target_events, target_observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut source_owner =
+        DirectMessageService::new(workspace.direct_message(source_transport).unwrap());
+    source_owner
+        .open("source-owner".into(), source.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let command = OpenAgentDirectMessage {
+        source_agent_id: source.id,
+        target_agent_id: target.id,
+        opened_at: NOW.into(),
+    };
+    assert!(matches!(
+        routed.open_agent(command.clone()).await,
+        Err(DirectMessageError::Runtime(message))
+            if message.contains(&format!("agent {} has no runtime owner", target.id))
+    ));
+    let mut target_owner =
+        DirectMessageService::new(workspace.direct_message(target_transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name.clone(), NOW.into())
+        .await
+        .unwrap();
+
+    let opened = routed.open_agent(command).await.unwrap();
+    assert!(opened.messages.is_empty());
+
+    let body = "  inspect this exact payload\n";
+    routed.send_message(body.into(), NOW.into()).await.unwrap();
+    assert!(source_observed.lock().unwrap().messages.is_empty());
+    let routed_session = {
+        let observed = target_observed.lock().unwrap();
+        assert_eq!(observed.connections.len(), 1);
+        assert_eq!(observed.creates.len(), 2);
+        assert_eq!(observed.messages.len(), 1);
+        assert_eq!(observed.messages[0].content, body);
+        assert_eq!(
+            observed.messages[0].session.binding_id,
+            observed.creates[1].binding_id
+        );
+        observed.messages[0].session.clone()
+    };
+
+    target_events
+        .send(TransportEvent::AgentTextDelta {
+            session: routed_session.clone(),
+            text: "target response".into(),
+        })
+        .await
+        .unwrap();
+    target_events
+        .send(TransportEvent::AgentMessageCompleted {
+            session: routed_session,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        routed.next_event(LATER.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("target response".into()))
+    );
+    let completed = routed.next_event(LATER.into()).await.unwrap().unwrap();
+    let DirectMessageEvent::MessageCompleted(completed) = completed else {
+        panic!("expected completed target response")
+    };
+    assert_eq!(completed.sender_id, target.id.to_string());
+
+    let messages = SqliteStore::open(database.path())
+        .unwrap()
+        .list_messages(opened.conversation_id)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].sender_type, MemberType::Agent);
+    assert_eq!(messages[0].sender_id, source.id.to_string());
+    assert_eq!(messages[0].body, body);
+    assert_eq!(messages[1], completed);
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    source_owner.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
 }

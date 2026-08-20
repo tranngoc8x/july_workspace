@@ -13,6 +13,13 @@ pub struct OpenedDirectMessage {
     pub messages: Vec<Message>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenAgentDirectMessage {
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub opened_at: String,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct DirectMessagePermissionRequestId(String);
 
@@ -102,6 +109,15 @@ pub trait DirectMessageRuntime {
         opened_at: String,
     ) -> Result<OpenedDirectMessage, DirectMessageError>;
 
+    async fn open_agent(
+        &mut self,
+        _command: OpenAgentDirectMessage,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        Err(DirectMessageError::Runtime(
+            "agent direct messages are unsupported by this runtime".into(),
+        ))
+    }
+
     async fn persist_message(&mut self, message: Message) -> Result<(), DirectMessageError>;
 
     async fn send_exact(&mut self, content: String) -> Result<(), DirectMessageError>;
@@ -132,7 +148,8 @@ pub struct DirectMessageService<R: DirectMessageRuntime> {
 struct ActiveDirectMessage {
     conversation_id: ConversationId,
     agent_id: AgentId,
-    user_id: String,
+    sender_type: crate::domain::MemberType,
+    sender_id: String,
     response: String,
 }
 
@@ -161,7 +178,27 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
         self.active = Some(ActiveDirectMessage {
             conversation_id: opened.conversation_id,
             agent_id: opened.agent_id,
-            user_id,
+            sender_type: crate::domain::MemberType::User,
+            sender_id: user_id,
+            response: String::new(),
+        });
+        Ok(opened)
+    }
+
+    pub async fn open_agent(
+        &mut self,
+        command: OpenAgentDirectMessage,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        if self.active.is_some() {
+            return Err(DirectMessageError::AlreadyOpen);
+        }
+        let source_agent_id = command.source_agent_id;
+        let opened = self.runtime.open_agent(command).await?;
+        self.active = Some(ActiveDirectMessage {
+            conversation_id: opened.conversation_id,
+            agent_id: opened.agent_id,
+            sender_type: crate::domain::MemberType::Agent,
+            sender_id: source_agent_id.to_string(),
             response: String::new(),
         });
         Ok(opened)
@@ -180,8 +217,8 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
             .persist_message(Message {
                 id: Default::default(),
                 conversation_id: active.conversation_id,
-                sender_type: crate::domain::MemberType::User,
-                sender_id: active.user_id.clone(),
+                sender_type: active.sender_type,
+                sender_id: active.sender_id.clone(),
                 body: content.clone(),
                 reply_to: None,
                 metadata: message_metadata("outbound"),

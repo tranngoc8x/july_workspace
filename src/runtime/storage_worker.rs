@@ -49,6 +49,7 @@ enum Command {
         String,
         oneshot::Sender<Result<Conversation, StoreError>>,
     ),
+    GetOrCreateAgentDm(AgentId, AgentId, String, Reply<Conversation>),
     InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
     ListMessages(
         ConversationId,
@@ -157,6 +158,10 @@ impl StorageWorker {
 }
 
 impl StorageHandle {
+    pub async fn get_agent(&self, id: AgentId) -> Result<Option<Agent>, RuntimeError> {
+        self.request(|reply| Command::GetAgent(id, reply)).await
+    }
+
     pub async fn get_agent_by_name(&self, name: String) -> Result<Option<Agent>, RuntimeError> {
         self.request(|reply| Command::GetAgentByName(name, reply))
             .await
@@ -182,6 +187,18 @@ impl StorageHandle {
     ) -> Result<Conversation, RuntimeError> {
         self.request(|reply| Command::GetOrCreateDm(user_id, agent_id, now, reply))
             .await
+    }
+
+    pub async fn get_or_create_agent_dm(
+        &self,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+        now: String,
+    ) -> Result<Conversation, RuntimeError> {
+        self.request(|reply| {
+            Command::GetOrCreateAgentDm(source_agent_id, target_agent_id, now, reply)
+        })
+        .await
     }
 
     pub async fn insert_message(&self, message: Message) -> Result<(), RuntimeError> {
@@ -519,6 +536,13 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::GetOrCreateDm(user_id, agent_id, now, reply) => {
                 let _ = reply.send(store.get_or_create_dm(&user_id, agent_id, &now));
+            }
+            Command::GetOrCreateAgentDm(source_agent_id, target_agent_id, now, reply) => {
+                let _ = reply.send(store.get_or_create_agent_dm(
+                    source_agent_id,
+                    target_agent_id,
+                    &now,
+                ));
             }
             Command::InsertMessage(message, reply) => {
                 let _ = reply.send(store.insert_message(&message));

@@ -1,10 +1,11 @@
 use super::{RuntimeError, RuntimeSession, StorageWorker, WorkspaceHandle, WorkspaceRuntime};
 use crate::application::{
     DirectMessageError, DirectMessageFailureKind, DirectMessagePermissionRequestId,
-    DirectMessageRuntime, DirectMessageRuntimeEvent, OpenedDirectMessage,
+    DirectMessageRuntime, DirectMessageRuntimeEvent, OpenAgentDirectMessage, OpenedDirectMessage,
 };
 use crate::domain::{
-    Agent, AgentId, Message, PermissionOutcome, SessionBinding, SessionBindingStatus,
+    Agent, AgentId, ConversationId, Message, PermissionOutcome, SessionBinding,
+    SessionBindingStatus,
 };
 use crate::storage::SqliteStore;
 use crate::transport::{
@@ -65,6 +66,90 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         } else {
             Err(DirectMessageError::SessionMismatch)
         }
+    }
+
+    async fn finish_open(
+        &mut self,
+        agent: Agent,
+        conversation_id: ConversationId,
+        messages: Vec<Message>,
+        opened_at: String,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        let storage = self.workspace.storage();
+        let binding = storage
+            .get_latest_session_binding(conversation_id, agent.id)
+            .await
+            .map_err(runtime_error)?;
+
+        match binding.as_ref().map(|binding| binding.status) {
+            Some(SessionBindingStatus::Lost) => return Err(DirectMessageError::SessionLost),
+            Some(SessionBindingStatus::Closed) => {
+                return Err(DirectMessageError::SessionUnavailable(
+                    SessionBindingStatus::Closed,
+                ));
+            }
+            Some(SessionBindingStatus::Active | SessionBindingStatus::Disconnected)
+                if binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.remote_session_id.is_none()) =>
+            {
+                let binding = binding.as_ref().expect("binding status was present");
+                storage
+                    .update_session_binding_status(
+                        binding.id,
+                        SessionBindingStatus::Lost,
+                        opened_at,
+                    )
+                    .await
+                    .map_err(runtime_error)?;
+                return Err(DirectMessageError::SessionLost);
+            }
+            _ => {}
+        }
+
+        let project_root = PathBuf::from(&agent.project_root);
+        if let Some(transport) = self.transport.take() {
+            self.workspace
+                .register_agent(
+                    AgentConnection {
+                        agent_id: agent.id,
+                        project_root: project_root.clone(),
+                    },
+                    transport,
+                )
+                .await
+                .map_err(runtime_error)?;
+        }
+        let binding = binding.unwrap_or_else(|| SessionBinding {
+            id: Default::default(),
+            conversation_id,
+            agent_id: agent.id,
+            transport_type: agent.transport_type.clone(),
+            remote_session_id: None,
+            generation: 1,
+            status: SessionBindingStatus::Active,
+            created_at: opened_at.clone(),
+            last_used_at: opened_at.clone(),
+        });
+        let session = self
+            .workspace
+            .open_session(agent.id, binding, project_root, opened_at)
+            .await
+            .map_err(runtime_error)?;
+        let session_ref = session.session().clone();
+
+        self.active = Some(ActiveDirectMessage {
+            agent_id: agent.id,
+            session: session_ref,
+            permissions: HashMap::new(),
+        });
+        self.session = Some(session);
+        Ok(OpenedDirectMessage {
+            conversation_id,
+            agent_id: agent.id,
+            agent_name: agent.name,
+            messages,
+        })
     }
 }
 
@@ -230,80 +315,48 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
             .list_messages(conversation.id)
             .await
             .map_err(runtime_error)?;
-        let binding = storage
-            .get_latest_session_binding(conversation.id, agent.id)
+        self.finish_open(agent, conversation.id, messages, opened_at)
+            .await
+    }
+
+    async fn open_agent(
+        &mut self,
+        command: OpenAgentDirectMessage,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        self.workspace.ensure_running().map_err(runtime_error)?;
+        if self.active.is_some() || self.session.is_some() {
+            return Err(DirectMessageError::AlreadyOpen);
+        }
+        if self
+            .expected_agent_id
+            .is_some_and(|expected| expected != command.target_agent_id)
+        {
+            return Err(DirectMessageError::AgentNotFound(
+                command.target_agent_id.to_string(),
+            ));
+        }
+        let storage = self.workspace.storage();
+        let conversation = storage
+            .get_or_create_agent_dm(
+                command.source_agent_id,
+                command.target_agent_id,
+                command.opened_at.clone(),
+            )
             .await
             .map_err(runtime_error)?;
-
-        match binding.as_ref().map(|binding| binding.status) {
-            Some(SessionBindingStatus::Lost) => return Err(DirectMessageError::SessionLost),
-            Some(SessionBindingStatus::Closed) => {
-                return Err(DirectMessageError::SessionUnavailable(
-                    SessionBindingStatus::Closed,
-                ));
-            }
-            Some(SessionBindingStatus::Active | SessionBindingStatus::Disconnected)
-                if binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.remote_session_id.is_none()) =>
-            {
-                let binding = binding.as_ref().expect("binding status was present");
-                storage
-                    .update_session_binding_status(
-                        binding.id,
-                        SessionBindingStatus::Lost,
-                        opened_at,
-                    )
-                    .await
-                    .map_err(runtime_error)?;
-                return Err(DirectMessageError::SessionLost);
-            }
-            _ => {}
-        }
-
-        let project_root = PathBuf::from(&agent.project_root);
-        if let Some(transport) = self.transport.take() {
-            self.workspace
-                .register_agent(
-                    AgentConnection {
-                        agent_id: agent.id,
-                        project_root: project_root.clone(),
-                    },
-                    transport,
-                )
-                .await
-                .map_err(runtime_error)?;
-        }
-        let binding = binding.unwrap_or_else(|| SessionBinding {
-            id: Default::default(),
-            conversation_id: conversation.id,
-            agent_id: agent.id,
-            transport_type: agent.transport_type.clone(),
-            remote_session_id: None,
-            generation: 1,
-            status: SessionBindingStatus::Active,
-            created_at: opened_at.clone(),
-            last_used_at: opened_at.clone(),
-        });
-        let session = self
-            .workspace
-            .open_session(agent.id, binding, project_root, opened_at)
+        let agent = storage
+            .get_agent(command.target_agent_id)
+            .await
+            .map_err(runtime_error)?
+            .ok_or_else(|| {
+                DirectMessageError::AgentNotFound(command.target_agent_id.to_string())
+            })?;
+        let messages = storage
+            .list_messages(conversation.id)
             .await
             .map_err(runtime_error)?;
-        let session_ref = session.session().clone();
-
-        self.active = Some(ActiveDirectMessage {
-            agent_id: agent.id,
-            session: session_ref,
-            permissions: HashMap::new(),
-        });
-        self.session = Some(session);
-        Ok(OpenedDirectMessage {
-            conversation_id: conversation.id,
-            agent_id: agent.id,
-            agent_name: agent.name,
-            messages,
-        })
+        self.finish_open(agent, conversation.id, messages, command.opened_at)
+            .await
     }
 
     async fn persist_message(&mut self, message: Message) -> Result<(), DirectMessageError> {
