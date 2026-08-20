@@ -45,7 +45,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     {
         std::fs::create_dir_all(parent)?;
     }
-    let runtime = open_acp_direct_message(&database, &agent_name)?;
+    let (mut workspace, runtime) = open_acp_direct_message(&database, &agent_name)?;
     let mut service = DirectMessageService::new(runtime);
     let interaction = async {
         let opened = service
@@ -61,9 +61,12 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         interact(&mut service, &opened.agent_name).await
     }
     .await;
-    let shutdown = service.shutdown(timestamp()).await;
+    let stopped_at = timestamp();
+    let context_shutdown = service.shutdown(stopped_at.clone()).await;
+    let workspace_shutdown = workspace.shutdown(stopped_at).await;
     interaction?;
-    shutdown?;
+    context_shutdown?;
+    workspace_shutdown.map_err(DirectMessageBootstrapError::from)?;
     Ok(())
 }
 

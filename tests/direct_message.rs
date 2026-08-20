@@ -6,7 +6,7 @@ use july_workspace::domain::{
     Agent, AgentId, ConversationId, MemberType, Message, PermissionOption, PermissionOutcome,
     SessionBinding, SessionBindingId, SessionBindingStatus,
 };
-use july_workspace::runtime::{AgentDirectMessageRuntime, StorageWorker};
+use july_workspace::runtime::{AgentDirectMessageRuntime, StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
 use july_workspace::transport::{
     AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionRequestId,
@@ -174,11 +174,66 @@ fn seed_agent(database: &TestDatabase) -> Agent {
     agent
 }
 
-fn runtime(
-    database: &TestDatabase,
-    transport: FakeTransport,
-) -> AgentDirectMessageRuntime<FakeTransport> {
-    AgentDirectMessageRuntime::new(transport, StorageWorker::open(database.path()).unwrap())
+fn runtime(database: &TestDatabase, transport: FakeTransport) -> TestDirectMessageRuntime {
+    let root = WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let context = root.direct_message(transport).unwrap();
+    TestDirectMessageRuntime { root, context }
+}
+
+struct TestDirectMessageRuntime {
+    root: WorkspaceRuntime<FakeTransport>,
+    context: AgentDirectMessageRuntime<FakeTransport>,
+}
+
+impl DirectMessageRuntime for TestDirectMessageRuntime {
+    async fn open(
+        &mut self,
+        user_id: String,
+        agent_name: String,
+        opened_at: String,
+    ) -> Result<OpenedDirectMessage, DirectMessageError> {
+        self.context.open(user_id, agent_name, opened_at).await
+    }
+
+    async fn persist_message(&mut self, message: Message) -> Result<(), DirectMessageError> {
+        self.context.persist_message(message).await
+    }
+
+    async fn send_exact(&mut self, content: String) -> Result<(), DirectMessageError> {
+        self.context.send_exact(content).await
+    }
+
+    async fn next_runtime_event(
+        &mut self,
+        observed_at: String,
+    ) -> Result<Option<DirectMessageRuntimeEvent>, DirectMessageError> {
+        self.context.next_runtime_event(observed_at).await
+    }
+
+    async fn respond_permission(
+        &mut self,
+        request_id: DirectMessagePermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), DirectMessageError> {
+        self.context
+            .respond_permission(request_id, outcome, decided_at)
+            .await
+    }
+
+    async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), DirectMessageError> {
+        self.context.cancel_turn(cancelled_at).await
+    }
+
+    async fn shutdown(&mut self, stopped_at: String) -> Result<(), DirectMessageError> {
+        let context = self.context.shutdown(stopped_at.clone()).await;
+        let root = self
+            .root
+            .shutdown(stopped_at)
+            .await
+            .map_err(|error| DirectMessageError::Runtime(error.to_string()));
+        context.and(root)
+    }
 }
 
 #[tokio::test]
@@ -361,10 +416,6 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
         }))
         .await
         .unwrap();
-    assert_eq!(
-        service.next_event(NOW.into()).await,
-        Err(DirectMessageError::SessionMismatch)
-    );
     events
         .send(TransportEvent::SessionLost {
             session: SessionRef {
@@ -374,10 +425,6 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
         })
         .await
         .unwrap();
-    assert_eq!(
-        service.next_event(NOW.into()).await,
-        Err(DirectMessageError::SessionMismatch)
-    );
     assert_eq!(
         SqliteStore::open(database.path())
             .unwrap()
@@ -401,6 +448,14 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
         })
         .await
         .unwrap();
+    assert!(matches!(
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::PermissionRequested { .. })
+    ));
+    assert_eq!(
+        service.next_event(NOW.into()).await,
+        Err(DirectMessageError::SessionLost)
+    );
     events
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: SessionRef {
@@ -708,7 +763,7 @@ async fn provider_missing_remote_session_marks_the_same_binding_lost() {
 }
 
 #[tokio::test]
-async fn rejects_blank_messages_and_foreign_session_events() {
+async fn rejects_blank_messages_and_does_not_observe_foreign_session_events() {
     let database = TestDatabase::new();
     seed_agent(&database);
     let (transport, events, observed) = FakeTransport::new();
@@ -733,9 +788,20 @@ async fn rejects_blank_messages_and_foreign_session_events() {
         })
         .await
         .unwrap();
+    let owned_binding_id = observed.lock().unwrap().creates[0].binding_id;
+    events
+        .send(TransportEvent::AgentTextDelta {
+            session: SessionRef {
+                binding_id: owned_binding_id,
+                remote_session_id: "remote-dm".into(),
+            },
+            text: "owned".into(),
+        })
+        .await
+        .unwrap();
     assert_eq!(
-        service.next_event(NOW.into()).await,
-        Err(DirectMessageError::SessionMismatch)
+        service.next_event(NOW.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("owned".into()))
     );
     service.shutdown(LATER.into()).await.unwrap();
     service.shutdown(LATER.into()).await.unwrap();
@@ -915,7 +981,7 @@ async fn shutdown_retries_pending_completion_before_stopping_runtime() {
 }
 
 #[tokio::test]
-async fn foreign_session_error_does_not_clear_valid_accumulated_text() {
+async fn foreign_session_event_is_not_observed_or_added_to_accumulated_text() {
     let database = TestDatabase::new();
     seed_agent(&database);
     let (transport, events, observed) = FakeTransport::new();
@@ -960,10 +1026,6 @@ async fn foreign_session_error_does_not_clear_valid_accumulated_text() {
     assert_eq!(
         service.next_event(NOW.into()).await.unwrap(),
         Some(DirectMessageEvent::TextDelta("Hello ".into()))
-    );
-    assert_eq!(
-        service.next_event(NOW.into()).await,
-        Err(DirectMessageError::SessionMismatch)
     );
     assert_eq!(
         service.next_event(NOW.into()).await.unwrap(),

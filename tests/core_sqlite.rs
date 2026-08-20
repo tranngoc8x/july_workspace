@@ -779,4 +779,30 @@ fn disconnect_marks_only_the_selected_current_binding() {
             .status,
         SessionBindingStatus::Active
     );
+
+    assert!(
+        store
+            .update_session_binding_status(first.id, SessionBindingStatus::Lost, LATER)
+            .unwrap()
+    );
+    assert!(store.mark_binding_disconnected(first.id, LATER).unwrap());
+    assert_eq!(
+        store.get_session_binding(first.id).unwrap().unwrap().status,
+        SessionBindingStatus::Lost
+    );
+    assert!(
+        store
+            .update_session_binding_status(first.id, SessionBindingStatus::Closed, LATER)
+            .unwrap()
+    );
+    assert!(store.mark_binding_disconnected(first.id, LATER).unwrap());
+    assert_eq!(
+        store.get_session_binding(first.id).unwrap().unwrap().status,
+        SessionBindingStatus::Closed
+    );
+    assert!(
+        !store
+            .mark_binding_disconnected(Default::default(), LATER)
+            .unwrap()
+    );
 }

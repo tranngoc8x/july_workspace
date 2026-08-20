@@ -137,6 +137,8 @@ pub enum CollaborationError {
     SessionLost,
     #[error("the durable Agent session is unavailable with status {0}")]
     SessionUnavailable(SessionBindingStatus),
+    #[error("session binding {0} is already attached to this runtime owner")]
+    SessionAlreadyAttached(SessionBindingId),
     #[error("collaboration runtime failed: {0}")]
     Runtime(String),
 }

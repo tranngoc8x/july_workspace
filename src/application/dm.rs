@@ -1,5 +1,6 @@
 use crate::domain::{
-    AgentId, ConversationId, Message, PermissionOption, PermissionOutcome, SessionBindingStatus,
+    AgentId, ConversationId, Message, PermissionOption, PermissionOutcome, SessionBindingId,
+    SessionBindingStatus,
 };
 use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
@@ -80,6 +81,8 @@ pub enum DirectMessageError {
     SessionLost,
     #[error("the durable agent session is unavailable with status {0}")]
     SessionUnavailable(SessionBindingStatus),
+    #[error("session binding {0} is already attached to this runtime owner")]
+    SessionAlreadyAttached(SessionBindingId),
     #[error("transport event does not belong to the open direct message")]
     SessionMismatch,
     #[error("permission request {0} is not pending")]

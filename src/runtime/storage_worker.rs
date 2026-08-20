@@ -88,8 +88,13 @@ enum Command {
     Shutdown(Option<oneshot::Sender<()>>),
 }
 
-pub struct StorageWorker {
+#[derive(Clone)]
+pub struct StorageHandle {
     commands: mpsc::Sender<Command>,
+}
+
+pub struct StorageWorker {
+    handle: StorageHandle,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -121,11 +126,37 @@ impl StorageWorker {
             }
         }
         Ok(Self {
-            commands,
+            handle: StorageHandle { commands },
             thread: Some(thread),
         })
     }
 
+    pub(crate) fn handle(&self) -> StorageHandle {
+        self.handle.clone()
+    }
+
+    pub async fn shutdown(&mut self) -> Result<(), RuntimeError> {
+        let (done, stopped) = oneshot::channel();
+        self.handle
+            .commands
+            .send(Command::Shutdown(Some(done)))
+            .await
+            .map_err(|_| RuntimeError::ChannelClosed)?;
+        stopped.await.map_err(|_| RuntimeError::ChannelClosed)?;
+        self.join()
+    }
+
+    fn join(&mut self) -> Result<(), RuntimeError> {
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| RuntimeError::StorageWorkerPanicked)?;
+        }
+        Ok(())
+    }
+}
+
+impl StorageHandle {
     pub async fn get_agent_by_name(&self, name: String) -> Result<Option<Agent>, RuntimeError> {
         self.request(|reply| Command::GetAgentByName(name, reply))
             .await
@@ -235,16 +266,6 @@ impl StorageWorker {
             .await
     }
 
-    pub async fn shutdown(&mut self) -> Result<(), RuntimeError> {
-        let (done, stopped) = oneshot::channel();
-        self.commands
-            .send(Command::Shutdown(Some(done)))
-            .await
-            .map_err(|_| RuntimeError::ChannelClosed)?;
-        stopped.await.map_err(|_| RuntimeError::ChannelClosed)?;
-        self.join()
-    }
-
     async fn request<R>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<R, StoreError>>) -> Command,
@@ -271,14 +292,13 @@ impl StorageWorker {
             .map_err(|_| CollaborationError::Runtime("storage owner channel closed".into()))?
             .map_err(map_store_error)
     }
+}
 
-    fn join(&mut self) -> Result<(), RuntimeError> {
-        if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| RuntimeError::StorageWorkerPanicked)?;
-        }
-        Ok(())
+impl std::ops::Deref for StorageWorker {
+    type Target = StorageHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handle
     }
 }
 
@@ -427,7 +447,7 @@ impl Drop for StorageWorker {
         if self.thread.is_some() {
             let (closed, receiver) = mpsc::channel(1);
             drop(receiver);
-            let commands = std::mem::replace(&mut self.commands, closed);
+            let commands = std::mem::replace(&mut self.handle.commands, closed);
             let _ = commands.try_send(Command::Shutdown(None));
             drop(commands);
             let _ = self.join();
