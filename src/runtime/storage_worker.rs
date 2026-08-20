@@ -51,6 +51,7 @@ enum Command {
     ),
     GetOrCreateAgentDm(AgentId, AgentId, String, Reply<Conversation>),
     InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
+    PersistThreadMention(Message, AgentId, AgentId, Reply<bool>),
     ListMessages(
         ConversationId,
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
@@ -204,6 +205,18 @@ impl StorageHandle {
     pub async fn insert_message(&self, message: Message) -> Result<(), RuntimeError> {
         self.request(|reply| Command::InsertMessage(message, reply))
             .await
+    }
+
+    pub async fn persist_thread_mention(
+        &self,
+        message: Message,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<bool, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::PersistThreadMention(message, source_agent_id, target_agent_id, reply)
+        })
+        .await
     }
 
     pub async fn list_messages(
@@ -547,6 +560,13 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::InsertMessage(message, reply) => {
                 let _ = reply.send(store.insert_message(&message));
             }
+            Command::PersistThreadMention(message, source_agent_id, target_agent_id, reply) => {
+                let _ = reply.send(store.persist_thread_mention(
+                    &message,
+                    source_agent_id,
+                    target_agent_id,
+                ));
+            }
             Command::ListMessages(conversation_id, reply) => {
                 let _ = reply.send(store.list_messages(conversation_id));
             }
@@ -611,6 +631,9 @@ fn map_store_error(error: StoreError) -> CollaborationError {
         }
         StoreError::ThreadIdConflict(id) => CollaborationError::ThreadIdConflict(id),
         StoreError::PrimaryWorkIdConflict(id) => CollaborationError::PrimaryWorkIdConflict(id),
+        StoreError::MessageSenderMismatch(id) => {
+            CollaborationError::InvalidCommand(format!("message sender must be agent {id}"))
+        }
         StoreError::Domain(error) => CollaborationError::InvalidCommand(error.to_string()),
         error => CollaborationError::Runtime(error.to_string()),
     }

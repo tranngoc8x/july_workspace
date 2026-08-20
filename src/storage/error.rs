@@ -57,6 +57,8 @@ pub enum StoreError {
     ThreadIdConflict(ConversationId),
     #[error("primary work id {0} already exists")]
     PrimaryWorkIdConflict(WorkItemId),
+    #[error("message sender must be agent {0}")]
+    MessageSenderMismatch(AgentId),
     #[error("message {id} already exists with different content")]
     MessageConflict { id: MessageId },
     #[error("database schema version {found} is newer than supported version {supported}")]

@@ -418,6 +418,65 @@ impl SqliteStore {
         Ok(true)
     }
 
+    pub fn persist_thread_mention(
+        &mut self,
+        message: &Message,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        message.validate()?;
+        let thread_id = message.conversation_id;
+        let thread = require_open_thread(&transaction, thread_id)?;
+        let room_id = thread.room_id.expect("validated thread has a room");
+        require_active_room(&transaction, room_id)?;
+        require_active_agent(&transaction, source_agent_id)?;
+        require_active_agent(&transaction, target_agent_id)?;
+        require_active_room_membership(&transaction, room_id, source_agent_id)?;
+        require_active_room_membership(&transaction, room_id, target_agent_id)?;
+        require_active_thread_membership(&transaction, thread_id, source_agent_id)?;
+        if message.sender_type != MemberType::Agent
+            || message.sender_id != source_agent_id.to_string()
+        {
+            return Err(StoreError::MessageSenderMismatch(source_agent_id));
+        }
+
+        let target_member_id = target_agent_id.to_string();
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_members
+                WHERE conversation_id = ?1 AND member_type = 'agent'
+                  AND member_id = ?2 AND left_at IS NULL
+            )",
+            params![thread_id.to_string(), target_member_id],
+            |row| row.get(0),
+        )?;
+        if !active {
+            let generation = next_thread_membership_generation(
+                &transaction,
+                thread_id,
+                MemberType::Agent,
+                &target_member_id,
+            )?;
+            insert_conversation_member(
+                &transaction,
+                &ConversationMember {
+                    conversation_id: thread_id,
+                    member_type: MemberType::Agent,
+                    member_id: target_member_id,
+                    generation,
+                    joined_at: message.created_at.clone(),
+                    left_at: None,
+                },
+            )?;
+        }
+        insert_message(&transaction, message)?;
+        transaction.commit()?;
+        Ok(!active)
+    }
+
     pub fn remove_thread_member(
         &mut self,
         conversation_id: ConversationId,
@@ -722,33 +781,7 @@ impl SqliteStore {
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
         message.validate()?;
-        let metadata = if message.metadata.is_null() {
-            None
-        } else {
-            Some(serde_json::to_string(&message.metadata)?)
-        };
-        let inserted = self.connection.execute(
-            "INSERT INTO messages(
-                id, conversation_id, sender_type, sender_id, body, reply_to,
-                metadata_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                message.id.to_string(),
-                message.conversation_id.to_string(),
-                message.sender_type.to_string(),
-                message.sender_id,
-                message.body,
-                message.reply_to.map(|id| id.to_string()),
-                metadata,
-                message.created_at,
-            ],
-        )?;
-        if inserted == 1 || self.get_message(message.id)?.as_ref() == Some(message) {
-            Ok(())
-        } else {
-            Err(StoreError::MessageConflict { id: message.id })
-        }
+        insert_message(&self.connection, message)
     }
 
     pub fn get_message(&self, id: MessageId) -> Result<Option<Message>, StoreError> {
@@ -1232,6 +1265,47 @@ fn insert_conversation_member(
         ],
     )?;
     Ok(())
+}
+
+fn insert_message(connection: &Connection, message: &Message) -> Result<(), StoreError> {
+    let metadata = if message.metadata.is_null() {
+        None
+    } else {
+        Some(serde_json::to_string(&message.metadata)?)
+    };
+    let inserted = connection.execute(
+        "INSERT INTO messages(
+            id, conversation_id, sender_type, sender_id, body, reply_to,
+            metadata_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO NOTHING",
+        params![
+            message.id.to_string(),
+            message.conversation_id.to_string(),
+            message.sender_type.to_string(),
+            message.sender_id,
+            message.body,
+            message.reply_to.map(|id| id.to_string()),
+            metadata,
+            message.created_at,
+        ],
+    )?;
+    if inserted == 1 {
+        return Ok(());
+    }
+    let existing = query_optional(
+        connection,
+        "SELECT id, conversation_id, sender_type, sender_id, body, reply_to,
+                metadata_json, created_at
+         FROM messages WHERE id = ?1",
+        params![message.id.to_string()],
+        records::message,
+    )?;
+    if existing.as_ref() == Some(message) {
+        Ok(())
+    } else {
+        Err(StoreError::MessageConflict { id: message.id })
+    }
 }
 
 fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(), StoreError> {
