@@ -503,12 +503,17 @@ async fn thread_context_is_terminal_after_shutdown() {
         WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
     let mut context = workspace.thread_with_transport(transport).unwrap();
 
-    context
+    let opened = context
         .open_thread_for_agent(command(&fixture, NOW))
         .await
         .unwrap();
     context.shutdown(LATER.into()).await.unwrap();
     context.shutdown(LATER.into()).await.unwrap();
+    let binding = SqliteStore::open(database.path())
+        .unwrap()
+        .get_session_binding(opened.session_binding_id)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         context
@@ -517,6 +522,56 @@ async fn thread_context_is_terminal_after_shutdown() {
         Err(CollaborationError::ContextStopped)
     );
     assert_eq!(observed.lock().unwrap().creates.len(), 1);
+    assert!(observed.lock().unwrap().resumes.is_empty());
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(opened.session_binding_id)
+            .unwrap(),
+        Some(binding)
+    );
+
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_thread_detach_remains_terminal_and_can_be_retried() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database, true, true);
+    let (transport, _) = FakeTransport::new("remote-thread");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut context = workspace.thread_with_transport(transport).unwrap();
+    let opened = context
+        .open_thread_for_agent(command(&fixture, NOW))
+        .await
+        .unwrap();
+    let lock = rusqlite::Connection::open(database.path()).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+
+    assert!(matches!(
+        context.shutdown(LATER.into()).await,
+        Err(CollaborationError::Runtime(_))
+    ));
+    assert_eq!(
+        context
+            .open_thread_for_agent(command(&fixture, LATER))
+            .await,
+        Err(CollaborationError::ContextStopped)
+    );
+
+    lock.execute_batch("ROLLBACK").unwrap();
+    context.shutdown(LATER.into()).await.unwrap();
+    context.shutdown(LATER.into()).await.unwrap();
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_session_binding(opened.session_binding_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Disconnected
+    );
 
     workspace.shutdown(LATER.into()).await.unwrap();
 }

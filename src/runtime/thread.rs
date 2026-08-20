@@ -140,13 +140,19 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
     }
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {
-        if self.stopped {
+        if self.stopped && self.session.is_none() {
             return Ok(());
         }
         self.stopped = true;
         self.opened = false;
         if let Some(mut session) = self.session.take() {
-            session.detach(stopped_at).await.map_err(runtime_error)
+            match session.detach(stopped_at).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.session = Some(session);
+                    Err(runtime_error(error))
+                }
+            }
         } else {
             Ok(())
         }
