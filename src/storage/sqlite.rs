@@ -636,6 +636,90 @@ impl SqliteStore {
         Ok(conversation)
     }
 
+    pub fn get_or_create_agent_dm(
+        &mut self,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+        now: &str,
+    ) -> Result<Conversation, StoreError> {
+        if source_agent_id == target_agent_id {
+            return Err(StoreError::InvalidStoredValue(
+                "agent DM requires distinct agent IDs",
+            ));
+        }
+        let conversation = Conversation {
+            id: ConversationId::new(),
+            kind: ConversationKind::Dm,
+            room_id: None,
+            title: None,
+            goal: None,
+            parent_conversation_id: None,
+            origin_conversation_id: None,
+            status: "open".into(),
+            created_at: now.into(),
+            updated_at: now.into(),
+        };
+        let members = [
+            ConversationMember {
+                conversation_id: conversation.id,
+                member_type: MemberType::Agent,
+                member_id: source_agent_id.to_string(),
+                generation: 1,
+                joined_at: now.into(),
+                left_at: None,
+            },
+            ConversationMember {
+                conversation_id: conversation.id,
+                member_type: MemberType::Agent,
+                member_id: target_agent_id.to_string(),
+                generation: 1,
+                joined_at: now.into(),
+                left_at: None,
+            },
+        ];
+        conversation.validate()?;
+        for member in &members {
+            member.validate()?;
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_agent(&transaction, source_agent_id)?;
+        require_active_agent(&transaction, target_agent_id)?;
+        let existing = query_optional(
+            &transaction,
+            "SELECT c.id, c.type, c.room_id, c.title, c.goal, c.parent_conversation_id,
+                    c.origin_conversation_id, c.status, c.created_at, c.updated_at
+             FROM conversations c
+             WHERE c.type = 'dm' AND c.status = 'open'
+               AND 2 = (
+                   SELECT COUNT(*) FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.left_at IS NULL
+               )
+               AND 2 = (
+                   SELECT COUNT(*) FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.member_type = 'agent'
+                     AND m.member_id IN (?1, ?2) AND m.left_at IS NULL
+               )
+             ORDER BY c.created_at, c.id
+             LIMIT 1",
+            params![source_agent_id.to_string(), target_agent_id.to_string()],
+            records::conversation,
+        )?;
+        if let Some(existing) = existing {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+
+        insert_conversation(&transaction, &conversation)?;
+        for member in &members {
+            insert_conversation_member(&transaction, member)?;
+        }
+        transaction.commit()?;
+        Ok(conversation)
+    }
+
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
         message.validate()?;
         let metadata = if message.metadata.is_null() {

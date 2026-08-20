@@ -7,6 +7,7 @@ use july_workspace::runtime::StorageWorker;
 use july_workspace::storage::{SqliteStore, StoreError};
 use rusqlite::Connection;
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use ulid::Ulid;
@@ -197,6 +198,158 @@ fn get_or_create_dm_rejects_blank_user_and_timestamp() {
 }
 
 #[test]
+fn get_or_create_agent_dm_reuses_only_the_exact_active_agent_pair() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let source = agent("codex");
+    let target = agent("claude");
+    let other = agent("gemini");
+    for agent in [&source, &target, &other] {
+        store.insert_agent(agent).unwrap();
+    }
+
+    let user_dm = store.get_or_create_dm("tony", source.id, NOW).unwrap();
+    let wrong_pair = dm();
+    store
+        .insert_conversation_with_members(
+            &wrong_pair,
+            &[
+                ConversationMember {
+                    conversation_id: wrong_pair.id,
+                    member_type: MemberType::Agent,
+                    member_id: source.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+                ConversationMember {
+                    conversation_id: wrong_pair.id,
+                    member_type: MemberType::Agent,
+                    member_id: other.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+            ],
+        )
+        .unwrap();
+    let extra_member = dm();
+    store
+        .insert_conversation_with_members(
+            &extra_member,
+            &[
+                ConversationMember {
+                    conversation_id: extra_member.id,
+                    member_type: MemberType::Agent,
+                    member_id: source.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+                ConversationMember {
+                    conversation_id: extra_member.id,
+                    member_type: MemberType::Agent,
+                    member_id: target.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+                ConversationMember {
+                    conversation_id: extra_member.id,
+                    member_type: MemberType::Agent,
+                    member_id: other.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+            ],
+        )
+        .unwrap();
+    let closed = Conversation {
+        status: "closed".into(),
+        ..dm()
+    };
+    store
+        .insert_conversation_with_members(
+            &closed,
+            &[
+                ConversationMember {
+                    conversation_id: closed.id,
+                    member_type: MemberType::Agent,
+                    member_id: source.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+                ConversationMember {
+                    conversation_id: closed.id,
+                    member_type: MemberType::Agent,
+                    member_id: target.id.to_string(),
+                    generation: 1,
+                    joined_at: NOW.into(),
+                    left_at: None,
+                },
+            ],
+        )
+        .unwrap();
+
+    let created = store
+        .get_or_create_agent_dm(source.id, target.id, NOW)
+        .unwrap();
+    assert_ne!(created.id, user_dm.id);
+    assert_ne!(created.id, wrong_pair.id);
+    assert_ne!(created.id, extra_member.id);
+    assert_ne!(created.id, closed.id);
+    assert_eq!(
+        store
+            .get_or_create_agent_dm(target.id, source.id, LATER)
+            .unwrap(),
+        created
+    );
+    let members = store.list_conversation_members(created.id).unwrap();
+    assert_eq!(members.len(), 2);
+    assert!(members.iter().all(|member| {
+        member.member_type == MemberType::Agent
+            && member.generation == 1
+            && member.joined_at == NOW
+            && member.left_at.is_none()
+    }));
+    assert_eq!(
+        members
+            .into_iter()
+            .map(|member| member.member_id)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([source.id.to_string(), target.id.to_string()])
+    );
+}
+
+#[test]
+fn get_or_create_agent_dm_rejects_self_missing_and_inactive_agents() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let source = agent("codex");
+    let mut inactive = agent("claude");
+    inactive.status = "inactive".into();
+    store.insert_agent(&source).unwrap();
+    store.insert_agent(&inactive).unwrap();
+
+    assert!(matches!(
+        store.get_or_create_agent_dm(source.id, source.id, NOW),
+        Err(StoreError::InvalidStoredValue(
+            "agent DM requires distinct agent IDs"
+        ))
+    ));
+    assert!(matches!(
+        store.get_or_create_agent_dm(source.id, AgentId::new(), NOW),
+        Err(StoreError::AgentNotFound(_))
+    ));
+    assert!(matches!(
+        store.get_or_create_agent_dm(source.id, inactive.id, NOW),
+        Err(StoreError::AgentInactive(id)) if id == inactive.id
+    ));
+}
+
+#[test]
 fn concurrent_get_or_create_dm_returns_one_conversation() {
     let database = TestDatabase::new();
     let target = agent("codex");
@@ -228,6 +381,43 @@ fn concurrent_get_or_create_dm_returns_one_conversation() {
     let first = first.join().unwrap().unwrap();
     let second = second.join().unwrap().unwrap();
     assert_eq!(first.id, second.id);
+}
+
+#[test]
+fn concurrent_get_or_create_agent_dm_returns_one_conversation() {
+    let database = TestDatabase::new();
+    let source = agent("codex");
+    let target = agent("claude");
+    let store = SqliteStore::open(database.path()).unwrap();
+    store.insert_agent(&source).unwrap();
+    store.insert_agent(&target).unwrap();
+    drop(store);
+
+    let mut first_store = SqliteStore::open(database.path()).unwrap();
+    let mut second_store = SqliteStore::open(database.path()).unwrap();
+    let blocker = Connection::open(database.path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = barrier.clone();
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.get_or_create_agent_dm(source.id, target.id, NOW)
+    });
+    let second_barrier = barrier.clone();
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_store.get_or_create_agent_dm(target.id, source.id, LATER)
+    });
+
+    barrier.wait();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    blocker.execute_batch("COMMIT").unwrap();
+
+    assert_eq!(
+        first.join().unwrap().unwrap().id,
+        second.join().unwrap().unwrap().id
+    );
 }
 
 #[test]
