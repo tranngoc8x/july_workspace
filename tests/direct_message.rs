@@ -1152,3 +1152,49 @@ async fn explicit_agent_dm_routes_only_to_target_owner_and_persists_both_agents(
     target_owner.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }
+
+#[tokio::test]
+async fn neutral_runtime_cannot_open_agent_dm_or_register_the_target_owner() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = Agent {
+        id: AgentId::new(),
+        name: "claude".into(),
+        project_root: "/workspace/target".into(),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&target)
+        .unwrap();
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut neutral = DirectMessageService::new(workspace.direct_message(transport).unwrap());
+
+    assert_eq!(
+        neutral
+            .open_agent(OpenAgentDirectMessage {
+                source_agent_id: source.id,
+                target_agent_id: target.id,
+                opened_at: NOW.into(),
+            })
+            .await,
+        Err(DirectMessageError::AgentTargetNotBound)
+    );
+    assert!(observed.lock().unwrap().connections.is_empty());
+    assert!(observed.lock().unwrap().creates.is_empty());
+    let conversation_count: i64 = rusqlite::Connection::open(database.path())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(conversation_count, 0);
+
+    neutral.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}

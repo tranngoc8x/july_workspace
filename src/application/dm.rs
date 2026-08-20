@@ -84,6 +84,8 @@ pub enum DirectMessageError {
     AlreadyOpen,
     #[error("direct message is not open")]
     NotOpen,
+    #[error("agent direct messages require a runtime bound to the target agent")]
+    AgentTargetNotBound,
     #[error("the durable agent session was lost")]
     SessionLost,
     #[error("the durable agent session is unavailable with status {0}")]

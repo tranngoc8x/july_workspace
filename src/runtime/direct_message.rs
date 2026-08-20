@@ -30,6 +30,7 @@ pub struct AgentDirectMessageRuntime<T: AgentTransport + Send + 'static> {
     active: Option<ActiveDirectMessage>,
     agent: Option<Agent>,
     expected_agent_id: Option<AgentId>,
+    agent_route_bound: bool,
     stopped: bool,
 }
 
@@ -39,6 +40,7 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         transport: Option<T>,
         expected_agent_id: Option<AgentId>,
     ) -> Self {
+        let agent_route_bound = transport.is_none() && expected_agent_id.is_some();
         Self {
             workspace,
             transport,
@@ -46,6 +48,7 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
             active: None,
             agent: None,
             expected_agent_id,
+            agent_route_bound,
             stopped: false,
         }
     }
@@ -326,6 +329,9 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
         self.workspace.ensure_running().map_err(runtime_error)?;
         if self.active.is_some() || self.session.is_some() {
             return Err(DirectMessageError::AlreadyOpen);
+        }
+        if !self.agent_route_bound {
+            return Err(DirectMessageError::AgentTargetNotBound);
         }
         if self
             .expected_agent_id
