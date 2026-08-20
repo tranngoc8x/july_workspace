@@ -6,6 +6,7 @@ mod error;
 use crate::domain::{AgentId, PermissionOption, PermissionOutcome, SessionBindingId};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
+use std::future::Future;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -241,25 +242,36 @@ fn char_boundary(text: &str, maximum: usize) -> usize {
     boundary
 }
 
-#[allow(async_fn_in_trait)]
 pub trait AgentTransport {
-    async fn connect(&mut self, agent: &AgentConnection) -> Result<(), TransportError>;
-    async fn create_session(
+    fn connect(
+        &mut self,
+        agent: &AgentConnection,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn create_session(
         &mut self,
         request: CreateSession,
-    ) -> Result<SessionCreated, TransportError>;
-    async fn resume_session(
+    ) -> impl Future<Output = Result<SessionCreated, TransportError>> + Send;
+    fn resume_session(
         &mut self,
         request: ResumeSession,
-    ) -> Result<SessionResumed, TransportError>;
-    async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError>;
-    async fn cancel_turn(&mut self, session: SessionRef) -> Result<(), TransportError>;
-    async fn respond_permission(
+    ) -> impl Future<Output = Result<SessionResumed, TransportError>> + Send;
+    fn send_message(
+        &mut self,
+        request: SendMessage,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn cancel_turn(
+        &mut self,
+        session: SessionRef,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn respond_permission(
         &mut self,
         response: PermissionResponse,
-    ) -> Result<(), TransportError>;
-    async fn close_session(&mut self, session: SessionRef) -> Result<(), TransportError>;
-    async fn shutdown(&mut self) -> Result<(), TransportError>;
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn close_session(
+        &mut self,
+        session: SessionRef,
+    ) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send;
     fn subscribe(&mut self) -> Result<TransportEvents, TransportError>;
 }
 

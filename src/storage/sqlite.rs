@@ -908,12 +908,16 @@ impl SqliteStore {
         binding_id: SessionBindingId,
         last_used_at: &str,
     ) -> Result<bool, StoreError> {
-        Ok(self.connection.execute(
+        if self.connection.execute(
             "UPDATE session_bindings
              SET status = 'disconnected', last_used_at = ?1
              WHERE id = ?2 AND status IN ('active', 'disconnected')",
             params![last_used_at, binding_id.to_string()],
-        )? != 0)
+        )? != 0
+        {
+            return Ok(true);
+        }
+        Ok(self.get_session_binding(binding_id)?.is_some())
     }
 
     pub fn insert_permission_decision(

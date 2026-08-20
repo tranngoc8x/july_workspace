@@ -1,4 +1,4 @@
-use super::{RuntimeError, StorageWorker};
+use super::{RuntimeError, StorageHandle};
 use crate::domain::{
     AgentId, PermissionDecision, SessionBinding, SessionBindingId, SessionBindingStatus,
 };
@@ -6,26 +6,22 @@ use crate::transport::{
     AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionRequestId,
     PermissionResponse, ResumeSession, SendMessage, SessionRef, TransportEvent, TransportEvents,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub(crate) struct SessionManager<T: AgentTransport> {
     transport: T,
-    storage: StorageWorker,
+    storage: StorageHandle,
     agent_id: AgentId,
     events: TransportEvents,
-    pending_permissions: HashMap<PermissionRequestId, PermissionRequest>,
-    owned_bindings: HashSet<SessionBindingId>,
+    pending_permissions: HashMap<(SessionBindingId, PermissionRequestId), PermissionRequest>,
+    owned_bindings: HashMap<SessionBindingId, SessionRef>,
 }
 
 impl<T: AgentTransport> SessionManager<T> {
-    pub(super) fn storage(&self) -> &StorageWorker {
-        &self.storage
-    }
-
     pub(crate) async fn connect(
         mut transport: T,
-        storage: StorageWorker,
+        storage: StorageHandle,
         agent: AgentConnection,
     ) -> Result<Self, RuntimeError> {
         if let Err(error) = transport.connect(&agent).await {
@@ -45,7 +41,7 @@ impl<T: AgentTransport> SessionManager<T> {
             agent_id: agent.agent_id,
             events,
             pending_permissions: HashMap::new(),
-            owned_bindings: HashSet::new(),
+            owned_bindings: HashMap::new(),
         })
     }
 
@@ -68,7 +64,8 @@ impl<T: AgentTransport> SessionManager<T> {
             let _ = self.transport.close_session(created.session.clone()).await;
             return Err(error);
         }
-        self.owned_bindings.insert(created.session.binding_id);
+        self.owned_bindings
+            .insert(created.session.binding_id, created.session.clone());
         Ok(created.session)
     }
 
@@ -98,7 +95,8 @@ impl<T: AgentTransport> SessionManager<T> {
             Ok(resumed) => {
                 self.update_binding_status(binding.id, SessionBindingStatus::Active, resumed_at)
                     .await?;
-                self.owned_bindings.insert(resumed.session.binding_id);
+                self.owned_bindings
+                    .insert(resumed.session.binding_id, resumed.session.clone());
                 Ok(resumed.session)
             }
             Err(crate::transport::TransportError::SessionLost(_)) => {
@@ -135,6 +133,28 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(())
     }
 
+    pub(crate) async fn detach_session(
+        &mut self,
+        session: &SessionRef,
+        detached_at: String,
+    ) -> Result<(), RuntimeError> {
+        if self.owned_bindings.get(&session.binding_id) != Some(session) {
+            return Err(RuntimeError::SessionBindingNotFound(session.binding_id));
+        }
+        self.audit_cancelled_permissions(Some(session), &detached_at)
+            .await?;
+        let disconnected = self
+            .storage
+            .mark_binding_disconnected(session.binding_id, detached_at)
+            .await?;
+        if disconnected {
+            self.owned_bindings.remove(&session.binding_id);
+            Ok(())
+        } else {
+            Err(RuntimeError::SessionBindingNotFound(session.binding_id))
+        }
+    }
+
     pub(crate) async fn next_event(
         &mut self,
         observed_at: &str,
@@ -160,12 +180,18 @@ impl<T: AgentTransport> SessionManager<T> {
     }
 
     pub(super) fn track_permission(&mut self, request: PermissionRequest) {
-        self.pending_permissions
-            .insert(request.request_id.clone(), request);
+        self.pending_permissions.insert(
+            (request.session.binding_id, request.request_id.clone()),
+            request,
+        );
+    }
+
+    pub(super) fn owns_session(&self, session: &SessionRef) -> bool {
+        self.owned_bindings.get(&session.binding_id) == Some(session)
     }
 
     pub(super) async fn mark_session_lost(
-        &self,
+        &mut self,
         session: &SessionRef,
         observed_at: String,
     ) -> Result<(), RuntimeError> {
@@ -180,12 +206,16 @@ impl<T: AgentTransport> SessionManager<T> {
     ) -> Result<(), RuntimeError> {
         let request = self
             .pending_permissions
-            .get(&response.request_id)
+            .get(&(response.session.binding_id, response.request_id.clone()))
             .cloned()
             .ok_or_else(|| {
                 RuntimeError::PermissionRequestNotFound(response.request_id.to_string())
             })?;
-        let session_mismatch = request.session != response.session;
+        if request.session != response.session {
+            return Err(RuntimeError::PermissionRequestNotFound(
+                response.request_id.to_string(),
+            ));
+        }
         let invalid_option = match &response.outcome {
             crate::domain::PermissionOutcome::Selected(option_id)
                 if !request.options.iter().any(|option| option.id == *option_id) =>
@@ -194,7 +224,7 @@ impl<T: AgentTransport> SessionManager<T> {
             }
             _ => None,
         };
-        if session_mismatch || invalid_option.is_some() {
+        if invalid_option.is_some() {
             response.session = request.session.clone();
             response.outcome = crate::domain::PermissionOutcome::Cancelled;
         }
@@ -207,6 +237,7 @@ impl<T: AgentTransport> SessionManager<T> {
             decided_at,
         };
         if let Err(error) = self.storage.insert_permission_decision(decision).await {
+            let key = (request.session.binding_id, response.request_id.clone());
             let _ = self
                 .transport
                 .respond_permission(PermissionResponse {
@@ -215,16 +246,12 @@ impl<T: AgentTransport> SessionManager<T> {
                     outcome: crate::domain::PermissionOutcome::Cancelled,
                 })
                 .await;
-            self.pending_permissions.remove(&response.request_id);
+            self.pending_permissions.remove(&key);
             return Err(error);
         }
-        self.pending_permissions.remove(&request.request_id);
+        self.pending_permissions
+            .remove(&(request.session.binding_id, request.request_id.clone()));
         self.transport.respond_permission(response).await?;
-        if session_mismatch {
-            return Err(RuntimeError::PermissionRequestNotFound(
-                request.request_id.to_string(),
-            ));
-        }
         if let Some(option_id) = invalid_option {
             return Err(
                 crate::transport::TransportError::PermissionOptionNotAdvertised(option_id).into(),
@@ -277,13 +304,11 @@ impl<T: AgentTransport> SessionManager<T> {
         }
         let disconnected =
             disconnect_owned_bindings(&self.storage, &self.owned_bindings, &stopped_at).await;
-        let storage = self.storage.shutdown().await;
         if let Some(error) = first_error {
             return Err(error);
         }
         transport?;
-        disconnected?;
-        storage
+        disconnected
     }
 
     async fn audit_cancelled_permissions(
@@ -307,18 +332,20 @@ impl<T: AgentTransport> SessionManager<T> {
                 outcome: crate::domain::PermissionOutcome::Cancelled,
                 decided_at: decided_at.into(),
             };
-            if let Err(error) = self.storage.insert_permission_decision(decision).await
-                && first_error.is_none()
-            {
-                first_error = Some(error);
+            match self.storage.insert_permission_decision(decision).await {
+                Ok(()) => {
+                    self.pending_permissions
+                        .remove(&(request.session.binding_id, request.request_id.clone()));
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
             }
-            self.pending_permissions.remove(&request.request_id);
         }
         first_error.map_or(Ok(()), Err)
     }
 
     async fn update_binding_status(
-        &self,
+        &mut self,
         id: crate::domain::SessionBindingId,
         status: SessionBindingStatus,
         changed_at: String,
@@ -354,15 +381,15 @@ fn binding_session(binding: &SessionBinding) -> Result<SessionRef, RuntimeError>
 }
 
 async fn apply_shutdown_event(
-    storage: &StorageWorker,
+    storage: &StorageHandle,
     agent_id: AgentId,
-    owned_bindings: &HashSet<SessionBindingId>,
+    owned_bindings: &HashMap<SessionBindingId, SessionRef>,
     event: TransportEvent,
     observed_at: &str,
 ) -> Result<(), RuntimeError> {
     match event {
         TransportEvent::PermissionRequested(request)
-            if owned_bindings.contains(&request.session.binding_id) =>
+            if owned_bindings.get(&request.session.binding_id) == Some(&request.session) =>
         {
             storage
                 .insert_permission_decision(PermissionDecision {
@@ -375,7 +402,9 @@ async fn apply_shutdown_event(
                 })
                 .await
         }
-        TransportEvent::SessionLost { session } if owned_bindings.contains(&session.binding_id) => {
+        TransportEvent::SessionLost { session }
+            if owned_bindings.get(&session.binding_id) == Some(&session) =>
+        {
             if storage
                 .update_session_binding_status(
                     session.binding_id,
@@ -400,12 +429,12 @@ async fn apply_shutdown_event(
 }
 
 async fn disconnect_owned_bindings(
-    storage: &StorageWorker,
-    owned_bindings: &HashSet<SessionBindingId>,
+    storage: &StorageHandle,
+    owned_bindings: &HashMap<SessionBindingId, SessionRef>,
     observed_at: &str,
 ) -> Result<(), RuntimeError> {
     let mut first_error = None;
-    for binding_id in owned_bindings {
+    for binding_id in owned_bindings.keys() {
         if let Err(error) = storage
             .mark_binding_disconnected(*binding_id, observed_at.into())
             .await

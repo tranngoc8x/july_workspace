@@ -5,7 +5,7 @@ use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, Room, RoomId, SessionBinding,
     SessionBindingId, SessionBindingStatus, WorkItemId,
 };
-use july_workspace::runtime::{AgentThreadRuntime, StorageWorker};
+use july_workspace::runtime::{AgentThreadRuntime, StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
 use july_workspace::transport::{
     AgentConnection, AgentTransport, CreateSession, PermissionResponse, ResumeSession, SendMessage,
@@ -54,6 +54,7 @@ struct ObservedTransport {
 
 struct FakeTransport {
     events: Option<tokio::sync::mpsc::Receiver<july_workspace::transport::TransportEvent>>,
+    _event_source: tokio::sync::mpsc::Sender<july_workspace::transport::TransportEvent>,
     observed: Arc<Mutex<ObservedTransport>>,
     remote_session_id: String,
     resume_lost: bool,
@@ -63,11 +64,12 @@ struct FakeTransport {
 
 impl FakeTransport {
     fn new(remote_session_id: &str) -> (Self, Arc<Mutex<ObservedTransport>>) {
-        let (_sender, receiver) = tokio::sync::mpsc::channel(4);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
         let observed = Arc::new(Mutex::new(ObservedTransport::default()));
         (
             Self {
                 events: Some(receiver),
+                _event_source: sender,
                 observed: observed.clone(),
                 remote_session_id: remote_session_id.into(),
                 resume_lost: false,
@@ -223,8 +225,34 @@ fn seed(
     }
 }
 
-fn runtime(database: &TestDatabase, transport: FakeTransport) -> AgentThreadRuntime<FakeTransport> {
-    AgentThreadRuntime::new(transport, StorageWorker::open(database.path()).unwrap())
+fn runtime(database: &TestDatabase, transport: FakeTransport) -> TestThreadRuntime {
+    let root = WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let context = root.thread_with_transport(transport).unwrap();
+    TestThreadRuntime { root, context }
+}
+
+struct TestThreadRuntime {
+    root: WorkspaceRuntime<FakeTransport>,
+    context: AgentThreadRuntime<FakeTransport>,
+}
+
+impl ThreadRuntime for TestThreadRuntime {
+    async fn open_thread_for_agent(
+        &mut self,
+        command: OpenThreadForAgent,
+    ) -> Result<OpenedThread, CollaborationError> {
+        self.context.open_thread_for_agent(command).await
+    }
+
+    async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {
+        let context = self.context.shutdown(stopped_at.clone()).await;
+        let root = self
+            .root
+            .shutdown(stopped_at)
+            .await
+            .map_err(|error| CollaborationError::Runtime(error.to_string()));
+        context.and(root)
+    }
 }
 
 fn command(fixture: &Fixture, opened_at: &str) -> OpenThreadForAgent {
@@ -502,8 +530,12 @@ async fn transport_failure_does_not_roll_back_the_thread_aggregate() {
                 .len(),
             2
         );
-        assert_eq!(observed.lock().unwrap().shutdowns, 1);
+        assert_eq!(
+            observed.lock().unwrap().shutdowns,
+            usize::from(failure == "connect")
+        );
         runtime.shutdown(LATER.into()).await.unwrap();
+        assert_eq!(observed.lock().unwrap().shutdowns, 1);
     }
 }
 

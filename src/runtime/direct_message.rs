@@ -1,4 +1,4 @@
-use super::{RuntimeError, SessionManager, StorageWorker};
+use super::{RuntimeError, RuntimeSession, StorageWorker, WorkspaceHandle, WorkspaceRuntime};
 use crate::application::{
     DirectMessageError, DirectMessageFailureKind, DirectMessagePermissionRequestId,
     DirectMessageRuntime, DirectMessageRuntimeEvent, OpenedDirectMessage,
@@ -8,8 +8,8 @@ use crate::domain::{
 };
 use crate::storage::SqliteStore;
 use crate::transport::{
-    AcpAgentConfig, AcpTransport, AgentConnection, AgentTransport, PermissionRequestId,
-    PermissionResponse, SessionRef, TransportError, TransportEvent, TransportFailureKind,
+    AcpAgentConfig, AcpTransport, AgentConnection, AgentTransport, PermissionRequestId, SessionRef,
+    TransportError, TransportEvent, TransportFailureKind,
 };
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -22,31 +22,36 @@ struct ActiveDirectMessage {
     permissions: HashMap<String, SessionRef>,
 }
 
-pub struct AgentDirectMessageRuntime<T: AgentTransport> {
+pub struct AgentDirectMessageRuntime<T: AgentTransport + Send + 'static> {
+    workspace: WorkspaceHandle<T>,
     transport: Option<T>,
-    storage: Option<StorageWorker>,
-    manager: Option<SessionManager<T>>,
+    session: Option<RuntimeSession>,
     active: Option<ActiveDirectMessage>,
     agent: Option<Agent>,
+    expected_agent_id: Option<AgentId>,
     stopped: bool,
 }
 
-impl<T: AgentTransport> AgentDirectMessageRuntime<T> {
-    pub fn new(transport: T, storage: StorageWorker) -> Self {
+impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
+    pub(crate) fn from_workspace(
+        workspace: WorkspaceHandle<T>,
+        transport: Option<T>,
+        expected_agent_id: Option<AgentId>,
+    ) -> Self {
         Self {
-            transport: Some(transport),
-            storage: Some(storage),
-            manager: None,
+            workspace,
+            transport,
+            session: None,
             active: None,
             agent: None,
+            expected_agent_id,
             stopped: false,
         }
     }
 
-    fn with_agent(transport: T, storage: StorageWorker, agent: Agent) -> Self {
-        let mut runtime = Self::new(transport, storage);
-        runtime.agent = Some(agent);
-        runtime
+    pub(crate) fn with_agent(mut self, agent: Agent) -> Self {
+        self.agent = Some(agent);
+        self
     }
 
     fn require_active(&self) -> Result<&ActiveDirectMessage, DirectMessageError> {
@@ -82,7 +87,13 @@ pub enum DirectMessageBootstrapError {
 pub fn open_acp_direct_message(
     database_path: impl AsRef<Path>,
     agent_name: &str,
-) -> Result<AgentDirectMessageRuntime<AcpTransport>, DirectMessageBootstrapError> {
+) -> Result<
+    (
+        WorkspaceRuntime<AcpTransport>,
+        AgentDirectMessageRuntime<AcpTransport>,
+    ),
+    DirectMessageBootstrapError,
+> {
     let store = SqliteStore::open(database_path.as_ref())?;
     let agent = store
         .get_agent_by_name(agent_name)?
@@ -99,11 +110,9 @@ pub fn open_acp_direct_message(
     let config = parse_acp_config(&agent.transport_config)?;
     drop(store);
     let storage = StorageWorker::open(database_path)?;
-    Ok(AgentDirectMessageRuntime::with_agent(
-        AcpTransport::new(config),
-        storage,
-        agent,
-    ))
+    let workspace = WorkspaceRuntime::new(storage)?;
+    let runtime = workspace.direct_message_with_agent(AcpTransport::new(config), agent);
+    Ok((workspace, runtime))
 }
 
 fn parse_acp_config(value: &Value) -> Result<AcpAgentConfig, DirectMessageBootstrapError> {
@@ -183,17 +192,18 @@ fn invalid(message: impl Into<String>) -> DirectMessageBootstrapError {
     DirectMessageBootstrapError::InvalidConfiguration(message.into())
 }
 
-impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
+impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
     async fn open(
         &mut self,
         user_id: String,
         agent_name: String,
         opened_at: String,
     ) -> Result<OpenedDirectMessage, DirectMessageError> {
-        if self.active.is_some() || self.manager.is_some() {
+        self.workspace.ensure_running().map_err(runtime_error)?;
+        if self.active.is_some() || self.session.is_some() {
             return Err(DirectMessageError::AlreadyOpen);
         }
-        let storage = self.storage.as_ref().ok_or(DirectMessageError::NotOpen)?;
+        let storage = self.workspace.storage();
         let agent = match self.agent.take() {
             Some(agent) if agent.name == agent_name => agent,
             Some(agent) => {
@@ -204,8 +214,14 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 .get_agent_by_name(agent_name.clone())
                 .await
                 .map_err(runtime_error)?
-                .ok_or(DirectMessageError::AgentNotFound(agent_name))?,
+                .ok_or_else(|| DirectMessageError::AgentNotFound(agent_name.clone()))?,
         };
+        if self
+            .expected_agent_id
+            .is_some_and(|expected| expected != agent.id)
+        {
+            return Err(DirectMessageError::AgentNotFound(agent_name));
+        }
         let conversation = storage
             .get_or_create_dm(user_id, agent.id, opened_at.clone())
             .await
@@ -245,61 +261,43 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
             _ => {}
         }
 
-        let transport = self.transport.take().ok_or(DirectMessageError::NotOpen)?;
-        let storage = self.storage.take().ok_or(DirectMessageError::NotOpen)?;
         let project_root = PathBuf::from(&agent.project_root);
-        let mut manager = SessionManager::connect(
-            transport,
-            storage,
-            AgentConnection {
-                agent_id: agent.id,
-                project_root: project_root.clone(),
-            },
-        )
-        .await
-        .map_err(runtime_error)?;
-
-        let session = match binding {
-            Some(binding) => {
-                manager
-                    .resume_session(&binding, project_root, opened_at.clone())
-                    .await
-            }
-            None => {
-                manager
-                    .create_session(
-                        SessionBinding {
-                            id: Default::default(),
-                            conversation_id: conversation.id,
-                            agent_id: agent.id,
-                            transport_type: agent.transport_type.clone(),
-                            remote_session_id: None,
-                            generation: 1,
-                            status: SessionBindingStatus::Active,
-                            created_at: opened_at.clone(),
-                            last_used_at: opened_at.clone(),
-                        },
-                        project_root,
-                    )
-                    .await
-            }
-        };
-        let session = match session {
-            Ok(session) => session,
-            Err(error) => {
-                let error = runtime_error(error);
-                let _ = manager.shutdown(opened_at).await;
-                self.stopped = true;
-                return Err(error);
-            }
-        };
+        if let Some(transport) = self.transport.take() {
+            self.workspace
+                .register_agent(
+                    AgentConnection {
+                        agent_id: agent.id,
+                        project_root: project_root.clone(),
+                    },
+                    transport,
+                )
+                .await
+                .map_err(runtime_error)?;
+        }
+        let binding = binding.unwrap_or_else(|| SessionBinding {
+            id: Default::default(),
+            conversation_id: conversation.id,
+            agent_id: agent.id,
+            transport_type: agent.transport_type.clone(),
+            remote_session_id: None,
+            generation: 1,
+            status: SessionBindingStatus::Active,
+            created_at: opened_at.clone(),
+            last_used_at: opened_at.clone(),
+        });
+        let session = self
+            .workspace
+            .open_session(agent.id, binding, project_root, opened_at)
+            .await
+            .map_err(runtime_error)?;
+        let session_ref = session.session().clone();
 
         self.active = Some(ActiveDirectMessage {
             agent_id: agent.id,
-            session,
+            session: session_ref,
             permissions: HashMap::new(),
         });
-        self.manager = Some(manager);
+        self.session = Some(session);
         Ok(OpenedDirectMessage {
             conversation_id: conversation.id,
             agent_id: agent.id,
@@ -309,9 +307,7 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
     }
 
     async fn persist_message(&mut self, message: Message) -> Result<(), DirectMessageError> {
-        self.manager
-            .as_ref()
-            .ok_or(DirectMessageError::NotOpen)?
+        self.workspace
             .storage()
             .insert_message(message)
             .await
@@ -319,27 +315,26 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
     }
 
     async fn send_exact(&mut self, content: String) -> Result<(), DirectMessageError> {
-        let session = self.require_active()?.session.clone();
-        self.manager
-            .as_mut()
+        self.require_active()?;
+        self.session
+            .as_ref()
             .ok_or(DirectMessageError::NotOpen)?
-            .send_message(session, content)
+            .send_message(content)
             .await
             .map_err(runtime_error)
     }
 
     async fn next_runtime_event(
         &mut self,
-        observed_at: String,
+        _observed_at: String,
     ) -> Result<Option<DirectMessageRuntimeEvent>, DirectMessageError> {
         loop {
             let event = self
-                .manager
+                .session
                 .as_mut()
                 .ok_or(DirectMessageError::NotOpen)?
-                .next_event(&observed_at)
-                .await
-                .map_err(runtime_error)?;
+                .next_event()
+                .await;
             let Some(event) = event else { return Ok(None) };
             match event {
                 TransportEvent::AgentTextDelta { session, text } => {
@@ -353,10 +348,6 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 TransportEvent::PermissionRequested(request) => {
                     self.require_session(&request.session)?;
                     let request_id = request.request_id.to_string();
-                    self.manager
-                        .as_mut()
-                        .expect("manager checked")
-                        .track_permission(request.clone());
                     self.active
                         .as_mut()
                         .expect("active checked")
@@ -388,12 +379,6 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
                 }
                 TransportEvent::SessionLost { session } => {
                     self.require_session(&session)?;
-                    self.manager
-                        .as_ref()
-                        .expect("manager checked")
-                        .mark_session_lost(&session, observed_at.clone())
-                        .await
-                        .map_err(runtime_error)?;
                     return Ok(Some(DirectMessageRuntimeEvent::SessionLost));
                 }
                 TransportEvent::TurnStarted { session }
@@ -412,22 +397,18 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
         outcome: PermissionOutcome,
         decided_at: String,
     ) -> Result<(), DirectMessageError> {
-        let session = self
-            .active
+        self.active
             .as_mut()
             .ok_or(DirectMessageError::NotOpen)?
             .permissions
             .remove(request_id.as_str())
             .ok_or_else(|| DirectMessageError::PermissionRequestNotFound(request_id.to_string()))?;
-        self.manager
-            .as_mut()
+        self.session
+            .as_ref()
             .ok_or(DirectMessageError::NotOpen)?
             .respond_permission(
-                PermissionResponse {
-                    session,
-                    request_id: PermissionRequestId::from(request_id.to_string()),
-                    outcome,
-                },
+                PermissionRequestId::from(request_id.to_string()),
+                outcome,
                 decided_at,
             )
             .await
@@ -435,11 +416,11 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
     }
 
     async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), DirectMessageError> {
-        let session = self.require_active()?.session.clone();
-        self.manager
-            .as_mut()
+        self.require_active()?;
+        self.session
+            .as_ref()
             .ok_or(DirectMessageError::NotOpen)?
-            .cancel_turn(session, cancelled_at)
+            .cancel_turn(cancelled_at)
             .await
             .map_err(runtime_error)
     }
@@ -450,22 +431,11 @@ impl<T: AgentTransport> DirectMessageRuntime for AgentDirectMessageRuntime<T> {
         }
         self.stopped = true;
         self.active = None;
-        if let Some(mut manager) = self.manager.take() {
-            return manager.shutdown(stopped_at).await.map_err(runtime_error);
+        if let Some(mut session) = self.session.take() {
+            session.detach(stopped_at).await.map_err(runtime_error)
+        } else {
+            Ok(())
         }
-
-        let transport_result = if let Some(mut transport) = self.transport.take() {
-            transport.shutdown().await.map_err(transport_error)
-        } else {
-            Ok(())
-        };
-        let storage_result = if let Some(mut storage) = self.storage.take() {
-            storage.shutdown().await.map_err(runtime_error)
-        } else {
-            Ok(())
-        };
-        transport_result?;
-        storage_result
     }
 }
 
@@ -475,6 +445,9 @@ fn runtime_error(error: RuntimeError) -> DirectMessageError {
         RuntimeError::MissingRemoteSession => DirectMessageError::SessionLost,
         RuntimeError::PermissionRequestNotFound(id) => {
             DirectMessageError::PermissionRequestNotFound(id)
+        }
+        RuntimeError::SessionBindingAlreadyAttached(id) => {
+            DirectMessageError::SessionAlreadyAttached(id)
         }
         other => DirectMessageError::Runtime(other.to_string()),
     }
