@@ -62,6 +62,17 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         self.active.as_ref().ok_or(DirectMessageError::NotOpen)
     }
 
+    fn ensure_openable(&self) -> Result<(), DirectMessageError> {
+        if self.stopped {
+            return Err(DirectMessageError::ContextStopped);
+        }
+        self.workspace.ensure_running().map_err(runtime_error)?;
+        if self.active.is_some() || self.session.is_some() {
+            return Err(DirectMessageError::AlreadyOpen);
+        }
+        Ok(())
+    }
+
     fn require_session(&self, session: &SessionRef) -> Result<(), DirectMessageError> {
         let active = self.active.as_ref().ok_or(DirectMessageError::NotOpen)?;
         if active.session == *session {
@@ -287,10 +298,7 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
         agent_name: String,
         opened_at: String,
     ) -> Result<OpenedDirectMessage, DirectMessageError> {
-        self.workspace.ensure_running().map_err(runtime_error)?;
-        if self.active.is_some() || self.session.is_some() {
-            return Err(DirectMessageError::AlreadyOpen);
-        }
+        self.ensure_openable()?;
         let storage = self.workspace.storage();
         let agent = match self.agent.take() {
             Some(agent) if agent.name == agent_name => agent,
@@ -326,10 +334,7 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
         &mut self,
         command: OpenAgentDirectMessage,
     ) -> Result<OpenedDirectMessage, DirectMessageError> {
-        self.workspace.ensure_running().map_err(runtime_error)?;
-        if self.active.is_some() || self.session.is_some() {
-            return Err(DirectMessageError::AlreadyOpen);
-        }
+        self.ensure_openable()?;
         if !self.agent_route_bound {
             return Err(DirectMessageError::AgentTargetNotBound);
         }

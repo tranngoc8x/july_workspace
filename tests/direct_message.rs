@@ -1198,3 +1198,95 @@ async fn neutral_runtime_cannot_open_agent_dm_or_register_the_target_owner() {
     neutral.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }
+
+#[tokio::test]
+async fn user_direct_message_context_is_terminal_after_shutdown() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut service = DirectMessageService::new(workspace.direct_message(transport).unwrap());
+    let opened = service
+        .open("tony".into(), agent.name.clone(), NOW.into())
+        .await
+        .unwrap();
+
+    service.shutdown(LATER.into()).await.unwrap();
+    service.shutdown(LATER.into()).await.unwrap();
+    assert_eq!(
+        service.open("tony".into(), agent.name, LATER.into()).await,
+        Err(DirectMessageError::ContextStopped)
+    );
+    assert_eq!(observed.lock().unwrap().creates.len(), 1);
+    assert!(observed.lock().unwrap().messages.is_empty());
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_latest_session_binding(opened.conversation_id, agent.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Disconnected
+    );
+
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_direct_message_context_is_terminal_after_shutdown() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = Agent {
+        id: AgentId::new(),
+        name: "claude".into(),
+        project_root: "/workspace/target".into(),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&target)
+        .unwrap();
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = DirectMessageService::new(workspace.direct_message(transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let command = OpenAgentDirectMessage {
+        source_agent_id: source.id,
+        target_agent_id: target.id,
+        opened_at: NOW.into(),
+    };
+    let opened = routed.open_agent(command.clone()).await.unwrap();
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    routed.shutdown(LATER.into()).await.unwrap();
+    assert_eq!(
+        routed.open_agent(command).await,
+        Err(DirectMessageError::ContextStopped)
+    );
+    assert_eq!(observed.lock().unwrap().creates.len(), 2);
+    assert!(observed.lock().unwrap().messages.is_empty());
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_latest_session_binding(opened.conversation_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionBindingStatus::Disconnected
+    );
+
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
