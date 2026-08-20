@@ -495,6 +495,33 @@ async fn shutting_down_one_thread_keeps_the_other_thread_active() {
 }
 
 #[tokio::test]
+async fn thread_context_is_terminal_after_shutdown() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database, true, true);
+    let (transport, observed) = FakeTransport::new("remote-thread");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut context = workspace.thread_with_transport(transport).unwrap();
+
+    context
+        .open_thread_for_agent(command(&fixture, NOW))
+        .await
+        .unwrap();
+    context.shutdown(LATER.into()).await.unwrap();
+    context.shutdown(LATER.into()).await.unwrap();
+
+    assert_eq!(
+        context
+            .open_thread_for_agent(command(&fixture, LATER))
+            .await,
+        Err(CollaborationError::ContextStopped)
+    );
+    assert_eq!(observed.lock().unwrap().creates.len(), 1);
+
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
 async fn transport_failure_does_not_roll_back_the_thread_aggregate() {
     for failure in ["connect", "create"] {
         let database = TestDatabase::new();

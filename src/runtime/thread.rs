@@ -65,6 +65,9 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
         &mut self,
         command: OpenThreadForAgent,
     ) -> Result<OpenedThread, CollaborationError> {
+        if self.stopped {
+            return Err(CollaborationError::ContextStopped);
+        }
         self.workspace.ensure_running().map_err(runtime_error)?;
         if self.opened || self.session.is_some() {
             return Err(CollaborationError::ThreadAlreadyOpen);

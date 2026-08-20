@@ -133,6 +133,8 @@ pub enum CollaborationError {
     InvalidCommand(String),
     #[error("a Thread is already open in this runtime")]
     ThreadAlreadyOpen,
+    #[error("Thread context is stopped")]
+    ContextStopped,
     #[error("the durable Agent session was lost")]
     SessionLost,
     #[error("the durable Agent session is unavailable with status {0}")]
