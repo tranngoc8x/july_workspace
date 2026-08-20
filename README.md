@@ -83,10 +83,11 @@ July is designed to sit around coding agents such as Codex, Claude Code, and oth
 ## Current Status
 
 July Workspace is currently under active development. Core roadmap Phases 0-4
-are implemented and tested: durable agent/DM state, ACP session lifecycle,
-Room/Thread membership, atomic Thread creation with primary Work, and targeted
-isolated Thread sessions. The executable remains intentionally limited to
-`july dm <agent>` until the broader command surface lands in Phase 8.
+plus Phase 5.1 are implemented and tested: durable agent/DM state, ACP session
+lifecycle, Room/Thread membership, atomic Thread creation with primary Work,
+targeted isolated Thread sessions, and explicit Agent-to-Agent DM. The
+executable remains intentionally limited to `july dm <agent>`; no
+Agent-to-Agent DM CLI exists yet.
 
 Next milestones focus on:
 

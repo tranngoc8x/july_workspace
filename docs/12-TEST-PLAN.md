@@ -47,12 +47,16 @@ Assert:
 
 ## 3. Messaging
 
-Test:
-- user → agent DM;
-- agent → agent DM;
-- thread mention;
-- dynamic member join;
-- offline recipient;
+Current Phase 5.1 coverage:
+- exact active unordered Agent pair reuse;
+- target-only exact-body delivery through the shared owner;
+- deterministic typed routing to the target owner;
+- durable source/target attribution for both sides of the DM.
+
+Planned Phase 5 coverage:
+- thread mention and dynamic member join;
+- offline persistence/delivery with `PENDING`, `DELIVERED`, and `FAILED`;
+- restart, isolation, and delivery regression tests;
 - retry after transport failure.
 
 ## 4. Publish

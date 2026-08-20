@@ -182,9 +182,28 @@ intact, and no Room or other-Thread transcript is injected.
 
 ## Phase 5 — Agent-to-Agent Messaging
 
-Implement:
+### Phase 5.1 — Explicit Agent-to-Agent DM
 
-- agent DM;
+Status: implemented and verified. The current slice proves exact active
+unordered Agent pair reuse, deterministic typed target routing through an
+existing shared target owner, exact-body source delivery, and durable
+source/target attribution. It has no semantic router.
+
+### Phase 5.2 — Thread mention and dynamic member join
+
+Status: planned.
+
+### Phase 5.3 — Offline persistence and delivery
+
+Status: planned. Delivery states will include `PENDING`, `DELIVERED`, and
+`FAILED`.
+
+### Phase 5.4 — Restart, isolation, and delivery regression tests
+
+Status: planned.
+
+Remaining implementation:
+
 - thread mentions;
 - dynamic member join;
 - offline message persistence/delivery.
