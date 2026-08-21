@@ -1,0 +1,15 @@
+[2026-08-20 20:55:08] auto-setup start (pid=12359, repo=JULY_WORKSPACE)
+[2026-08-20 20:55:08] lock acquired (pid=12359)
+[2026-08-20 20:55:09] assign port=14620 (was empty)
+[2026-08-20 20:55:09] lock released (pid=12359)
+[2026-08-20 20:55:09] bd healthy, done
+[2026-08-20 20:57:07] auto-setup start (pid=18008, repo=JULY_WORKSPACE)
+[2026-08-20 20:57:07] lock acquired (pid=18008)
+[2026-08-20 20:57:07] port 14620 OK, không đổi
+[2026-08-20 20:57:07] lock released (pid=18008)
+[2026-08-20 20:57:08] bd healthy, done
+[2026-08-20 20:57:18] auto-setup start (pid=18506, repo=JULY_WORKSPACE)
+[2026-08-20 20:57:18] lock acquired (pid=18506)
+[2026-08-20 20:57:18] port 14620 OK, không đổi
+[2026-08-20 20:57:18] lock released (pid=18506)
+[2026-08-20 20:57:19] bd healthy, done
