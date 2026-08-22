@@ -2,7 +2,7 @@ use super::StoreError;
 use crate::domain::{
     Agent, Checkpoint, Conversation, ConversationMember, DomainError, Memory, Message,
     MessageDelivery, PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room,
-    RoomMember, SessionBinding, WorkDependency, WorkItem, WorkResult,
+    RoomMember, SessionBinding, SessionRecovery, WorkDependency, WorkItem, WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -214,6 +214,18 @@ pub(super) fn session_binding(row: &Row<'_>) -> Result<SessionBinding, StoreErro
         created_at: row.get(7)?,
         last_used_at: row.get(8)?,
     })
+}
+
+pub(super) fn session_recovery(row: &Row<'_>) -> Result<SessionRecovery, StoreError> {
+    let recovery = SessionRecovery {
+        session_binding_id: id(row.get(0)?)?,
+        source_binding_id: id(row.get(1)?)?,
+        capsule: row.get(2)?,
+        capsule_delivered_at: row.get(3)?,
+        created_at: row.get(4)?,
+    };
+    recovery.validate()?;
+    Ok(recovery)
 }
 
 pub(super) fn permission_decision(row: &Row<'_>) -> Result<PermissionDecision, StoreError> {

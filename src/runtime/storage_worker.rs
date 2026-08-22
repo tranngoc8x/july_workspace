@@ -9,7 +9,8 @@ use crate::domain::{
     Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, MemberType,
     Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision,
     Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
+    WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -148,6 +149,16 @@ enum Command {
         String,
         oneshot::Sender<Result<bool, StoreError>>,
     ),
+    BeginSessionReplacement(
+        SessionBindingId,
+        SessionBindingId,
+        String,
+        String,
+        Reply<(SessionBinding, SessionRecovery)>,
+    ),
+    GetSessionRecovery(SessionBindingId, Reply<Option<SessionRecovery>>),
+    AttachReplacementRemoteSession(SessionBindingId, String, String, Reply<SessionBinding>),
+    MarkSessionRecoveryCapsuleDelivered(SessionBindingId, String, Reply<bool>),
     InsertPermission(PermissionDecision, oneshot::Sender<Result<(), StoreError>>),
     GetPermission(
         String,
@@ -459,6 +470,61 @@ impl StorageHandle {
     ) -> Result<bool, RuntimeError> {
         self.request(|reply| Command::MarkDisconnected(binding_id, last_used_at, reply))
             .await
+    }
+
+    pub async fn begin_session_replacement(
+        &self,
+        source_binding_id: SessionBindingId,
+        replacement_binding_id: SessionBindingId,
+        capsule: String,
+        replaced_at: String,
+    ) -> Result<(SessionBinding, SessionRecovery), RuntimeError> {
+        self.request(|reply| {
+            Command::BeginSessionReplacement(
+                source_binding_id,
+                replacement_binding_id,
+                capsule,
+                replaced_at,
+                reply,
+            )
+        })
+        .await
+    }
+
+    pub async fn get_session_recovery(
+        &self,
+        session_binding_id: SessionBindingId,
+    ) -> Result<Option<SessionRecovery>, RuntimeError> {
+        self.request(|reply| Command::GetSessionRecovery(session_binding_id, reply))
+            .await
+    }
+
+    pub async fn attach_replacement_remote_session(
+        &self,
+        session_binding_id: SessionBindingId,
+        remote_session_id: String,
+        attached_at: String,
+    ) -> Result<SessionBinding, RuntimeError> {
+        self.request(|reply| {
+            Command::AttachReplacementRemoteSession(
+                session_binding_id,
+                remote_session_id,
+                attached_at,
+                reply,
+            )
+        })
+        .await
+    }
+
+    pub async fn mark_session_recovery_capsule_delivered(
+        &self,
+        session_binding_id: SessionBindingId,
+        delivered_at: String,
+    ) -> Result<bool, RuntimeError> {
+        self.request(|reply| {
+            Command::MarkSessionRecoveryCapsuleDelivered(session_binding_id, delivered_at, reply)
+        })
+        .await
     }
 
     pub async fn insert_permission_decision(
@@ -1038,6 +1104,45 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::MarkDisconnected(binding_id, last_used_at, reply) => {
                 let _ = reply.send(store.mark_binding_disconnected(binding_id, &last_used_at));
+            }
+            Command::BeginSessionReplacement(
+                source_binding_id,
+                replacement_binding_id,
+                capsule,
+                replaced_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.begin_session_replacement(
+                    source_binding_id,
+                    replacement_binding_id,
+                    &capsule,
+                    &replaced_at,
+                ));
+            }
+            Command::GetSessionRecovery(session_binding_id, reply) => {
+                let _ = reply.send(store.get_session_recovery(session_binding_id));
+            }
+            Command::AttachReplacementRemoteSession(
+                session_binding_id,
+                remote_session_id,
+                attached_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.attach_replacement_remote_session(
+                    session_binding_id,
+                    &remote_session_id,
+                    &attached_at,
+                ));
+            }
+            Command::MarkSessionRecoveryCapsuleDelivered(
+                session_binding_id,
+                delivered_at,
+                reply,
+            ) => {
+                let _ = reply.send(
+                    store
+                        .mark_session_recovery_capsule_delivered(session_binding_id, &delivered_at),
+                );
             }
             Command::InsertPermission(decision, reply) => {
                 let _ = reply.send(store.insert_permission_decision(&decision));

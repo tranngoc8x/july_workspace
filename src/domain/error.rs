@@ -16,6 +16,8 @@ pub enum DomainError {
     DependencyResultStatusMismatch,
     #[error("session generation must be greater than zero")]
     InvalidSessionGeneration,
+    #[error("session recovery source and replacement must differ")]
+    SessionRecoverySelfReference,
     #[error("membership generation must be greater than zero")]
     InvalidMembershipGeneration,
     #[error("capsule delivery timestamp requires a capsule")]

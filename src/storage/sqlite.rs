@@ -4,7 +4,7 @@ use crate::domain::{
     ConversationMember, DeliveryStatus, MemberType, Memory, MemoryId, MemoryKind, MemoryScopeType,
     Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome, Publish, PublishId,
     ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
-    WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -52,6 +52,10 @@ const MIGRATIONS: [Migration; 10] = [
     Migration {
         version: 10,
         sql: include_str!("migrations/0010_phase6_invariants.sql"),
+    },
+    Migration {
+        version: 11,
+        sql: include_str!("migrations/0011_session_recovery.sql"),
     },
 ];
 
@@ -1639,6 +1643,221 @@ impl SqliteStore {
         Ok(self.get_session_binding(binding_id)?.is_some())
     }
 
+    pub fn begin_session_replacement(
+        &mut self,
+        source_binding_id: SessionBindingId,
+        replacement_binding_id: SessionBindingId,
+        capsule: &str,
+        replaced_at: &str,
+    ) -> Result<(SessionBinding, SessionRecovery), StoreError> {
+        let requested_recovery = SessionRecovery {
+            session_binding_id: replacement_binding_id,
+            source_binding_id,
+            capsule: capsule.into(),
+            capsule_delivered_at: None,
+            created_at: replaced_at.into(),
+        };
+        requested_recovery.validate()?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source = session_binding_by_id(&transaction, source_binding_id)?.ok_or(
+            StoreError::SessionReplacementSourceNotFound(source_binding_id),
+        )?;
+
+        if let Some(existing_recovery) =
+            session_recovery_by_source(&transaction, source_binding_id)?
+        {
+            if existing_recovery.session_binding_id == replacement_binding_id
+                && existing_recovery.capsule == capsule
+                && existing_recovery.created_at == replaced_at
+            {
+                let replacement = session_binding_by_id(&transaction, replacement_binding_id)?
+                    .ok_or(StoreError::SessionRecoveryNotFound(replacement_binding_id))?;
+                transaction.commit()?;
+                return Ok((replacement, existing_recovery));
+            }
+            return Err(StoreError::SessionReplacementConflict {
+                source_binding_id,
+                replacement_binding_id,
+            });
+        }
+
+        if session_binding_by_id(&transaction, replacement_binding_id)?.is_some() {
+            return Err(StoreError::SessionReplacementConflict {
+                source_binding_id,
+                replacement_binding_id,
+            });
+        }
+        let latest = query_optional(
+            &transaction,
+            "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
+                    generation, status, created_at, last_used_at
+             FROM session_bindings
+             WHERE conversation_id = ?1 AND agent_id = ?2
+             ORDER BY generation DESC LIMIT 1",
+            params![
+                source.conversation_id.to_string(),
+                source.agent_id.to_string()
+            ],
+            records::session_binding,
+        )?
+        .ok_or(StoreError::SessionReplacementSourceNotFound(
+            source_binding_id,
+        ))?;
+        if latest.id != source_binding_id {
+            return Err(StoreError::SessionReplacementSourceStale {
+                source_binding_id,
+                latest_binding_id: latest.id,
+            });
+        }
+        if source.status == SessionBindingStatus::Closed {
+            return Err(StoreError::SessionReplacementSourceUnavailable {
+                source_binding_id,
+                status: source.status,
+            });
+        }
+        let generation = u32::try_from(source.generation)
+            .ok()
+            .and_then(|generation| generation.checked_add(1))
+            .ok_or(StoreError::SessionReplacementGenerationExhausted(
+                source_binding_id,
+            ))?;
+        let replacement = SessionBinding {
+            id: replacement_binding_id,
+            conversation_id: source.conversation_id,
+            agent_id: source.agent_id,
+            transport_type: source.transport_type,
+            remote_session_id: None,
+            generation: u64::from(generation),
+            status: SessionBindingStatus::Disconnected,
+            created_at: replaced_at.into(),
+            last_used_at: replaced_at.into(),
+        };
+        replacement.validate()?;
+
+        transaction.execute(
+            "UPDATE session_bindings
+             SET status = 'lost', last_used_at = ?1
+             WHERE id = ?2",
+            params![replaced_at, source_binding_id.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_bindings(
+                id, conversation_id, agent_id, transport_type, remote_session_id,
+                generation, status, created_at, last_used_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'disconnected', ?6, ?6)",
+            params![
+                replacement.id.to_string(),
+                replacement.conversation_id.to_string(),
+                replacement.agent_id.to_string(),
+                replacement.transport_type,
+                i64::from(generation),
+                replaced_at,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO session_recoveries(
+                session_binding_id, source_binding_id, capsule, created_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                replacement_binding_id.to_string(),
+                source_binding_id.to_string(),
+                capsule,
+                replaced_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok((replacement, requested_recovery))
+    }
+
+    pub fn get_session_recovery(
+        &self,
+        session_binding_id: SessionBindingId,
+    ) -> Result<Option<SessionRecovery>, StoreError> {
+        session_recovery_by_id(&self.connection, session_binding_id)
+    }
+
+    pub fn attach_replacement_remote_session(
+        &mut self,
+        session_binding_id: SessionBindingId,
+        remote_session_id: &str,
+        attached_at: &str,
+    ) -> Result<SessionBinding, StoreError> {
+        require_store_text(remote_session_id, "session_binding.remote_session_id")?;
+        require_store_text(attached_at, "session_binding.last_used_at")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovery = session_recovery_by_id(&transaction, session_binding_id)?
+            .ok_or(StoreError::SessionRecoveryNotFound(session_binding_id))?;
+        let mut binding = session_binding_by_id(&transaction, session_binding_id)?
+            .ok_or(StoreError::SessionRecoveryNotFound(session_binding_id))?;
+
+        if let Some(existing_remote_session_id) = binding.remote_session_id.as_deref() {
+            if existing_remote_session_id == remote_session_id {
+                transaction.commit()?;
+                return Ok(binding);
+            }
+            return Err(StoreError::SessionRecoveryRemoteAttachmentConflict(
+                session_binding_id,
+            ));
+        }
+        if recovery.capsule_delivered_at.is_some()
+            || binding.status != SessionBindingStatus::Disconnected
+        {
+            return Err(StoreError::SessionRecoveryRemoteAttachmentConflict(
+                session_binding_id,
+            ));
+        }
+        transaction.execute(
+            "UPDATE session_bindings
+             SET remote_session_id = ?1, status = 'active', last_used_at = ?2
+             WHERE id = ?3 AND remote_session_id IS NULL AND status = 'disconnected'",
+            params![
+                remote_session_id,
+                attached_at,
+                session_binding_id.to_string()
+            ],
+        )?;
+        transaction.commit()?;
+        binding.remote_session_id = Some(remote_session_id.into());
+        binding.status = SessionBindingStatus::Active;
+        binding.last_used_at = attached_at.into();
+        Ok(binding)
+    }
+
+    pub fn mark_session_recovery_capsule_delivered(
+        &mut self,
+        session_binding_id: SessionBindingId,
+        delivered_at: &str,
+    ) -> Result<bool, StoreError> {
+        require_store_text(delivered_at, "session_recovery.capsule_delivered_at")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovery = session_recovery_by_id(&transaction, session_binding_id)?
+            .ok_or(StoreError::SessionRecoveryNotFound(session_binding_id))?;
+        if recovery.capsule_delivered_at.is_some() {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let binding = session_binding_by_id(&transaction, session_binding_id)?
+            .ok_or(StoreError::SessionRecoveryNotFound(session_binding_id))?;
+        if binding.remote_session_id.is_none() || binding.status != SessionBindingStatus::Active {
+            return Err(StoreError::SessionRecoveryNotAttached(session_binding_id));
+        }
+        transaction.execute(
+            "UPDATE session_recoveries
+             SET capsule_delivered_at = ?1
+             WHERE session_binding_id = ?2 AND capsule_delivered_at IS NULL",
+            params![delivered_at, session_binding_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn insert_permission_decision(
         &self,
         decision: &PermissionDecision,
@@ -2503,6 +2722,54 @@ fn next_thread_membership_generation(
         })
 }
 
+fn require_store_text(value: &str, field: &'static str) -> Result<(), StoreError> {
+    if value.trim().is_empty() {
+        Err(crate::domain::DomainError::EmptyField(field).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn session_binding_by_id(
+    connection: &Connection,
+    id: SessionBindingId,
+) -> Result<Option<SessionBinding>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
+                generation, status, created_at, last_used_at
+         FROM session_bindings WHERE id = ?1",
+        params![id.to_string()],
+        records::session_binding,
+    )
+}
+
+fn session_recovery_by_id(
+    connection: &Connection,
+    session_binding_id: SessionBindingId,
+) -> Result<Option<SessionRecovery>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT session_binding_id, source_binding_id, capsule, capsule_delivered_at, created_at
+         FROM session_recoveries WHERE session_binding_id = ?1",
+        params![session_binding_id.to_string()],
+        records::session_recovery,
+    )
+}
+
+fn session_recovery_by_source(
+    connection: &Connection,
+    source_binding_id: SessionBindingId,
+) -> Result<Option<SessionRecovery>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT session_binding_id, source_binding_id, capsule, capsule_delivered_at, created_at
+         FROM session_recoveries WHERE source_binding_id = ?1",
+        params![source_binding_id.to_string()],
+        records::session_recovery,
+    )
+}
+
 fn query_optional<P, T>(
     connection: &Connection,
     sql: &str,
@@ -2652,11 +2919,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_ten() {
+    fn fresh_database_has_schema_version_eleven() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
     }
 
     #[test]
@@ -2676,6 +2943,7 @@ mod tests {
             "work_results",
             "publishes",
             "session_bindings",
+            "session_recoveries",
             "permission_decisions",
             "checkpoints",
             "memories",
@@ -2712,6 +2980,7 @@ mod tests {
             "work_results",
             "publishes",
             "session_bindings",
+            "session_recoveries",
             "checkpoints",
             "memories",
             "permission_decisions",
@@ -2736,7 +3005,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 28);
+        assert_eq!(foreign_key_count, 30);
     }
 
     #[test]
@@ -3024,14 +3293,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            10
+            11
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            10
+            11
         );
     }
 
@@ -3700,7 +3969,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 10);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 11);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -4188,19 +4457,138 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (11);",
+                 INSERT INTO schema_migrations(version) VALUES (12);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 11,
-                supported: 10,
+                found: 12,
+                supported: 11,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),
         }
+    }
+
+    #[test]
+    fn session_recovery_constraints_and_one_way_progress_are_enforced() {
+        let database = TestDatabase::new();
+        let store = SqliteStore::open(database.path()).unwrap();
+        seed_session_parent_rows(&store.connection);
+        insert_raw_binding(&store.connection, "source-1", 1, "lost");
+        insert_raw_binding(&store.connection, "replacement-1", 2, "disconnected");
+        insert_raw_binding(&store.connection, "source-2", 3, "lost");
+        insert_raw_binding(&store.connection, "replacement-2", 4, "lost");
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_recoveries(
+                    session_binding_id, source_binding_id, capsule, created_at
+                 ) VALUES ('replacement-1', 'source-1', 'capsule', 'created')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_recoveries(
+                        session_binding_id, source_binding_id, capsule, created_at
+                     ) VALUES ('source-2', 'source-2', 'capsule', 'created')",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_recoveries(
+                        session_binding_id, source_binding_id, capsule, created_at
+                     ) VALUES ('replacement-2', 'source-2', ' ', 'created')",
+                    [],
+                )
+                .is_err()
+        );
+        for statement in [
+            "UPDATE session_recoveries SET source_binding_id = 'source-2'",
+            "UPDATE session_recoveries SET capsule = 'changed'",
+            "UPDATE session_recoveries SET created_at = 'changed'",
+            "UPDATE session_recoveries SET capsule_delivered_at = ' '",
+        ] {
+            assert!(
+                store.connection.execute(statement, []).is_err(),
+                "{statement}"
+            );
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE session_recoveries SET capsule_delivered_at = 'delivered'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE session_recoveries SET capsule_delivered_at = 'later'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE session_recoveries SET capsule_delivered_at = NULL",
+                    [],
+                )
+                .is_err()
+        );
+
+        let index_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('session_recoveries')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+    }
+
+    #[test]
+    fn failed_migration_eleven_rolls_back_table_and_version() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..10]).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER session_recoveries_update_guard
+                 BEFORE UPDATE ON agents BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+
+        assert!(apply_migrations(&mut connection, &MIGRATIONS).is_err());
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 10);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'session_recoveries'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     fn seed_session_parent_rows(connection: &Connection) {

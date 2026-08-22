@@ -1,6 +1,6 @@
 use crate::domain::{
-    AgentId, ConversationId, DomainError, MessageId, PublishId, ResultId, RoomId, WorkItemId,
-    WorkStatus,
+    AgentId, ConversationId, DomainError, MessageId, PublishId, ResultId, RoomId, SessionBindingId,
+    SessionBindingStatus, WorkItemId, WorkStatus,
 };
 use thiserror::Error;
 
@@ -119,6 +119,35 @@ pub enum StoreError {
         message_id: MessageId,
         target_agent_id: AgentId,
     },
+    #[error("session replacement source {0} does not exist")]
+    SessionReplacementSourceNotFound(SessionBindingId),
+    #[error(
+        "session replacement source {source_binding_id} is stale; latest binding is {latest_binding_id}"
+    )]
+    SessionReplacementSourceStale {
+        source_binding_id: SessionBindingId,
+        latest_binding_id: SessionBindingId,
+    },
+    #[error("session replacement source {source_binding_id} is unavailable in status {status}")]
+    SessionReplacementSourceUnavailable {
+        source_binding_id: SessionBindingId,
+        status: SessionBindingStatus,
+    },
+    #[error("session replacement source {0} exhausted its generation range")]
+    SessionReplacementGenerationExhausted(SessionBindingId),
+    #[error(
+        "session replacement retry for source {source_binding_id} conflicts with replacement {replacement_binding_id}"
+    )]
+    SessionReplacementConflict {
+        source_binding_id: SessionBindingId,
+        replacement_binding_id: SessionBindingId,
+    },
+    #[error("session recovery for replacement {0} does not exist")]
+    SessionRecoveryNotFound(SessionBindingId),
+    #[error("session recovery replacement {0} has no attached remote session")]
+    SessionRecoveryNotAttached(SessionBindingId),
+    #[error("session recovery replacement {0} is already attached differently")]
+    SessionRecoveryRemoteAttachmentConflict(SessionBindingId),
     #[error("database schema version {found} is newer than supported version {supported}")]
     DatabaseTooNew { found: i64, supported: i64 },
 }

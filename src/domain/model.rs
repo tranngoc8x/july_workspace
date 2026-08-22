@@ -412,6 +412,29 @@ impl SessionBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecovery {
+    pub session_binding_id: SessionBindingId,
+    pub source_binding_id: SessionBindingId,
+    pub capsule: String,
+    pub capsule_delivered_at: Option<String>,
+    pub created_at: String,
+}
+
+impl SessionRecovery {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.capsule, "session_recovery.capsule")?;
+        require_text(&self.created_at, "session_recovery.created_at")?;
+        if let Some(delivered_at) = self.capsule_delivered_at.as_deref() {
+            require_text(delivered_at, "session_recovery.capsule_delivered_at")?;
+        }
+        if self.session_binding_id == self.source_binding_id {
+            return Err(DomainError::SessionRecoverySelfReference);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermissionOption {
     pub id: String,
     pub label: String,
@@ -927,6 +950,59 @@ mod tests {
         assert_eq!(
             binding.validate(),
             Err(DomainError::InvalidSessionGeneration)
+        );
+    }
+
+    #[test]
+    fn session_recovery_validates_identity_and_progress_text() {
+        let replacement_id = SessionBindingId::new();
+        let source_id = SessionBindingId::new();
+        let valid = SessionRecovery {
+            session_binding_id: replacement_id,
+            source_binding_id: source_id,
+            capsule: "capsule".into(),
+            capsule_delivered_at: None,
+            created_at: "2026-08-22T00:00:00Z".into(),
+        };
+        assert!(valid.validate().is_ok());
+
+        for (recovery, field) in [
+            (
+                SessionRecovery {
+                    capsule: " ".into(),
+                    ..valid.clone()
+                },
+                "session_recovery.capsule",
+            ),
+            (
+                SessionRecovery {
+                    created_at: " ".into(),
+                    ..valid.clone()
+                },
+                "session_recovery.created_at",
+            ),
+            (
+                SessionRecovery {
+                    capsule_delivered_at: Some(" ".into()),
+                    ..valid.clone()
+                },
+                "session_recovery.capsule_delivered_at",
+            ),
+        ] {
+            assert_eq!(
+                recovery.validate(),
+                Err(DomainError::EmptyField(field)),
+                "accepted blank {field}"
+            );
+        }
+
+        assert_eq!(
+            SessionRecovery {
+                source_binding_id: replacement_id,
+                ..valid
+            }
+            .validate(),
+            Err(DomainError::SessionRecoverySelfReference)
         );
     }
 
