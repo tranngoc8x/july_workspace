@@ -65,7 +65,7 @@ struct FakeTransport {
     resume_lost: bool,
     create_fails_at: Option<usize>,
     send_fails_at: Option<usize>,
-    block_send_at: Option<(usize, Arc<tokio::sync::Notify>)>,
+    block_send_at: Option<(usize, std::sync::mpsc::SyncSender<()>)>,
 }
 
 impl FakeTransport {
@@ -139,7 +139,7 @@ impl AgentTransport for FakeTransport {
         if let Some((blocked_at, reached)) = &self.block_send_at
             && *blocked_at == sent
         {
-            reached.notify_one();
+            reached.send(()).unwrap();
             return std::future::pending().await;
         }
         if self.send_fails_at == Some(sent) {
@@ -1495,42 +1495,62 @@ async fn cancelled_agent_message_is_reconciled_and_retried_only_to_its_stored_ta
     let target = seed_named_agent(&database, "claude");
     let other = seed_named_agent(&database, "gemini");
     let (mut blocked_transport, _blocked_events, blocked_observed) = FakeTransport::new();
-    let blocked = Arc::new(tokio::sync::Notify::new());
-    blocked_transport.block_send_at = Some((1, blocked.clone()));
+    let (blocked_send, blocked) = std::sync::mpsc::sync_channel(1);
+    blocked_transport.block_send_at = Some((1, blocked_send));
     let (other_transport, _other_events, other_observed) = FakeTransport::new();
     let database_path = database.path().to_owned();
     let body = "  restart keeps this exact DM body\n";
     let message_id = MessageId::new();
-    let mut process = tokio::spawn({
+    let source_id = source.id;
+    let (stop_first_boot, stopped) = tokio::sync::oneshot::channel::<()>();
+    let first_boot = std::thread::spawn({
         let target = target.clone();
         let other = other.clone();
-        async move {
-            let workspace =
-                WorkspaceRuntime::new(StorageWorker::open(database_path).unwrap()).unwrap();
-            let mut target_owner =
-                DirectMessageService::new(workspace.direct_message(blocked_transport).unwrap());
-            target_owner
-                .open("target-owner".into(), target.name.clone(), NOW.into())
-                .await
-                .unwrap();
-            let mut other_owner =
-                DirectMessageService::new(workspace.direct_message(other_transport).unwrap());
-            other_owner
-                .open("other-owner".into(), other.name.clone(), NOW.into())
-                .await
-                .unwrap();
-            let mut routed =
-                DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
-            let _ = routed
-                .send_agent_message(agent_send(message_id, source.id, target.id, body))
-                .await;
+        move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    tokio::select! {
+                        _ = stopped => {}
+                        _ = async move {
+                            let workspace = WorkspaceRuntime::new(
+                                StorageWorker::open(database_path).unwrap(),
+                            )
+                            .unwrap();
+                            let mut target_owner = DirectMessageService::new(
+                                workspace.direct_message(blocked_transport).unwrap(),
+                            );
+                            target_owner
+                                .open("target-owner".into(), target.name.clone(), NOW.into())
+                                .await
+                                .unwrap();
+                            let mut other_owner = DirectMessageService::new(
+                                workspace.direct_message(other_transport).unwrap(),
+                            );
+                            other_owner
+                                .open("other-owner".into(), other.name.clone(), NOW.into())
+                                .await
+                                .unwrap();
+                            let mut routed = DirectMessageService::new(
+                                workspace.direct_message_for_agent(target.id).unwrap(),
+                            );
+                            let _ = routed
+                                .send_agent_message(agent_send(
+                                    message_id,
+                                    source_id,
+                                    target.id,
+                                    body,
+                                ))
+                                .await;
+                        } => panic!("first boot ended before process loss"),
+                    }
+                });
         }
     });
 
-    tokio::select! {
-        _ = blocked.notified() => {}
-        result = &mut process => panic!("delivery process ended before cancellation: {result:?}"),
-    }
+    blocked.recv().unwrap();
     let store = SqliteStore::open(database.path()).unwrap();
     assert_eq!(store.get_message(message_id).unwrap().unwrap().body, body);
     assert_eq!(
@@ -1546,8 +1566,17 @@ async fn cancelled_agent_message_is_reconciled_and_retried_only_to_its_stored_ta
         None
     );
     drop(store);
-    process.abort();
-    assert!(process.await.unwrap_err().is_cancelled());
+    stop_first_boot.send(()).unwrap();
+    first_boot.join().unwrap();
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Pending
+    );
 
     let (target_transport, _target_events, target_observed) = FakeTransport::new();
     let (other_transport, _other_events, restart_other_observed) = FakeTransport::new();

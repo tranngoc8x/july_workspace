@@ -61,7 +61,7 @@ struct FakeTransport {
     remote_prefix: String,
     create_fails_at: Option<usize>,
     send_fails_at: Option<usize>,
-    block_send_at: Option<(usize, Arc<tokio::sync::Notify>)>,
+    block_send_at: Option<(usize, std::sync::mpsc::SyncSender<()>)>,
 }
 
 impl FakeTransport {
@@ -128,7 +128,7 @@ impl AgentTransport for FakeTransport {
         if let Some((blocked_at, reached)) = &self.block_send_at
             && *blocked_at == sent
         {
-            reached.notify_one();
+            reached.send(()).unwrap();
             return std::future::pending().await;
         }
         if self.send_fails_at == Some(sent) {
@@ -870,8 +870,8 @@ async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leakin
     let database = TestDatabase::new();
     let fixture = seed(&database);
     let (mut blocked_transport, blocked_observed) = FakeTransport::new("blocked-target");
-    let blocked = Arc::new(tokio::sync::Notify::new());
-    blocked_transport.block_send_at = Some((2, blocked.clone()));
+    let (blocked_send, blocked) = std::sync::mpsc::sync_channel(1);
+    blocked_transport.block_send_at = Some((2, blocked_send));
     let (source_transport, source_observed) = FakeTransport::new("blocked-source");
     let database_path = database.path().to_owned();
     let process_fixture = Fixture {
@@ -884,42 +884,58 @@ async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leakin
         unrelated_message: fixture.unrelated_message.clone(),
     };
     let message_id = MessageId::new();
-    let mut process = tokio::spawn(async move {
-        let workspace = WorkspaceRuntime::new(StorageWorker::open(database_path).unwrap()).unwrap();
-        let mut source_owner = workspace.thread_with_transport(source_transport).unwrap();
-        source_owner
-            .open_thread_for_agent(open_command(
-                process_fixture.source_owner_thread.id,
-                process_fixture.source.id,
-            ))
-            .await
-            .unwrap();
-        let mut target_owner = workspace.thread_with_transport(blocked_transport).unwrap();
-        target_owner
-            .open_thread_for_agent(open_command(
-                process_fixture.target_owner_thread.id,
-                process_fixture.target.id,
-            ))
-            .await
-            .unwrap();
-        let mut mentions = workspace.thread(process_fixture.target.id).unwrap();
-        let _ = mentions
-            .mention_thread_agent(mention_command(
-                &process_fixture,
-                message_id,
-                process_fixture.mention_thread.id,
-                process_fixture.target.id,
-                BODY,
-                CAPSULE,
-                MENTIONED,
-            ))
-            .await;
+    let (stop_first_boot, stopped) = tokio::sync::oneshot::channel::<()>();
+    let first_boot = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::select! {
+                    _ = stopped => {}
+                    _ = async move {
+                        let workspace = WorkspaceRuntime::new(
+                            StorageWorker::open(database_path).unwrap(),
+                        )
+                        .unwrap();
+                        let mut source_owner = workspace
+                            .thread_with_transport(source_transport)
+                            .unwrap();
+                        source_owner
+                            .open_thread_for_agent(open_command(
+                                process_fixture.source_owner_thread.id,
+                                process_fixture.source.id,
+                            ))
+                            .await
+                            .unwrap();
+                        let mut target_owner = workspace
+                            .thread_with_transport(blocked_transport)
+                            .unwrap();
+                        target_owner
+                            .open_thread_for_agent(open_command(
+                                process_fixture.target_owner_thread.id,
+                                process_fixture.target.id,
+                            ))
+                            .await
+                            .unwrap();
+                        let mut mentions = workspace.thread(process_fixture.target.id).unwrap();
+                        let _ = mentions
+                            .mention_thread_agent(mention_command(
+                                &process_fixture,
+                                message_id,
+                                process_fixture.mention_thread.id,
+                                process_fixture.target.id,
+                                BODY,
+                                CAPSULE,
+                                MENTIONED,
+                            ))
+                            .await;
+                    } => panic!("first boot ended before process loss"),
+                }
+            });
     });
 
-    tokio::select! {
-        _ = blocked.notified() => {}
-        result = &mut process => panic!("delivery process ended before cancellation: {result:?}"),
-    }
+    blocked.recv().unwrap();
     let stranded = delivery(&database, &fixture, message_id);
     assert_eq!(stranded.status, DeliveryStatus::Pending);
     assert_eq!(stranded.capsule.as_deref(), Some(CAPSULE));
@@ -933,8 +949,12 @@ async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leakin
             .body,
         BODY
     );
-    process.abort();
-    assert!(process.await.unwrap_err().is_cancelled());
+    stop_first_boot.send(()).unwrap();
+    first_boot.join().unwrap();
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Pending
+    );
 
     let (target_transport, target_observed) = FakeTransport::new("restart-target");
     let (source_transport, restart_source_observed) = FakeTransport::new("restart-source");
@@ -952,13 +972,19 @@ async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leakin
         .await
         .unwrap();
     let mut target_owner = workspace.thread_with_transport(target_transport).unwrap();
-    target_owner
+    let target_owner_opened = target_owner
         .open_thread_for_agent(open_command(
             fixture.target_owner_thread.id,
             fixture.target.id,
         ))
         .await
         .unwrap();
+    let persisted_mention_binding_id = SqliteStore::open(database.path())
+        .unwrap()
+        .get_latest_session_binding(fixture.mention_thread.id, fixture.target.id)
+        .unwrap()
+        .unwrap()
+        .id;
     let mut mentions = workspace.thread(fixture.target.id).unwrap();
     let retried = delivered(
         mentions
@@ -968,6 +994,15 @@ async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leakin
     );
 
     assert_eq!(retried.opened.thread_id, fixture.mention_thread.id);
+    assert_eq!(retried.opened.agent_id, fixture.target.id);
+    assert_ne!(
+        retried.opened.session_binding_id,
+        target_owner_opened.session_binding_id
+    );
+    assert_eq!(
+        retried.opened.session_binding_id,
+        persisted_mention_binding_id
+    );
     assert_eq!(
         blocked_observed
             .lock()
