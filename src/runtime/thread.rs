@@ -154,7 +154,7 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
     async fn mention_thread_agent(
         &mut self,
         command: MentionThreadAgent,
-    ) -> Result<MentionedThreadAgent, CollaborationError> {
+    ) -> Result<Option<MentionedThreadAgent>, CollaborationError> {
         if self.stopped {
             return Err(CollaborationError::ContextStopped);
         }
@@ -184,7 +184,7 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
             return Err(CollaborationError::ThreadAlreadyOpen);
         }
 
-        let membership_changed = self
+        let Some(membership_changed) = self
             .workspace
             .storage()
             .persist_thread_mention(
@@ -203,7 +203,10 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
                 command.source_agent_id,
                 command.target_agent_id,
             )
-            .await?;
+            .await?
+        else {
+            return Ok(None);
+        };
         let opened = match self.opened {
             Some(opened) => opened,
             None => {
@@ -221,10 +224,10 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
                 .map_err(runtime_error)?;
         }
         self.send_exact(command.body).await.map_err(runtime_error)?;
-        Ok(MentionedThreadAgent {
+        Ok(Some(MentionedThreadAgent {
             opened,
             membership_changed,
-        })
+        }))
     }
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {

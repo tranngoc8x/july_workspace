@@ -423,11 +423,15 @@ impl SqliteStore {
         message: &Message,
         source_agent_id: AgentId,
         target_agent_id: AgentId,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<bool>, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         message.validate()?;
+        if !insert_message(&transaction, message)? {
+            transaction.commit()?;
+            return Ok(None);
+        }
         let thread_id = message.conversation_id;
         let thread = require_open_thread(&transaction, thread_id)?;
         let room_id = thread.room_id.expect("validated thread has a room");
@@ -472,9 +476,8 @@ impl SqliteStore {
                 },
             )?;
         }
-        insert_message(&transaction, message)?;
         transaction.commit()?;
-        Ok(!active)
+        Ok(Some(!active))
     }
 
     pub fn remove_thread_member(
@@ -781,7 +784,7 @@ impl SqliteStore {
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
         message.validate()?;
-        insert_message(&self.connection, message)
+        insert_message(&self.connection, message).map(|_| ())
     }
 
     pub fn get_message(&self, id: MessageId) -> Result<Option<Message>, StoreError> {
@@ -1267,7 +1270,7 @@ fn insert_conversation_member(
     Ok(())
 }
 
-fn insert_message(connection: &Connection, message: &Message) -> Result<(), StoreError> {
+fn insert_message(connection: &Connection, message: &Message) -> Result<bool, StoreError> {
     let metadata = if message.metadata.is_null() {
         None
     } else {
@@ -1291,7 +1294,7 @@ fn insert_message(connection: &Connection, message: &Message) -> Result<(), Stor
         ],
     )?;
     if inserted == 1 {
-        return Ok(());
+        return Ok(true);
     }
     let existing = query_optional(
         connection,
@@ -1302,7 +1305,7 @@ fn insert_message(connection: &Connection, message: &Message) -> Result<(), Stor
         records::message,
     )?;
     if existing.as_ref() == Some(message) {
-        Ok(())
+        Ok(false)
     } else {
         Err(StoreError::MessageConflict { id: message.id })
     }

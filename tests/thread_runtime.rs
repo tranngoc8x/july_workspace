@@ -248,7 +248,7 @@ impl ThreadRuntime for TestThreadRuntime {
     async fn mention_thread_agent(
         &mut self,
         command: MentionThreadAgent,
-    ) -> Result<MentionedThreadAgent, CollaborationError> {
+    ) -> Result<Option<MentionedThreadAgent>, CollaborationError> {
         self.context.mention_thread_agent(command).await
     }
 

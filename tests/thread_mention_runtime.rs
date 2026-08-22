@@ -318,17 +318,19 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
     let mut mentions = workspace.thread(fixture.target.id).unwrap();
     let first_id = MessageId::new();
 
+    let first_command = mention_command(
+        &fixture,
+        first_id,
+        fixture.mention_thread.id,
+        fixture.target.id,
+        BODY,
+        CAPSULE,
+        MENTIONED,
+    );
     let first = mentions
-        .mention_thread_agent(mention_command(
-            &fixture,
-            first_id,
-            fixture.mention_thread.id,
-            fixture.target.id,
-            BODY,
-            CAPSULE,
-            MENTIONED,
-        ))
+        .mention_thread_agent(first_command.clone())
         .await
+        .unwrap()
         .unwrap();
 
     assert!(first.membership_changed);
@@ -359,6 +361,20 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
         );
     }
 
+    assert_eq!(
+        mentions.mention_thread_agent(first_command).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        target_members(&database, &fixture, fixture.mention_thread.id),
+        1
+    );
+    {
+        let observed = target_observed.lock().unwrap();
+        assert_eq!(observed.creates.len(), 2);
+        assert_eq!(observed.messages.len(), 2);
+    }
+
     let second_id = MessageId::new();
     let second_body = "Second exact body";
     let second = mentions
@@ -372,6 +388,7 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
             LATER,
         ))
         .await
+        .unwrap()
         .unwrap();
 
     assert!(!second.membership_changed);
@@ -581,12 +598,16 @@ async fn missing_target_owner_preserves_the_join_and_message() {
 
 #[tokio::test]
 async fn open_or_send_failure_preserves_the_join_and_message() {
-    for failure in ["open", "send"] {
+    for failure in ["open", "capsule", "body"] {
         let database = TestDatabase::new();
         let fixture = seed(&database);
         let (mut transport, observed) = FakeTransport::new(failure);
         transport.create_fails_at = (failure == "open").then_some(2);
-        transport.send_fails_at = (failure == "send").then_some(1);
+        transport.send_fails_at = match failure {
+            "capsule" => Some(1),
+            "body" => Some(2),
+            _ => None,
+        };
         let mut workspace =
             WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
         let mut target_owner = workspace.thread_with_transport(transport).unwrap();
@@ -637,14 +658,14 @@ async fn open_or_send_failure_preserves_the_join_and_message() {
                     .iter()
                     .map(|message| message.content.as_str())
                     .collect::<Vec<_>>(),
-                if failure == "send" {
-                    vec![CAPSULE]
-                } else {
-                    Vec::new()
+                match failure {
+                    "capsule" => vec![CAPSULE],
+                    "body" => vec![CAPSULE, BODY],
+                    _ => Vec::new(),
                 }
             );
         }
-        if failure == "send" {
+        if failure != "open" {
             mentions.shutdown(LATER.into()).await.unwrap();
         }
         target_owner.shutdown(LATER.into()).await.unwrap();

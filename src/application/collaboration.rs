@@ -174,7 +174,7 @@ pub trait ThreadRuntime {
     async fn mention_thread_agent(
         &mut self,
         command: MentionThreadAgent,
-    ) -> Result<MentionedThreadAgent, CollaborationError>;
+    ) -> Result<Option<MentionedThreadAgent>, CollaborationError>;
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError>;
 }

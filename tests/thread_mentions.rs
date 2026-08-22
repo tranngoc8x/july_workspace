@@ -145,11 +145,12 @@ fn mention_joins_target_and_persists_source_message() {
     let mut fixture = setup(true, true, false);
     let message = mention(&fixture);
 
-    assert!(
+    assert_eq!(
         fixture
             .store
             .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
 
     let members = target_members(&fixture);
@@ -159,8 +160,19 @@ fn mention_joins_target_and_persists_source_message() {
     assert_eq!(members[0].left_at, None);
     assert_eq!(
         fixture.store.get_message(message.id).unwrap(),
-        Some(message)
+        Some(message.clone())
     );
+
+    assert_eq!(
+        fixture
+            .store
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
+            .unwrap(),
+        None
+    );
+    let members = target_members(&fixture);
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].generation, 1);
 }
 
 #[test]
@@ -168,11 +180,12 @@ fn mention_keeps_active_target_membership_and_persists_message() {
     let mut fixture = setup(true, true, true);
     let message = mention(&fixture);
 
-    assert!(
-        !fixture
+    assert_eq!(
+        fixture
             .store
             .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
-            .unwrap()
+            .unwrap(),
+        Some(false)
     );
 
     let members = target_members(&fixture);
@@ -194,11 +207,12 @@ fn mention_rejoins_target_with_next_generation() {
         .unwrap();
     let message = mention(&fixture);
 
-    assert!(
+    assert_eq!(
         fixture
             .store
             .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
-            .unwrap()
+            .unwrap(),
+        Some(true)
     );
 
     let members = target_members(&fixture);

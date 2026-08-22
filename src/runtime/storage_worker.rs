@@ -51,7 +51,7 @@ enum Command {
     ),
     GetOrCreateAgentDm(AgentId, AgentId, String, Reply<Conversation>),
     InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
-    PersistThreadMention(Message, AgentId, AgentId, Reply<bool>),
+    PersistThreadMention(Message, AgentId, AgentId, Reply<Option<bool>>),
     ListMessages(
         ConversationId,
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
@@ -212,7 +212,7 @@ impl StorageHandle {
         message: Message,
         source_agent_id: AgentId,
         target_agent_id: AgentId,
-    ) -> Result<bool, CollaborationError> {
+    ) -> Result<Option<bool>, CollaborationError> {
         self.collaboration_request(|reply| {
             Command::PersistThreadMention(message, source_agent_id, target_agent_id, reply)
         })
