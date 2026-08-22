@@ -38,14 +38,31 @@ runtime:
 
 ## Offline delivery
 
-Message persists first, then delivery is attempted.
+Phase 5.3 persists the message and one explicit target delivery before
+transport. Delivery states are exactly:
 
-Recommended delivery state:
 - PENDING
 - DELIVERED
 - FAILED
 
-A temporarily offline agent must not lose the message.
+`DELIVERED` means the existing transport `send_message` accepted the exact
+body and is terminal. Ordinary owner, session-open, or send failures leave the
+message durable and transition its target row to `FAILED`; the runtime returns
+a typed structured failure outcome. Each target has its own row, so target-only
+routing is preserved. A temporarily offline agent must not lose the message.
+
+Explicit retry claims only `FAILED`. It reuses the stored exact target and body;
+a delivered or concurrently claimed delivery is a no-op. For Thread mentions,
+retry revalidates active Agent, Room, and Thread membership and never implicitly
+rejoins. A capsule is persisted only when the initial mention joins or rejoins
+the target, and capsule delivery is tracked separately so a successful capsule
+is not resent.
+
+Delivery is at-least-once. If the process crashes after transport acceptance
+but before the `DELIVERED` transition, a later explicit retry can deliver the
+same body again. July makes no exactly-once promise and does not add a daemon,
+automatic backoff, CLI, semantic routing, or a new public messaging syntax in
+Phase 5.3.
 
 ## Result
 

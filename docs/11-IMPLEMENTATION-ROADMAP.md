@@ -200,8 +200,20 @@ replays are durable no-ops and transport failures do not roll back persistence.
 
 ### Phase 5.3 — Offline persistence and delivery
 
-Status: planned. Delivery states will include `PENDING`, `DELIVERED`, and
-`FAILED`.
+Status: implemented and verified. Each message has one explicit target
+`message_deliveries` row. The message and `PENDING` row are persisted before
+transport; transport acceptance transitions it to terminal `DELIVERED`.
+Ordinary owner/open/send failures transition it to `FAILED` and return a typed
+structured failure. Explicit retry claims only `FAILED`, reuses the stored
+exact target/body, and preserves target-only routing. Thread retry revalidates
+active Agent, Room, and Thread membership without implicit rejoin; a persisted
+join/rejoin capsule has separate delivery progress and is not resent after
+success.
+
+Delivery is at-least-once: a crash after transport acceptance and before the
+`DELIVERED` write can result in duplicate delivery on explicit retry. Exactly
+once is not promised. Phase 5.3 adds no daemon, automatic backoff, CLI, semantic
+routing, or new public syntax.
 
 ### Phase 5.4 — Restart, isolation, and delivery regression tests
 
@@ -209,7 +221,7 @@ Status: planned.
 
 Remaining implementation:
 
-- offline message persistence/delivery.
+- Phase 5.4 restart, isolation, and delivery regression tests.
 
 DoD:
 

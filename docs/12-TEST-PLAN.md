@@ -61,10 +61,20 @@ Current Phase 5.2 coverage:
 - durable membership and message state after open or send failure;
 - isolation from unrelated Agents, Threads, Rooms, and DMs.
 
-Planned Phase 5 coverage:
-- offline persistence/delivery with `PENDING`, `DELIVERED`, and `FAILED`;
+Current Phase 5.3 coverage:
+- per-target delivery rows with `PENDING`, `DELIVERED`, and `FAILED`;
+- message-plus-delivery persistence before transport;
+- `DELIVERED` after transport acceptance and `FAILED` on owner/open/send
+  failure, with typed structured failure outcomes;
+- explicit `FAILED`-only retry using the stored exact target/body;
+- Thread capsule progress and retry without duplicate successful capsules;
+- target-only routing, exact replay suppression, and at-least-once crash-window
+  semantics.
+
+Planned Phase 5.4 coverage:
+- restart reconciliation for persisted `PENDING` deliveries;
 - restart, isolation, and delivery regression tests;
-- retry after transport failure.
+- retry after transport failure across the restart boundary.
 
 ## 4. Publish
 

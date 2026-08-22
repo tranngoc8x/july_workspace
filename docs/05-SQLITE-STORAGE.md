@@ -117,6 +117,39 @@ CREATE TABLE messages (
 );
 ```
 
+### message_deliveries
+
+Phase 5.3 adds one delivery row per `(message_id, target_agent_id)`. The
+durable state is exactly `pending`, `delivered`, or `failed`:
+
+```sql
+CREATE TABLE message_deliveries (
+  message_id TEXT NOT NULL REFERENCES messages(id),
+  target_agent_id TEXT NOT NULL REFERENCES agents(id),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed')),
+  capsule TEXT,
+  capsule_delivered_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  delivered_at TEXT,
+  PRIMARY KEY(message_id, target_agent_id)
+);
+```
+
+The executable migration also rejects blank timestamps/capsules, capsule
+progress without a capsule, and inconsistent `delivered_at` values. Message
+and target delivery are inserted atomically before transport. `delivered` is
+terminal and means the existing transport accepted the send. Owner, open, or
+send failures leave the message durable and transition its delivery to
+`failed`; the typed runtime outcome reports the structured failure, while raw
+provider errors are not stored as a new persistence field. Existing messages
+without a delivery row remain valid.
+
+Explicit retry claims only `failed`, restores `pending`, and reuses the stored
+message body and exact target. Thread retry revalidates active Agent, Room, and
+Thread membership without implicitly rejoining; a persisted Thread capsule is
+tracked separately so a successful capsule is not resent.
+
 ### work_items
 
 ```sql
@@ -455,6 +488,10 @@ table already referenced by dependencies and results. Existing WorkItems
 migrate with `is_primary = 0`; July does not infer historical primary
 ownership. The aggregate Phase 4 create operation is responsible for inserting
 one primary WorkItem for every new Thread.
+
+Phase 5.3 message delivery is at-least-once. A crash after transport accepts a
+message but before SQLite records `delivered` can cause an explicit retry to
+send the same exact body again. Exactly-once delivery is not promised.
 
 ## No dual source of truth
 
