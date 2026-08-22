@@ -1102,6 +1102,40 @@ impl SqliteStore {
         )
     }
 
+    pub(crate) fn list_recent_messages_after(
+        &self,
+        conversation_id: ConversationId,
+        anchor: Option<&Message>,
+        limit: usize,
+    ) -> Result<(Vec<Message>, bool), StoreError> {
+        let query_limit =
+            i64::try_from(limit.saturating_add(1)).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "recovery message limit",
+                value: limit as i128,
+            })?;
+        let mut messages = query_all(
+            &self.connection,
+            "SELECT id, conversation_id, sender_type, sender_id, body, reply_to,
+                    metadata_json, created_at
+             FROM messages
+             WHERE conversation_id = ?1
+               AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND id > ?3))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?4",
+            params![
+                conversation_id.to_string(),
+                anchor.map(|message| message.created_at.as_str()),
+                anchor.map(|message| message.id.to_string()),
+                query_limit,
+            ],
+            records::message,
+        )?;
+        let truncated = messages.len() > limit;
+        messages.truncate(limit);
+        messages.reverse();
+        Ok((messages, truncated))
+    }
+
     pub fn insert_work_item(&self, work_item: &WorkItem) -> Result<(), StoreError> {
         if work_item.status != WorkStatus::Open
             || work_item.owner_agent_id.is_some()
@@ -1765,6 +1799,29 @@ impl SqliteStore {
                 scope_id,
                 kind.map(|kind| kind.to_string()),
             ],
+            records::memory,
+        )
+    }
+
+    pub(crate) fn list_current_recovery_memories(
+        &self,
+        project_root: &str,
+        room_id: Option<RoomId>,
+    ) -> Result<Vec<Memory>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT memory.id, memory.scope_type, memory.scope_id, memory.kind, memory.content,
+                    memory.source_conversation_id, memory.evidence_json,
+                    memory.supersedes_memory_id, memory.created_at
+             FROM memories memory
+             WHERE ((memory.scope_type = 'project' AND memory.scope_id = ?1)
+                    OR (?2 IS NOT NULL AND memory.scope_type = 'room' AND memory.scope_id = ?2))
+               AND NOT EXISTS (
+                    SELECT 1 FROM memories successor
+                    WHERE successor.supersedes_memory_id = memory.id
+               )
+             ORDER BY memory.scope_type, memory.kind, memory.created_at, memory.id",
+            params![project_root, room_id.map(|id| id.to_string())],
             records::memory,
         )
     }

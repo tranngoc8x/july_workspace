@@ -1,13 +1,14 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    CollaborationError, CollaborationRuntime, DependencyError, DependencyOutcome,
-    DependencyRuntime, MembershipChange, MembershipState, PublishError, PublishRuntime,
-    PublishedResult, WorkError, WorkRuntime,
+    BuildRecoveryCapsule, CollaborationError, CollaborationRuntime, DependencyError,
+    DependencyOutcome, DependencyRuntime, MembershipChange, MembershipState, PublishError,
+    PublishRuntime, PublishedResult, RecoveryCapsule, RecoveryError, RecoveryInput,
+    RecoveryRuntime, WorkError, WorkRuntime, format_recovery_capsule,
 };
 use crate::domain::{
-    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Memory,
-    MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, Publish,
-    PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
+    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, MemberType,
+    Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision,
+    Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
     SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
@@ -116,6 +117,10 @@ enum Command {
         String,
         Option<MemoryKind>,
         Reply<Vec<Memory>>,
+    ),
+    BuildRecoveryCapsule(
+        BuildRecoveryCapsule,
+        oneshot::Sender<Result<RecoveryCapsule, RecoveryError>>,
     ),
     InsertBinding(SessionBinding, oneshot::Sender<Result<(), StoreError>>),
     GetCurrentBinding(
@@ -543,6 +548,20 @@ impl StorageHandle {
             .map_err(|_| PublishError::Runtime("storage owner channel closed".into()))?
             .map_err(map_publish_error)
     }
+
+    pub(crate) async fn build_recovery_capsule(
+        &self,
+        command: BuildRecoveryCapsule,
+    ) -> Result<RecoveryCapsule, RecoveryError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::BuildRecoveryCapsule(command, reply))
+            .await
+            .map_err(|_| RecoveryError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| RecoveryError::Runtime("storage owner channel closed".into()))?
+    }
 }
 
 impl std::ops::Deref for StorageWorker {
@@ -778,6 +797,15 @@ impl PublishRuntime for StorageWorker {
     }
 }
 
+impl RecoveryRuntime for StorageWorker {
+    async fn build_recovery_capsule(
+        &mut self,
+        command: BuildRecoveryCapsule,
+    ) -> Result<RecoveryCapsule, RecoveryError> {
+        self.handle.build_recovery_capsule(command).await
+    }
+}
+
 impl Drop for StorageWorker {
     fn drop(&mut self) {
         if self.thread.is_some() {
@@ -990,6 +1018,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::ListMemories(scope_type, scope_id, kind, reply) => {
                 let _ = reply.send(store.list_memories(scope_type, &scope_id, kind));
             }
+            Command::BuildRecoveryCapsule(command, reply) => {
+                let _ = reply.send(build_recovery_capsule(&store, command));
+            }
             Command::InsertBinding(binding, reply) => {
                 let _ = reply.send(store.insert_session_binding(&binding));
             }
@@ -1022,6 +1053,88 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
         }
     }
+}
+
+fn build_recovery_capsule(
+    store: &SqliteStore,
+    command: BuildRecoveryCapsule,
+) -> Result<RecoveryCapsule, RecoveryError> {
+    let agent = store
+        .get_agent(command.agent_id)
+        .map_err(recovery_runtime_error)?
+        .ok_or(RecoveryError::AgentNotFound(command.agent_id))?;
+    if agent.status != "active" {
+        return Err(RecoveryError::AgentInactive(agent.id));
+    }
+    let conversation = store
+        .get_conversation(command.conversation_id)
+        .map_err(recovery_runtime_error)?
+        .ok_or(RecoveryError::ConversationNotFound(command.conversation_id))?;
+    let active_member = store
+        .list_conversation_members(conversation.id)
+        .map_err(recovery_runtime_error)?
+        .into_iter()
+        .any(|member| {
+            member.member_type == MemberType::Agent
+                && member.member_id == agent.id.to_string()
+                && member.left_at.is_none()
+        });
+    if !active_member {
+        return Err(RecoveryError::AgentNotMember {
+            conversation_id: conversation.id,
+            agent_id: agent.id,
+        });
+    }
+
+    let checkpoint = store
+        .get_latest_checkpoint(conversation.id, agent.id)
+        .map_err(recovery_runtime_error)?;
+    let anchor = match checkpoint.as_ref() {
+        Some(Checkpoint {
+            id: checkpoint_id,
+            last_message_id: Some(message_id),
+            ..
+        }) => {
+            let (checkpoint_id, message_id) = (*checkpoint_id, *message_id);
+            let message = store
+                .get_message(message_id)
+                .map_err(recovery_runtime_error)?
+                .filter(|message| message.conversation_id == conversation.id)
+                .ok_or(RecoveryError::InvalidCheckpointAnchor {
+                    checkpoint_id,
+                    message_id,
+                })?;
+            Some(message)
+        }
+        _ => None,
+    };
+    let memories = store
+        .list_current_recovery_memories(&agent.project_root, conversation.room_id)
+        .map_err(recovery_runtime_error)?;
+    let published_results = store
+        .list_published_results(conversation.id)
+        .map_err(recovery_runtime_error)?;
+    let (messages, messages_truncated) = store
+        .list_recent_messages_after(
+            conversation.id,
+            anchor.as_ref(),
+            crate::application::RECENT_MESSAGE_LIMIT,
+        )
+        .map_err(recovery_runtime_error)?;
+
+    format_recovery_capsule(RecoveryInput {
+        agent,
+        conversation,
+        memories,
+        checkpoint,
+        published_results,
+        messages,
+        messages_truncated,
+    })
+}
+
+fn recovery_runtime_error(error: StoreError) -> RecoveryError {
+    RecoveryError::Runtime(error.to_string())
 }
 
 fn map_store_error(error: StoreError) -> CollaborationError {
