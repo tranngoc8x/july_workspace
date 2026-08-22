@@ -182,6 +182,12 @@ intact, and no Room or other-Thread transcript is injected.
 
 ## Phase 5 — Agent-to-Agent Messaging
 
+Status: complete. Phases 5.1-5.4 implement and verify the original Phase 5
+scope: deterministic Agent DM routing, Thread mentions with dynamic join,
+durable offline delivery, and restart reconciliation with context isolation.
+Delivery remains at-least-once; exactly-once delivery, a daemon, automatic
+retry/backoff, semantic routing, and messaging CLI remain out of scope.
+
 ### Phase 5.1 — Explicit Agent-to-Agent DM
 
 Status: implemented and verified. The current slice proves exact active
