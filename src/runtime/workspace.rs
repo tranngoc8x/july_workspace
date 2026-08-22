@@ -115,7 +115,7 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
         {
             Ok(recovery) => recovery,
             Err(error) => {
-                let _ = session.detach(recovery_at).await;
+                session.abort_recovery(recovery_at).await;
                 return Err(error);
             }
         };
@@ -123,7 +123,7 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
             && recovery.capsule_delivered_at.is_none()
         {
             if let Err(error) = session.send_message(recovery.capsule).await {
-                let _ = session.detach(recovery_at).await;
+                session.abort_recovery(recovery_at).await;
                 return Err(error);
             }
             if let Err(error) = self
@@ -134,7 +134,7 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
                 )
                 .await
             {
-                let _ = session.detach(recovery_at).await;
+                session.abort_recovery(recovery_at).await;
                 return Err(error);
             }
         }
@@ -168,6 +168,7 @@ enum OwnerCommand {
     CancelTurn(SessionRef, String, Reply<()>),
     RespondPermission(PermissionResponse, String, Reply<()>),
     Detach(SessionRef, String, Reply<()>),
+    AbortRecovery(SessionRef, String, Reply<()>),
     Shutdown(String, Reply<()>),
 }
 
@@ -234,6 +235,13 @@ impl RuntimeSession {
         let session = self.session.clone();
         self.request(|reply| OwnerCommand::Detach(session, detached_at, reply))
             .await
+    }
+
+    async fn abort_recovery(&mut self, detached_at: String) {
+        let session = self.session.clone();
+        let _ = self
+            .request(|reply| OwnerCommand::AbortRecovery(session, detached_at, reply))
+            .await;
     }
 
     async fn request(
@@ -684,6 +692,21 @@ async fn handle_owner_command<T: AgentTransport>(
                 }
             }
             let _ = reply.send(result);
+        }
+        Some(OwnerCommand::AbortRecovery(session, detached_at, reply)) => {
+            let result = require_session(bindings, &session);
+            if result.is_ok() {
+                bindings.remove(&session.binding_id);
+                if let Some(delivery) = pending {
+                    delivery
+                        .targets
+                        .retain(|target| target.0 != session.binding_id);
+                }
+            }
+            let _ = reply.send(match result {
+                Ok(()) => manager.abort_session_recovery(&session, detached_at).await,
+                Err(error) => Err(error),
+            });
         }
         Some(OwnerCommand::Shutdown(stopped_at, reply)) => {
             return Some(OwnerExit::Shutdown(stopped_at, reply));

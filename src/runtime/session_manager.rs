@@ -107,29 +107,40 @@ impl<T: AgentTransport> SessionManager<T> {
             }
 
             let recovery = self.storage.get_session_recovery(binding.id).await?;
-            let result = if recovery.is_some() {
+            let (result, replace_on_lost) = if recovery.is_some() {
                 if binding.remote_session_id.is_some() {
-                    self.resume_session(&binding, project_root.clone(), opened_at.clone())
-                        .await
-                } else {
-                    self.create_replacement_session(
-                        &binding,
-                        project_root.clone(),
-                        opened_at.clone(),
+                    (
+                        self.resume_session(&binding, project_root.clone(), opened_at.clone())
+                            .await,
+                        true,
                     )
-                    .await
+                } else {
+                    (
+                        self.create_replacement_session(
+                            &binding,
+                            project_root.clone(),
+                            opened_at.clone(),
+                        )
+                        .await,
+                        false,
+                    )
                 }
             } else if binding.remote_session_id.is_none() {
                 binding = self.begin_replacement(&binding, opened_at.clone()).await?;
                 continue;
             } else {
-                self.resume_session(&binding, project_root.clone(), opened_at.clone())
-                    .await
+                (
+                    self.resume_session(&binding, project_root.clone(), opened_at.clone())
+                        .await,
+                    true,
+                )
             };
 
             match result {
                 Ok(session) => return Ok(session),
-                Err(RuntimeError::Transport(crate::transport::TransportError::SessionLost(_))) => {
+                Err(RuntimeError::Transport(crate::transport::TransportError::SessionLost(_)))
+                    if replace_on_lost =>
+                {
                     binding = self.begin_replacement(&binding, opened_at.clone()).await?;
                 }
                 Err(error) => return Err(error),
@@ -272,6 +283,30 @@ impl<T: AgentTransport> SessionManager<T> {
             .await?;
         if disconnected {
             self.owned_bindings.remove(&session.binding_id);
+            Ok(())
+        } else {
+            Err(RuntimeError::SessionBindingNotFound(session.binding_id))
+        }
+    }
+
+    pub(crate) async fn abort_session_recovery(
+        &mut self,
+        session: &SessionRef,
+        detached_at: String,
+    ) -> Result<(), RuntimeError> {
+        if self.owned_bindings.get(&session.binding_id) != Some(session) {
+            return Err(RuntimeError::SessionBindingNotFound(session.binding_id));
+        }
+        self.owned_bindings.remove(&session.binding_id);
+        let audit = self
+            .audit_cancelled_permissions(Some(session), &detached_at)
+            .await;
+        let disconnected = self
+            .storage
+            .mark_binding_disconnected(session.binding_id, detached_at)
+            .await;
+        audit?;
+        if disconnected? {
             Ok(())
         } else {
             Err(RuntimeError::SessionBindingNotFound(session.binding_id))
