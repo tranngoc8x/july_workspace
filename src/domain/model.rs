@@ -75,6 +75,11 @@ string_enum!(SessionBindingStatus {
     Lost => "lost",
     Closed => "closed",
 });
+string_enum!(DeliveryStatus {
+    Pending => "pending",
+    Delivered => "delivered",
+    Failed => "failed",
+});
 
 fn require_text(value: &str, field: &'static str) -> Result<(), DomainError> {
     if value.trim().is_empty() {
@@ -220,6 +225,35 @@ impl Message {
         require_text(&self.sender_id, "message.sender_id")?;
         require_text(&self.body, "message.body")?;
         require_text(&self.created_at, "message.created_at")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageDelivery {
+    pub message_id: MessageId,
+    pub target_agent_id: AgentId,
+    pub status: DeliveryStatus,
+    pub capsule: Option<String>,
+    pub capsule_delivered_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub delivered_at: Option<String>,
+}
+
+impl MessageDelivery {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Some(capsule) = &self.capsule {
+            require_text(capsule, "message_delivery.capsule")?;
+        }
+        if let Some(delivered_at) = &self.capsule_delivered_at {
+            require_text(delivered_at, "message_delivery.capsule_delivered_at")?;
+        }
+        require_text(&self.created_at, "message_delivery.created_at")?;
+        require_text(&self.updated_at, "message_delivery.updated_at")?;
+        if let Some(delivered_at) = &self.delivered_at {
+            require_text(delivered_at, "message_delivery.delivered_at")?;
+        }
+        Ok(())
     }
 }
 

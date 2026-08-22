@@ -1,10 +1,10 @@
 use super::{StoreError, records};
 use crate::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
-    ConversationMember, MemberType, Memory, MemoryId, Message, MessageId, PermissionDecision,
-    PermissionOutcome, Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding,
-    SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult,
-    WorkStatus,
+    ConversationMember, DeliveryStatus, MemberType, Memory, MemoryId, Message, MessageDelivery,
+    MessageId, PermissionDecision, PermissionOutcome, Publish, PublishId, ResultId, Room, RoomId,
+    RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem,
+    WorkItemId, WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -24,6 +24,10 @@ const MIGRATIONS: [Migration; 3] = [
     Migration {
         version: 3,
         sql: include_str!("migrations/0003_collaboration_membership.sql"),
+    },
+    Migration {
+        version: 4,
+        sql: include_str!("migrations/0004_message_deliveries.sql"),
     },
 ];
 
@@ -798,6 +802,131 @@ impl SqliteStore {
         )
     }
 
+    pub fn insert_message_with_pending_delivery(
+        &mut self,
+        message: &Message,
+        target_agent_id: AgentId,
+        capsule: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        message.validate()?;
+        let delivery = MessageDelivery {
+            message_id: message.id,
+            target_agent_id,
+            status: DeliveryStatus::Pending,
+            capsule: capsule.map(str::to_owned),
+            capsule_delivered_at: None,
+            created_at: message.created_at.clone(),
+            updated_at: message.created_at.clone(),
+            delivered_at: None,
+        };
+        delivery.validate()?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !insert_message(&transaction, message)? {
+            let existing = get_message_delivery(&transaction, message.id, target_agent_id)?;
+            if existing.as_ref().is_some_and(|existing| {
+                existing.message_id == delivery.message_id
+                    && existing.target_agent_id == delivery.target_agent_id
+                    && existing.capsule == delivery.capsule
+                    && existing.created_at == delivery.created_at
+            }) {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            return Err(StoreError::DeliveryConflict {
+                message_id: message.id,
+                target_agent_id,
+            });
+        }
+        insert_message_delivery(&transaction, &delivery)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn get_message_delivery(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+    ) -> Result<Option<MessageDelivery>, StoreError> {
+        get_message_delivery(&self.connection, message_id, target_agent_id)
+    }
+
+    pub fn mark_delivery_capsule_delivered(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        delivered_at: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE message_deliveries
+             SET capsule_delivered_at = ?3, updated_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2
+               AND status = 'pending' AND capsule IS NOT NULL
+               AND capsule_delivered_at IS NULL",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                delivered_at
+            ],
+        )? == 1)
+    }
+
+    pub fn mark_delivery_delivered(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        delivered_at: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE message_deliveries
+             SET status = 'delivered', updated_at = ?3, delivered_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2 AND status = 'pending'",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                delivered_at
+            ],
+        )? == 1)
+    }
+
+    pub fn mark_delivery_failed(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        failed_at: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE message_deliveries
+             SET status = 'failed', updated_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2 AND status = 'pending'",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                failed_at
+            ],
+        )? == 1)
+    }
+
+    pub fn claim_failed_delivery(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        claimed_at: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.connection.execute(
+            "UPDATE message_deliveries
+             SET status = 'pending', updated_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2 AND status = 'failed'",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                claimed_at
+            ],
+        )? == 1)
+    }
+
     pub fn list_messages(
         &self,
         conversation_id: ConversationId,
@@ -1311,6 +1440,44 @@ fn insert_message(connection: &Connection, message: &Message) -> Result<bool, St
     }
 }
 
+fn insert_message_delivery(
+    connection: &Connection,
+    delivery: &MessageDelivery,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO message_deliveries(
+            message_id, target_agent_id, status, capsule, capsule_delivered_at,
+            created_at, updated_at, delivered_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            delivery.message_id.to_string(),
+            delivery.target_agent_id.to_string(),
+            delivery.status.to_string(),
+            delivery.capsule,
+            delivery.capsule_delivered_at,
+            delivery.created_at,
+            delivery.updated_at,
+            delivery.delivered_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn get_message_delivery(
+    connection: &Connection,
+    message_id: MessageId,
+    target_agent_id: AgentId,
+) -> Result<Option<MessageDelivery>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT message_id, target_agent_id, status, capsule, capsule_delivered_at,
+                created_at, updated_at, delivered_at
+         FROM message_deliveries WHERE message_id = ?1 AND target_agent_id = ?2",
+        params![message_id.to_string(), target_agent_id.to_string()],
+        records::message_delivery,
+    )
+}
+
 fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(), StoreError> {
     work_item.validate()?;
     connection.execute(
@@ -1664,11 +1831,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_three() {
+    fn fresh_database_has_schema_version_four() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -1682,6 +1849,7 @@ mod tests {
             "conversations",
             "conversation_members",
             "messages",
+            "message_deliveries",
             "work_items",
             "work_dependencies",
             "work_results",
@@ -1717,6 +1885,7 @@ mod tests {
             "conversations",
             "conversation_members",
             "messages",
+            "message_deliveries",
             "work_items",
             "work_dependencies",
             "work_results",
@@ -1746,7 +1915,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 25);
+        assert_eq!(foreign_key_count, 27);
     }
 
     #[test]
@@ -2030,14 +2199,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            3
+            4
         );
     }
 
@@ -2068,7 +2237,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..3]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 3);
         assert_eq!(
@@ -2135,6 +2304,94 @@ mod tests {
                 .unwrap(),
             "work-1"
         );
+    }
+
+    #[test]
+    fn migration_four_preserves_legacy_messages_without_deliveries() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..3]).unwrap();
+        seed_session_parent_rows(&connection);
+        connection
+            .execute(
+                "INSERT INTO messages(
+                    id, conversation_id, sender_type, sender_id, body, created_at
+                 ) VALUES (
+                    'message-legacy', 'conversation-1', 'agent', 'agent-1', 'kept', 'now'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 4);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT body FROM messages WHERE id = 'message-legacy'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM message_deliveries", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delivery_schema_rejects_invalid_state_and_progress() {
+        let database = TestDatabase::new();
+        let store = SqliteStore::open(database.path()).unwrap();
+        seed_session_parent_rows(&store.connection);
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(
+                    id, conversation_id, sender_type, sender_id, body, created_at
+                 ) VALUES (
+                    'message-1', 'conversation-1', 'agent', 'agent-1', 'hello', 'now'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        for values in [
+            "'unknown', NULL, NULL, 'now', 'now', NULL",
+            "'pending', '', NULL, 'now', 'now', NULL",
+            "'pending', NULL, 'capsule-sent', 'now', 'now', NULL",
+            "'pending', NULL, NULL, '', 'now', NULL",
+            "'pending', NULL, NULL, 'now', '', NULL",
+            "'pending', NULL, NULL, 'now', 'now', 'delivered'",
+            "'delivered', NULL, NULL, 'now', 'now', NULL",
+            "'failed', 'capsule', '', 'now', 'now', NULL",
+        ] {
+            assert!(
+                store
+                    .connection
+                    .execute(
+                        &format!(
+                            "INSERT INTO message_deliveries(
+                                message_id, target_agent_id, status, capsule,
+                                capsule_delivered_at, created_at, updated_at, delivered_at
+                             ) VALUES ('message-1', 'agent-1', {values})"
+                        ),
+                        [],
+                    )
+                    .is_err(),
+                "accepted invalid delivery values: {values}"
+            );
+        }
     }
 
     #[test]
@@ -2210,15 +2467,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (4);",
+                 INSERT INTO schema_migrations(version) VALUES (5);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 4,
-                supported: 3,
+                found: 5,
+                supported: 4,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

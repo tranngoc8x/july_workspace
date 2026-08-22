@@ -61,6 +61,11 @@ pub enum StoreError {
     MessageSenderMismatch(AgentId),
     #[error("message {id} already exists with different content")]
     MessageConflict { id: MessageId },
+    #[error("delivery for message {message_id} and target {target_agent_id} conflicts")]
+    DeliveryConflict {
+        message_id: MessageId,
+        target_agent_id: AgentId,
+    },
     #[error("database schema version {found} is newer than supported version {supported}")]
     DatabaseTooNew { found: i64, supported: i64 },
 }

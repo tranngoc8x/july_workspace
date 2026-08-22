@@ -1,8 +1,8 @@
 use super::StoreError;
 use crate::domain::{
     Agent, Checkpoint, Conversation, ConversationMember, DomainError, Memory, Message,
-    PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room, RoomMember,
-    SessionBinding, WorkDependency, WorkItem, WorkResult,
+    MessageDelivery, PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room,
+    RoomMember, SessionBinding, WorkDependency, WorkItem, WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -123,6 +123,19 @@ pub(super) fn message(row: &Row<'_>) -> Result<Message, StoreError> {
         reply_to: optional_id(row.get(5)?)?,
         metadata: metadata.map(json_value).transpose()?.unwrap_or(Value::Null),
         created_at: row.get(7)?,
+    })
+}
+
+pub(super) fn message_delivery(row: &Row<'_>) -> Result<MessageDelivery, StoreError> {
+    Ok(MessageDelivery {
+        message_id: id(row.get(0)?)?,
+        target_agent_id: id(row.get(1)?)?,
+        status: domain_enum(row.get(2)?)?,
+        capsule: row.get(3)?,
+        capsule_delivered_at: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        delivered_at: row.get(7)?,
     })
 }
 
