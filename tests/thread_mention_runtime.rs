@@ -61,6 +61,7 @@ struct FakeTransport {
     remote_prefix: String,
     create_fails_at: Option<usize>,
     send_fails_at: Option<usize>,
+    block_send_at: Option<(usize, Arc<tokio::sync::Notify>)>,
 }
 
 impl FakeTransport {
@@ -75,6 +76,7 @@ impl FakeTransport {
                 remote_prefix: remote_prefix.into(),
                 create_fails_at: None,
                 send_fails_at: None,
+                block_send_at: None,
             },
             observed,
         )
@@ -118,9 +120,18 @@ impl AgentTransport for FakeTransport {
     }
 
     async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError> {
-        let mut observed = self.observed.lock().unwrap();
-        observed.messages.push(request);
-        if self.send_fails_at == Some(observed.messages.len()) {
+        let sent = {
+            let mut observed = self.observed.lock().unwrap();
+            observed.messages.push(request);
+            observed.messages.len()
+        };
+        if let Some((blocked_at, reached)) = &self.block_send_at
+            && *blocked_at == sent
+        {
+            reached.notify_one();
+            return std::future::pending().await;
+        }
+        if self.send_fails_at == Some(sent) {
             Err(TransportError::Protocol("send failed".into()))
         } else {
             Ok(())
@@ -850,6 +861,161 @@ async fn body_failure_retry_delivers_original_body_without_duplicate_capsule() {
     assert_eq!(delivery.delivered_at.as_deref(), Some(LATER));
 
     mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_thread_body_is_reconciled_without_resending_capsule_or_leaking_context() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let (mut blocked_transport, blocked_observed) = FakeTransport::new("blocked-target");
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    blocked_transport.block_send_at = Some((2, blocked.clone()));
+    let (source_transport, source_observed) = FakeTransport::new("blocked-source");
+    let database_path = database.path().to_owned();
+    let process_fixture = Fixture {
+        source: fixture.source.clone(),
+        target: fixture.target.clone(),
+        mention_thread: fixture.mention_thread.clone(),
+        other_mention_thread: fixture.other_mention_thread.clone(),
+        source_owner_thread: fixture.source_owner_thread.clone(),
+        target_owner_thread: fixture.target_owner_thread.clone(),
+        unrelated_message: fixture.unrelated_message.clone(),
+    };
+    let message_id = MessageId::new();
+    let mut process = tokio::spawn(async move {
+        let workspace = WorkspaceRuntime::new(StorageWorker::open(database_path).unwrap()).unwrap();
+        let mut source_owner = workspace.thread_with_transport(source_transport).unwrap();
+        source_owner
+            .open_thread_for_agent(open_command(
+                process_fixture.source_owner_thread.id,
+                process_fixture.source.id,
+            ))
+            .await
+            .unwrap();
+        let mut target_owner = workspace.thread_with_transport(blocked_transport).unwrap();
+        target_owner
+            .open_thread_for_agent(open_command(
+                process_fixture.target_owner_thread.id,
+                process_fixture.target.id,
+            ))
+            .await
+            .unwrap();
+        let mut mentions = workspace.thread(process_fixture.target.id).unwrap();
+        let _ = mentions
+            .mention_thread_agent(mention_command(
+                &process_fixture,
+                message_id,
+                process_fixture.mention_thread.id,
+                process_fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await;
+    });
+
+    tokio::select! {
+        _ = blocked.notified() => {}
+        result = &mut process => panic!("delivery process ended before cancellation: {result:?}"),
+    }
+    let stranded = delivery(&database, &fixture, message_id);
+    assert_eq!(stranded.status, DeliveryStatus::Pending);
+    assert_eq!(stranded.capsule.as_deref(), Some(CAPSULE));
+    assert_eq!(stranded.capsule_delivered_at.as_deref(), Some(MENTIONED));
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message(message_id)
+            .unwrap()
+            .unwrap()
+            .body,
+        BODY
+    );
+    process.abort();
+    assert!(process.await.unwrap_err().is_cancelled());
+
+    let (target_transport, target_observed) = FakeTransport::new("restart-target");
+    let (source_transport, restart_source_observed) = FakeTransport::new("restart-source");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let reconciled = delivery(&database, &fixture, message_id);
+    assert_eq!(reconciled.status, DeliveryStatus::Failed);
+    assert_eq!(reconciled.capsule_delivered_at.as_deref(), Some(MENTIONED));
+    let mut source_owner = workspace.thread_with_transport(source_transport).unwrap();
+    source_owner
+        .open_thread_for_agent(open_command(
+            fixture.source_owner_thread.id,
+            fixture.source.id,
+        ))
+        .await
+        .unwrap();
+    let mut target_owner = workspace.thread_with_transport(target_transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let retried = delivered(
+        mentions
+            .retry_thread_mention(retry_command(message_id, fixture.target.id))
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(retried.opened.thread_id, fixture.mention_thread.id);
+    assert_eq!(
+        blocked_observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![CAPSULE, BODY]
+    );
+    {
+        let observed = target_observed.lock().unwrap();
+        assert_eq!(
+            observed
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![BODY]
+        );
+        assert_eq!(
+            observed.messages[0].session.binding_id,
+            retried.opened.session_binding_id
+        );
+    }
+    assert!(source_observed.lock().unwrap().messages.is_empty());
+    assert!(restart_source_observed.lock().unwrap().messages.is_empty());
+    let store = SqliteStore::open(database.path()).unwrap();
+    let completed = store
+        .get_message_delivery(message_id, fixture.target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, DeliveryStatus::Delivered);
+    assert_eq!(completed.capsule_delivered_at.as_deref(), Some(MENTIONED));
+    assert_eq!(
+        store.list_messages(fixture.source_owner_thread.id).unwrap(),
+        vec![fixture.unrelated_message.clone()]
+    );
+    assert!(
+        store
+            .list_messages(fixture.other_mention_thread.id)
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+
+    mentions.shutdown(LATER.into()).await.unwrap();
+    source_owner.shutdown(LATER.into()).await.unwrap();
     target_owner.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }

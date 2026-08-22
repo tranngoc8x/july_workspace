@@ -65,6 +65,7 @@ struct FakeTransport {
     resume_lost: bool,
     create_fails_at: Option<usize>,
     send_fails_at: Option<usize>,
+    block_send_at: Option<(usize, Arc<tokio::sync::Notify>)>,
 }
 
 impl FakeTransport {
@@ -82,6 +83,7 @@ impl FakeTransport {
                 resume_lost: false,
                 create_fails_at: None,
                 send_fails_at: None,
+                block_send_at: None,
             },
             sender,
             observed,
@@ -133,7 +135,14 @@ impl AgentTransport for FakeTransport {
 
     async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError> {
         self.observed.lock().unwrap().messages.push(request);
-        if self.send_fails_at == Some(self.observed.lock().unwrap().messages.len()) {
+        let sent = self.observed.lock().unwrap().messages.len();
+        if let Some((blocked_at, reached)) = &self.block_send_at
+            && *blocked_at == sent
+        {
+            reached.notify_one();
+            return std::future::pending().await;
+        }
+        if self.send_fails_at == Some(sent) {
             return Err(TransportError::Protocol("fixture send failure".into()));
         }
         Ok(())
@@ -1476,6 +1485,145 @@ async fn offline_agent_message_is_durable_and_explicit_retry_delivers_exact_body
     routed.shutdown(LATER.into()).await.unwrap();
     source_owner.shutdown(LATER.into()).await.unwrap();
     target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_agent_message_is_reconciled_and_retried_only_to_its_stored_target() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let other = seed_named_agent(&database, "gemini");
+    let (mut blocked_transport, _blocked_events, blocked_observed) = FakeTransport::new();
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    blocked_transport.block_send_at = Some((1, blocked.clone()));
+    let (other_transport, _other_events, other_observed) = FakeTransport::new();
+    let database_path = database.path().to_owned();
+    let body = "  restart keeps this exact DM body\n";
+    let message_id = MessageId::new();
+    let mut process = tokio::spawn({
+        let target = target.clone();
+        let other = other.clone();
+        async move {
+            let workspace =
+                WorkspaceRuntime::new(StorageWorker::open(database_path).unwrap()).unwrap();
+            let mut target_owner =
+                DirectMessageService::new(workspace.direct_message(blocked_transport).unwrap());
+            target_owner
+                .open("target-owner".into(), target.name.clone(), NOW.into())
+                .await
+                .unwrap();
+            let mut other_owner =
+                DirectMessageService::new(workspace.direct_message(other_transport).unwrap());
+            other_owner
+                .open("other-owner".into(), other.name.clone(), NOW.into())
+                .await
+                .unwrap();
+            let mut routed =
+                DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+            let _ = routed
+                .send_agent_message(agent_send(message_id, source.id, target.id, body))
+                .await;
+        }
+    });
+
+    tokio::select! {
+        _ = blocked.notified() => {}
+        result = &mut process => panic!("delivery process ended before cancellation: {result:?}"),
+    }
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(store.get_message(message_id).unwrap().unwrap().body, body);
+    assert_eq!(
+        store
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Pending
+    );
+    assert_eq!(
+        store.get_message_delivery(message_id, other.id).unwrap(),
+        None
+    );
+    drop(store);
+    process.abort();
+    assert!(process.await.unwrap_err().is_cancelled());
+
+    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let (other_transport, _other_events, restart_other_observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Failed
+    );
+    let mut target_owner =
+        DirectMessageService::new(workspace.direct_message(target_transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name.clone(), LATER.into())
+        .await
+        .unwrap();
+    let mut other_owner =
+        DirectMessageService::new(workspace.direct_message(other_transport).unwrap());
+    other_owner
+        .open("other-owner".into(), other.name.clone(), LATER.into())
+        .await
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+
+    assert!(matches!(
+        routed
+            .retry_agent_message(RetryAgentDirectMessage {
+                message_id,
+                target_agent_id: target.id,
+                retried_at: LATER.into(),
+            })
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::Delivered(delivered))
+            if delivered.source_agent_id == source.id && delivered.target_agent_id == target.id
+    ));
+    assert_eq!(
+        blocked_observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![body]
+    );
+    assert_eq!(
+        target_observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![body]
+    );
+    assert!(other_observed.lock().unwrap().messages.is_empty());
+    assert!(restart_other_observed.lock().unwrap().messages.is_empty());
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Delivered
+    );
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    other_owner.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }
 
