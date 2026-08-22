@@ -67,6 +67,11 @@ struct FakeTransport {
     create_fails_at: Option<usize>,
     create_lost_at: Option<usize>,
     send_fails_at: Option<usize>,
+    send_failure_gate: Option<(
+        usize,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
     block_send_at: Option<(usize, std::sync::mpsc::SyncSender<()>)>,
 }
 
@@ -76,7 +81,17 @@ impl FakeTransport {
         tokio::sync::mpsc::Sender<TransportEvent>,
         Arc<Mutex<ObservedTransport>>,
     ) {
-        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        Self::with_event_capacity(16)
+    }
+
+    fn with_event_capacity(
+        capacity: usize,
+    ) -> (
+        Self,
+        tokio::sync::mpsc::Sender<TransportEvent>,
+        Arc<Mutex<ObservedTransport>>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let observed = Arc::new(Mutex::new(ObservedTransport::default()));
         (
             Self {
@@ -86,6 +101,7 @@ impl FakeTransport {
                 create_fails_at: None,
                 create_lost_at: None,
                 send_fails_at: None,
+                send_failure_gate: None,
                 block_send_at: None,
             },
             sender,
@@ -147,6 +163,16 @@ impl AgentTransport for FakeTransport {
         {
             reached.send(()).unwrap();
             return std::future::pending().await;
+        }
+        if self
+            .send_failure_gate
+            .as_ref()
+            .is_some_and(|(failed_at, _, _)| *failed_at == sent)
+        {
+            let (_, reached, release) = self.send_failure_gate.take().unwrap();
+            reached.send(()).unwrap();
+            release.await.unwrap();
+            return Err(TransportError::Protocol("fixture send failure".into()));
         }
         if self.send_fails_at == Some(sent) {
             return Err(TransportError::Protocol("fixture send failure".into()));
@@ -1045,107 +1071,135 @@ async fn replacement_create_session_lost_keeps_pending_n_plus_one() {
 }
 
 #[tokio::test]
-async fn recovery_abort_is_local_even_when_disconnect_persistence_fails() {
-    for late_disconnect in [false, true] {
-        let database = TestDatabase::new();
-        let agent = seed_agent(&database);
-        let mut store = SqliteStore::open(database.path()).unwrap();
-        let dm = store.get_or_create_dm("tony", agent.id, NOW).unwrap();
-        let source = SessionBinding {
-            id: SessionBindingId::new(),
-            conversation_id: dm.id,
-            agent_id: agent.id,
-            transport_type: "acp".into(),
-            remote_session_id: Some("remote-source".into()),
-            generation: 1,
-            status: SessionBindingStatus::Lost,
-            created_at: NOW.into(),
-            last_used_at: NOW.into(),
-        };
-        store.insert_session_binding(&source).unwrap();
-        drop(store);
-        let connection = rusqlite::Connection::open(database.path()).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TRIGGER fail_recovery_detach
-                 BEFORE UPDATE OF status ON session_bindings
-                 WHEN OLD.status = 'active' AND NEW.status = 'disconnected'
-                 BEGIN SELECT RAISE(ABORT, 'fixture recovery detach failure'); END;",
-            )
-            .unwrap();
+async fn recovery_abort_is_owner_atomic_when_disconnect_persistence_fails() {
+    let database = TestDatabase::new();
+    let agent = seed_agent(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let dm = store.get_or_create_dm("tony", agent.id, NOW).unwrap();
+    let source = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: dm.id,
+        agent_id: agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: Some("remote-source".into()),
+        generation: 1,
+        status: SessionBindingStatus::Lost,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    store.insert_session_binding(&source).unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_recovery_detach
+             BEFORE UPDATE OF status ON session_bindings
+             WHEN OLD.status = 'active' AND NEW.status = 'disconnected'
+             BEGIN SELECT RAISE(ABORT, 'fixture recovery detach failure'); END;",
+        )
+        .unwrap();
 
-        let (mut transport, events, observed) = FakeTransport::new();
-        transport.send_fails_at = Some(1);
-        let mut service = DirectMessageService::new(runtime(&database, transport));
-        assert!(matches!(
-            service
-                .open("tony".into(), "codex".into(), LATER.into())
-                .await,
-            Err(DirectMessageError::Runtime(message)) if message.contains("fixture send failure")
-        ));
-
-        let store = SqliteStore::open(database.path()).unwrap();
-        let pending = store
-            .get_latest_session_binding(dm.id, agent.id)
-            .unwrap()
-            .unwrap();
-        let recovery = store.get_session_recovery(pending.id).unwrap().unwrap();
-        assert_eq!(pending.generation, 2, "late disconnect: {late_disconnect}");
-        assert_eq!(
-            pending.status,
-            SessionBindingStatus::Active,
-            "late disconnect: {late_disconnect}"
-        );
-        assert!(recovery.capsule_delivered_at.is_none());
-        drop(store);
-
-        if late_disconnect {
-            events
-                .send(TransportEvent::TransportDisconnected {
-                    agent_id: agent.id,
-                    reason: "late source disconnect".into(),
-                })
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let (send_reached, mut reached) = tokio::sync::oneshot::channel();
+    let (release_send, released) = tokio::sync::oneshot::channel();
+    let (mut transport, events, observed) = FakeTransport::with_event_capacity(1);
+    transport.send_failure_gate = Some((1, send_reached, released));
+    let mut service = DirectMessageService::new(runtime(&database, transport));
+    let result = {
+        let opening = service.open("tony".into(), "codex".into(), LATER.into());
+        tokio::pin!(opening);
+        tokio::select! {
+            result = &mut opening => panic!("recovery send was not gated: {result:?}"),
+            result = &mut reached => result.unwrap(),
         }
-        connection
-            .execute_batch("DROP TRIGGER fail_recovery_detach")
-            .unwrap();
-
-        service
-            .open("tony".into(), "codex".into(), LATER.into())
+        events
+            .send(TransportEvent::TransportDisconnected {
+                agent_id: agent.id,
+                reason: "disconnect queued during recovery send".into(),
+            })
             .await
             .unwrap();
-        {
-            let observed = observed.lock().unwrap();
-            assert_eq!(observed.connections.len(), 1);
-            assert_eq!(observed.creates.len(), 1);
-            assert_eq!(observed.resumes.len(), 1);
-            assert_eq!(observed.messages.len(), 2);
-            assert_eq!(observed.messages[0].content, recovery.capsule);
-            assert_eq!(observed.messages[1].content, recovery.capsule);
-        }
-        let store = SqliteStore::open(database.path()).unwrap();
-        assert_eq!(
-            store
-                .get_latest_session_binding(dm.id, agent.id)
-                .unwrap()
-                .unwrap()
-                .id,
-            pending.id
+        let stale_session = SessionRef {
+            binding_id: source.id,
+            remote_session_id: "remote-source".into(),
+        };
+        release_send.send(()).unwrap();
+        events
+            .reserve()
+            .await
+            .unwrap()
+            .send(TransportEvent::AgentTextDelta {
+                session: stale_session,
+                text: "event after disconnect consumption".into(),
+            });
+        drop(
+            events
+                .reserve()
+                .await
+                .expect("owner stopped before draining queued events"),
+        );
+        opening.await
+    };
+    assert!(matches!(
+        result,
+        Err(DirectMessageError::Runtime(message)) if message.contains("fixture send failure")
+    ));
+
+    let store = SqliteStore::open(database.path()).unwrap();
+    let pending = store
+        .get_latest_session_binding(dm.id, agent.id)
+        .unwrap()
+        .unwrap();
+    let recovery = store.get_session_recovery(pending.id).unwrap().unwrap();
+    assert_eq!(pending.generation, 2);
+    assert_eq!(pending.status, SessionBindingStatus::Active);
+    assert!(recovery.capsule_delivered_at.is_none());
+    drop(store);
+
+    service
+        .open("tony".into(), "codex".into(), LATER.into())
+        .await
+        .unwrap();
+    {
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.connections.len(), 1);
+        assert_eq!(observed.creates.len(), 1);
+        assert_eq!(observed.resumes.len(), 1);
+        assert_eq!(observed.messages.len(), 2);
+        assert!(
+            observed
+                .messages
+                .iter()
+                .all(|request| request.session.binding_id == pending.id)
         );
         assert!(
-            store
-                .get_session_recovery(pending.id)
-                .unwrap()
-                .unwrap()
-                .capsule_delivered_at
-                .is_some()
+            observed
+                .messages
+                .iter()
+                .all(|request| request.content == recovery.capsule)
         );
-        drop(store);
-        service.shutdown(LATER.into()).await.unwrap();
     }
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(
+        store
+            .get_latest_session_binding(dm.id, agent.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        pending.id
+    );
+    assert!(
+        store
+            .get_session_recovery(pending.id)
+            .unwrap()
+            .unwrap()
+            .capsule_delivered_at
+            .is_some()
+    );
+    drop(store);
+    connection
+        .execute_batch("DROP TRIGGER fail_recovery_detach")
+        .unwrap();
+    service.shutdown(LATER.into()).await.unwrap();
 }
 
 #[tokio::test]

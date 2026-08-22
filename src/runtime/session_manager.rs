@@ -253,6 +253,28 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(())
     }
 
+    pub(crate) async fn deliver_recovery_capsule(
+        &mut self,
+        session: &SessionRef,
+        delivered_at: String,
+    ) -> Result<(), RuntimeError> {
+        let Some(recovery) = self
+            .storage
+            .get_session_recovery(session.binding_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if recovery.capsule_delivered_at.is_some() {
+            return Ok(());
+        }
+        self.send_message(session.clone(), recovery.capsule).await?;
+        self.storage
+            .mark_session_recovery_capsule_delivered(session.binding_id, delivered_at)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn cancel_turn(
         &mut self,
         session: SessionRef,

@@ -97,48 +97,15 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
         project_root: PathBuf,
         resumed_at: String,
     ) -> Result<RuntimeSession, RuntimeError> {
-        let recovery_at = resumed_at.clone();
-        let mut session = self
-            .request(|reply| WorkspaceCommand::OpenSession {
-                agent_id,
-                binding,
-                project_root,
-                resumed_at,
-                recover_missing: true,
-                reply,
-            })
-            .await?;
-        let recovery = match self
-            .storage
-            .get_session_recovery(session.session().binding_id)
-            .await
-        {
-            Ok(recovery) => recovery,
-            Err(error) => {
-                session.abort_recovery(recovery_at).await;
-                return Err(error);
-            }
-        };
-        if let Some(recovery) = recovery
-            && recovery.capsule_delivered_at.is_none()
-        {
-            if let Err(error) = session.send_message(recovery.capsule).await {
-                session.abort_recovery(recovery_at).await;
-                return Err(error);
-            }
-            if let Err(error) = self
-                .storage
-                .mark_session_recovery_capsule_delivered(
-                    session.session().binding_id,
-                    recovery_at.clone(),
-                )
-                .await
-            {
-                session.abort_recovery(recovery_at).await;
-                return Err(error);
-            }
-        }
-        Ok(session)
+        self.request(|reply| WorkspaceCommand::OpenSession {
+            agent_id,
+            binding,
+            project_root,
+            resumed_at,
+            recover_missing: true,
+            reply,
+        })
+        .await
     }
 
     async fn request<R>(
@@ -168,7 +135,6 @@ enum OwnerCommand {
     CancelTurn(SessionRef, String, Reply<()>),
     RespondPermission(PermissionResponse, String, Reply<()>),
     Detach(SessionRef, String, Reply<()>),
-    AbortRecovery(SessionRef, String, Reply<()>),
     Shutdown(String, Reply<()>),
 }
 
@@ -235,13 +201,6 @@ impl RuntimeSession {
         let session = self.session.clone();
         self.request(|reply| OwnerCommand::Detach(session, detached_at, reply))
             .await
-    }
-
-    async fn abort_recovery(&mut self, detached_at: String) {
-        let session = self.session.clone();
-        let _ = self
-            .request(|reply| OwnerCommand::AbortRecovery(session, detached_at, reply))
-            .await;
     }
 
     async fn request(
@@ -643,18 +602,38 @@ async fn handle_owner_command<T: AgentTransport>(
                 let _ = reply.send(Err(RuntimeError::SessionBindingAlreadyAttached(binding.id)));
                 return None;
             }
+            let recovery_at = resumed_at.clone();
             let result = manager
                 .open_session(binding, project_root, resumed_at, recover_missing)
                 .await;
-            if let Ok(session) = &result {
-                bindings.insert(
-                    session.binding_id,
-                    BindingRoute {
-                        session: session.clone(),
-                        events,
-                    },
-                );
-            }
+            let result = match result {
+                Ok(session) => {
+                    bindings.insert(
+                        session.binding_id,
+                        BindingRoute {
+                            session: session.clone(),
+                            events,
+                        },
+                    );
+                    if recover_missing
+                        && let Err(error) = manager
+                            .deliver_recovery_capsule(&session, recovery_at.clone())
+                            .await
+                    {
+                        bindings.remove(&session.binding_id);
+                        if let Some(delivery) = pending {
+                            delivery
+                                .targets
+                                .retain(|target| target.0 != session.binding_id);
+                        }
+                        let _ = manager.abort_session_recovery(&session, recovery_at).await;
+                        Err(error)
+                    } else {
+                        Ok(session)
+                    }
+                }
+                Err(error) => Err(error),
+            };
             let _ = reply.send(result);
         }
         Some(OwnerCommand::SendMessage(request, reply)) => {
@@ -692,21 +671,6 @@ async fn handle_owner_command<T: AgentTransport>(
                 }
             }
             let _ = reply.send(result);
-        }
-        Some(OwnerCommand::AbortRecovery(session, detached_at, reply)) => {
-            let result = require_session(bindings, &session);
-            if result.is_ok() {
-                bindings.remove(&session.binding_id);
-                if let Some(delivery) = pending {
-                    delivery
-                        .targets
-                        .retain(|target| target.0 != session.binding_id);
-                }
-            }
-            let _ = reply.send(match result {
-                Ok(()) => manager.abort_session_recovery(&session, detached_at).await,
-                Err(error) => Err(error),
-            });
         }
         Some(OwnerCommand::Shutdown(stopped_at, reply)) => {
             return Some(OwnerExit::Shutdown(stopped_at, reply));
