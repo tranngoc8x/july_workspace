@@ -1,4 +1,5 @@
 use super::{RuntimeError, StorageHandle};
+use crate::application::BuildRecoveryCapsule;
 use crate::domain::{
     AgentId, PermissionDecision, SessionBinding, SessionBindingId, SessionBindingStatus,
 };
@@ -69,6 +70,73 @@ impl<T: AgentTransport> SessionManager<T> {
         Ok(created.session)
     }
 
+    pub(crate) async fn open_session(
+        &mut self,
+        mut binding: SessionBinding,
+        project_root: PathBuf,
+        opened_at: String,
+        recover_missing: bool,
+    ) -> Result<SessionRef, RuntimeError> {
+        self.require_own_binding(&binding)?;
+        if !recover_missing {
+            return if binding.remote_session_id.is_some() {
+                self.resume_session(&binding, project_root, opened_at).await
+            } else {
+                self.create_session(binding, project_root).await
+            };
+        }
+        let latest = self
+            .storage
+            .get_latest_session_binding(binding.conversation_id, binding.agent_id)
+            .await?;
+        let Some(latest) = latest else {
+            return self.create_session(binding, project_root).await;
+        };
+        if latest.id != binding.id {
+            return Err(RuntimeError::SessionBindingNotFound(binding.id));
+        }
+        binding = latest;
+
+        loop {
+            if binding.status == SessionBindingStatus::Closed {
+                return Err(RuntimeError::SessionUnavailable(binding.status));
+            }
+            if binding.status == SessionBindingStatus::Lost {
+                binding = self.begin_replacement(&binding, opened_at.clone()).await?;
+                continue;
+            }
+
+            let recovery = self.storage.get_session_recovery(binding.id).await?;
+            let result = if recovery.is_some() {
+                if binding.remote_session_id.is_some() {
+                    self.resume_session(&binding, project_root.clone(), opened_at.clone())
+                        .await
+                } else {
+                    self.create_replacement_session(
+                        &binding,
+                        project_root.clone(),
+                        opened_at.clone(),
+                    )
+                    .await
+                }
+            } else if binding.remote_session_id.is_none() {
+                binding = self.begin_replacement(&binding, opened_at.clone()).await?;
+                continue;
+            } else {
+                self.resume_session(&binding, project_root.clone(), opened_at.clone())
+                    .await
+            };
+
+            match result {
+                Ok(session) => return Ok(session),
+                Err(RuntimeError::Transport(crate::transport::TransportError::SessionLost(_))) => {
+                    binding = self.begin_replacement(&binding, opened_at.clone()).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(crate) async fn resume_session(
         &mut self,
         binding: &SessionBinding,
@@ -106,6 +174,61 @@ impl<T: AgentTransport> SessionManager<T> {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    async fn begin_replacement(
+        &mut self,
+        source: &SessionBinding,
+        replaced_at: String,
+    ) -> Result<SessionBinding, RuntimeError> {
+        let capsule = self
+            .storage
+            .build_recovery_capsule(BuildRecoveryCapsule {
+                conversation_id: source.conversation_id,
+                agent_id: source.agent_id,
+            })
+            .await?;
+        let (replacement, _) = self
+            .storage
+            .begin_session_replacement(
+                source.id,
+                SessionBindingId::new(),
+                capsule.content,
+                replaced_at,
+            )
+            .await?;
+        Ok(replacement)
+    }
+
+    async fn create_replacement_session(
+        &mut self,
+        binding: &SessionBinding,
+        project_root: PathBuf,
+        attached_at: String,
+    ) -> Result<SessionRef, RuntimeError> {
+        self.require_own_binding(binding)?;
+        let created = self
+            .transport
+            .create_session(CreateSession {
+                binding_id: binding.id,
+                project_root,
+            })
+            .await?;
+        if let Err(error) = self
+            .storage
+            .attach_replacement_remote_session(
+                binding.id,
+                created.session.remote_session_id.clone(),
+                attached_at,
+            )
+            .await
+        {
+            let _ = self.transport.close_session(created.session.clone()).await;
+            return Err(error);
+        }
+        self.owned_bindings
+            .insert(created.session.binding_id, created.session.clone());
+        Ok(created.session)
     }
 
     pub(crate) async fn send_message(

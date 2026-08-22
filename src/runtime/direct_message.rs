@@ -98,30 +98,13 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
             .await
             .map_err(runtime_error)?;
 
-        match binding.as_ref().map(|binding| binding.status) {
-            Some(SessionBindingStatus::Lost) => return Err(DirectMessageError::SessionLost),
-            Some(SessionBindingStatus::Closed) => {
-                return Err(DirectMessageError::SessionUnavailable(
-                    SessionBindingStatus::Closed,
-                ));
-            }
-            Some(SessionBindingStatus::Active | SessionBindingStatus::Disconnected)
-                if binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.remote_session_id.is_none()) =>
-            {
-                let binding = binding.as_ref().expect("binding status was present");
-                storage
-                    .update_session_binding_status(
-                        binding.id,
-                        SessionBindingStatus::Lost,
-                        opened_at,
-                    )
-                    .await
-                    .map_err(runtime_error)?;
-                return Err(DirectMessageError::SessionLost);
-            }
-            _ => {}
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding.status == SessionBindingStatus::Closed)
+        {
+            return Err(DirectMessageError::SessionUnavailable(
+                SessionBindingStatus::Closed,
+            ));
         }
 
         let project_root = PathBuf::from(&agent.project_root);
@@ -150,7 +133,7 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         });
         let session = self
             .workspace
-            .open_session(agent.id, binding, project_root, opened_at)
+            .open_recoverable_session(agent.id, binding, project_root, opened_at)
             .await
             .map_err(runtime_error)?;
         let session_ref = session.session().clone();
@@ -720,6 +703,7 @@ fn runtime_error(error: RuntimeError) -> DirectMessageError {
         RuntimeError::SessionBindingAlreadyAttached(id) => {
             DirectMessageError::SessionAlreadyAttached(id)
         }
+        RuntimeError::SessionUnavailable(status) => DirectMessageError::SessionUnavailable(status),
         other => DirectMessageError::Runtime(other.to_string()),
     }
 }

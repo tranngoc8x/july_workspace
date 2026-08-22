@@ -1,4 +1,5 @@
-use crate::domain::{AgentId, SessionBindingId};
+use crate::application::RecoveryError;
+use crate::domain::{AgentId, SessionBindingId, SessionBindingStatus};
 use crate::storage::StoreError;
 use crate::transport::TransportError;
 use thiserror::Error;
@@ -13,6 +14,8 @@ pub enum RuntimeError {
     Storage(#[from] StoreError),
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error(transparent)]
+    Recovery(#[from] RecoveryError),
     #[error("runtime owner channel closed")]
     ChannelClosed,
     #[error("no Tokio runtime is currently entered")]
@@ -31,6 +34,8 @@ pub enum RuntimeError {
     SessionBindingNotFound(SessionBindingId),
     #[error("session binding {0} is already attached to this runtime owner")]
     SessionBindingAlreadyAttached(SessionBindingId),
+    #[error("session binding is unavailable with status {0}")]
+    SessionUnavailable(SessionBindingStatus),
     #[error("workspace runtime is stopped")]
     WorkspaceStopped,
 }

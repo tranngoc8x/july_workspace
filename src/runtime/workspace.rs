@@ -28,6 +28,7 @@ enum WorkspaceCommand<T> {
         binding: SessionBinding,
         project_root: PathBuf,
         resumed_at: String,
+        recover_missing: bool,
         reply: Reply<RuntimeSession>,
     },
     Shutdown(String, Reply<()>),
@@ -83,9 +84,61 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
             binding,
             project_root,
             resumed_at,
+            recover_missing: false,
             reply,
         })
         .await
+    }
+
+    pub(crate) async fn open_recoverable_session(
+        &self,
+        agent_id: AgentId,
+        binding: SessionBinding,
+        project_root: PathBuf,
+        resumed_at: String,
+    ) -> Result<RuntimeSession, RuntimeError> {
+        let recovery_at = resumed_at.clone();
+        let mut session = self
+            .request(|reply| WorkspaceCommand::OpenSession {
+                agent_id,
+                binding,
+                project_root,
+                resumed_at,
+                recover_missing: true,
+                reply,
+            })
+            .await?;
+        let recovery = match self
+            .storage
+            .get_session_recovery(session.session().binding_id)
+            .await
+        {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                let _ = session.detach(recovery_at).await;
+                return Err(error);
+            }
+        };
+        if let Some(recovery) = recovery
+            && recovery.capsule_delivered_at.is_none()
+        {
+            if let Err(error) = session.send_message(recovery.capsule).await {
+                let _ = session.detach(recovery_at).await;
+                return Err(error);
+            }
+            if let Err(error) = self
+                .storage
+                .mark_session_recovery_capsule_delivered(
+                    session.session().binding_id,
+                    recovery_at.clone(),
+                )
+                .await
+            {
+                let _ = session.detach(recovery_at).await;
+                return Err(error);
+            }
+        }
+        Ok(session)
     }
 
     async fn request<R>(
@@ -107,6 +160,7 @@ enum OwnerCommand {
         binding: SessionBinding,
         project_root: PathBuf,
         resumed_at: String,
+        recover_missing: bool,
         events: mpsc::Sender<TransportEvent>,
         reply: Reply<SessionRef>,
     },
@@ -346,11 +400,19 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                 binding,
                 project_root,
                 resumed_at,
+                recover_missing,
                 reply,
             } => {
                 let result = match owners.get(&agent_id) {
                     Some(owner) => {
-                        open_owner_session(owner, binding, project_root, resumed_at).await
+                        open_owner_session(
+                            owner,
+                            binding,
+                            project_root,
+                            resumed_at,
+                            recover_missing,
+                        )
+                        .await
                     }
                     None => Err(RuntimeError::AgentNotRegistered(agent_id)),
                 };
@@ -371,6 +433,7 @@ async fn open_owner_session(
     binding: SessionBinding,
     project_root: PathBuf,
     resumed_at: String,
+    recover_missing: bool,
 ) -> Result<RuntimeSession, RuntimeError> {
     let (events, receiver) = mpsc::channel(SESSION_EVENT_CAPACITY);
     let (reply, response) = oneshot::channel();
@@ -380,6 +443,7 @@ async fn open_owner_session(
             binding,
             project_root,
             resumed_at,
+            recover_missing,
             events,
             reply,
         })
@@ -563,6 +627,7 @@ async fn handle_owner_command<T: AgentTransport>(
             binding,
             project_root,
             resumed_at,
+            recover_missing,
             events,
             reply,
         }) => {
@@ -570,13 +635,9 @@ async fn handle_owner_command<T: AgentTransport>(
                 let _ = reply.send(Err(RuntimeError::SessionBindingAlreadyAttached(binding.id)));
                 return None;
             }
-            let result = if binding.remote_session_id.is_some() {
-                manager
-                    .resume_session(&binding, project_root, resumed_at)
-                    .await
-            } else {
-                manager.create_session(binding, project_root).await
-            };
+            let result = manager
+                .open_session(binding, project_root, resumed_at, recover_missing)
+                .await;
             if let Ok(session) = &result {
                 bindings.insert(
                     session.binding_id,
