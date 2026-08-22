@@ -428,10 +428,6 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         message.validate()?;
-        if !insert_message(&transaction, message)? {
-            transaction.commit()?;
-            return Ok(None);
-        }
         let thread_id = message.conversation_id;
         let thread = require_open_thread(&transaction, thread_id)?;
         let room_id = thread.room_id.expect("validated thread has a room");
@@ -445,6 +441,10 @@ impl SqliteStore {
             || message.sender_id != source_agent_id.to_string()
         {
             return Err(StoreError::MessageSenderMismatch(source_agent_id));
+        }
+        if !insert_message(&transaction, message)? {
+            transaction.commit()?;
+            return Ok(None);
         }
 
         let target_member_id = target_agent_id.to_string();

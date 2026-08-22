@@ -556,6 +556,63 @@ async fn neutral_mismatched_and_blank_mentions_fail_before_storage_or_transport(
 }
 
 #[tokio::test]
+async fn missing_and_non_thread_mentions_keep_typed_errors_without_persistence_or_transport() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let dm_id = SqliteStore::open(database.path())
+        .unwrap()
+        .get_or_create_dm("tony", fixture.target.id, CREATED)
+        .unwrap()
+        .id;
+    let (transport, observed) = FakeTransport::new("target");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+
+    for thread_id in [ConversationId::new(), dm_id] {
+        let message_id = MessageId::new();
+        assert_eq!(
+            mentions
+                .mention_thread_agent(mention_command(
+                    &fixture,
+                    message_id,
+                    thread_id,
+                    fixture.target.id,
+                    BODY,
+                    CAPSULE,
+                    MENTIONED,
+                ))
+                .await,
+            Err(CollaborationError::ThreadNotFound(thread_id))
+        );
+        assert!(
+            SqliteStore::open(database.path())
+                .unwrap()
+                .get_message(message_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+    {
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.connections.len(), 1);
+        assert_eq!(observed.creates.len(), 1);
+        assert!(observed.messages.is_empty());
+    }
+
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_target_owner_preserves_the_join_and_message() {
     let database = TestDatabase::new();
     let fixture = seed(&database);
