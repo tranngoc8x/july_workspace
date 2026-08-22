@@ -173,6 +173,11 @@ pub enum CollaborationError {
     SessionUnavailable(SessionBindingStatus),
     #[error("session binding {0} is already attached to this runtime owner")]
     SessionAlreadyAttached(SessionBindingId),
+    #[error("delivery state recording failed: {primary}; FAILED recovery also failed: {recovery}")]
+    DeliveryStateRecoveryFailed {
+        primary: Box<CollaborationError>,
+        recovery: Box<CollaborationError>,
+    },
     #[error("collaboration runtime failed: {0}")]
     Runtime(String),
 }

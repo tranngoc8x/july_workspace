@@ -135,17 +135,25 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
         attempted_at: String,
         error: CollaborationError,
     ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
-        if !self
+        let recorded_error = match self
             .workspace
             .storage()
             .mark_delivery_failed(message_id, target_agent_id, attempted_at)
-            .await?
+            .await
         {
-            return Err(CollaborationError::Runtime(
-                "Thread mention delivery is no longer pending".into(),
-            ));
-        }
-        Ok(Some(ThreadMentionOutcome::PersistedFailed(error)))
+            Ok(true) => error,
+            Ok(false) => CollaborationError::DeliveryStateRecoveryFailed {
+                primary: Box::new(error),
+                recovery: Box::new(CollaborationError::Runtime(
+                    "FAILED recovery found delivery no longer pending".into(),
+                )),
+            },
+            Err(recovery) => CollaborationError::DeliveryStateRecoveryFailed {
+                primary: Box::new(error),
+                recovery: Box::new(recovery),
+            },
+        };
+        Ok(Some(ThreadMentionOutcome::PersistedFailed(recorded_error)))
     }
 
     async fn deliver_persisted(
@@ -213,7 +221,7 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                     .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
                     .await;
             }
-            if !self
+            let recorded = self
                 .workspace
                 .storage()
                 .mark_delivery_capsule_delivered(
@@ -221,11 +229,31 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                     delivery.target_agent_id,
                     attempted_at.clone(),
                 )
-                .await?
-            {
-                return Err(CollaborationError::Runtime(
-                    "Thread mention capsule delivery is no longer pending".into(),
-                ));
+                .await;
+            match recorded {
+                Ok(true) => {}
+                Ok(false) => {
+                    return self
+                        .persisted_failure(
+                            message.id,
+                            delivery.target_agent_id,
+                            attempted_at,
+                            CollaborationError::Runtime(
+                                "Thread mention capsule delivery is no longer pending".into(),
+                            ),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .persisted_failure(
+                            message.id,
+                            delivery.target_agent_id,
+                            attempted_at,
+                            error,
+                        )
+                        .await;
+                }
             }
         }
         if let Err(error) = self.send_exact(message.body).await.map_err(runtime_error) {
@@ -233,15 +261,30 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                 .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
                 .await;
         }
-        if !self
+        let recorded = self
             .workspace
             .storage()
-            .mark_delivery_delivered(message.id, delivery.target_agent_id, attempted_at)
-            .await?
-        {
-            return Err(CollaborationError::Runtime(
-                "Thread mention delivery is no longer pending".into(),
-            ));
+            .mark_delivery_delivered(message.id, delivery.target_agent_id, attempted_at.clone())
+            .await;
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => {
+                return self
+                    .persisted_failure(
+                        message.id,
+                        delivery.target_agent_id,
+                        attempted_at,
+                        CollaborationError::Runtime(
+                            "Thread mention delivery is no longer pending".into(),
+                        ),
+                    )
+                    .await;
+            }
+            Err(error) => {
+                return self
+                    .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                    .await;
+            }
         }
         Ok(Some(ThreadMentionOutcome::Delivered(
             MentionedThreadAgent {
@@ -365,7 +408,7 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
         {
             return Err(CollaborationError::ThreadAlreadyOpen);
         }
-        let Some((message, delivery)) = self
+        let claimed = self
             .workspace
             .storage()
             .claim_thread_mention_retry(
@@ -373,9 +416,13 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
                 command.target_agent_id,
                 command.retried_at.clone(),
             )
-            .await?
-        else {
-            return Ok(None);
+            .await;
+        let (message, delivery) = match claimed {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                return Ok(Some(ThreadMentionOutcome::PersistedFailed(error)));
+            }
         };
         if self
             .opened

@@ -982,3 +982,229 @@ async fn retry_claims_once_and_delivered_retry_is_a_transport_noop() {
     target_owner.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }
+
+#[tokio::test]
+async fn capsule_progress_noop_recovers_failed_with_a_structured_outcome() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let (transport, observed) = FakeTransport::new("target");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER ignore_capsule_progress
+             BEFORE UPDATE OF capsule_delivered_at ON message_deliveries
+             WHEN NEW.capsule_delivered_at IS NOT NULL
+             BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+
+    let outcome = mentions
+        .mention_thread_agent(mention_command(
+            &fixture,
+            message_id,
+            fixture.mention_thread.id,
+            fixture.target.id,
+            BODY,
+            CAPSULE,
+            MENTIONED,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ThreadMentionOutcome::PersistedFailed(CollaborationError::Runtime(message))
+            if message.contains("capsule delivery is no longer pending")
+    ));
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![CAPSULE]
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER ignore_capsule_progress")
+        .unwrap();
+    mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn delivered_record_error_recovers_failed_with_a_structured_outcome() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    SqliteStore::open(database.path())
+        .unwrap()
+        .add_thread_member(fixture.mention_thread.id, fixture.target.id, CREATED)
+        .unwrap();
+    let (transport, observed) = FakeTransport::new("target");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_delivered_record
+             BEFORE UPDATE OF status ON message_deliveries
+             WHEN NEW.status = 'delivered'
+             BEGIN SELECT RAISE(ABORT, 'fixture delivered record failure'); END;",
+        )
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+
+    let outcome = mentions
+        .mention_thread_agent(mention_command(
+            &fixture,
+            message_id,
+            fixture.mention_thread.id,
+            fixture.target.id,
+            BODY,
+            CAPSULE,
+            MENTIONED,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        ThreadMentionOutcome::PersistedFailed(CollaborationError::Runtime(message))
+            if message.contains("fixture delivered record failure")
+    ));
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![BODY]
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_delivered_record")
+        .unwrap();
+    mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn record_and_recovery_errors_are_combined_in_the_persisted_outcome() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    SqliteStore::open(database.path())
+        .unwrap()
+        .add_thread_member(fixture.mention_thread.id, fixture.target.id, CREATED)
+        .unwrap();
+    let (transport, observed) = FakeTransport::new("target");
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_all_delivery_updates
+             BEFORE UPDATE ON message_deliveries
+             BEGIN SELECT RAISE(ABORT, 'fixture all delivery updates fail'); END;",
+        )
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+
+    let outcome = mentions
+        .mention_thread_agent(mention_command(
+            &fixture,
+            message_id,
+            fixture.mention_thread.id,
+            fixture.target.id,
+            BODY,
+            CAPSULE,
+            MENTIONED,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ThreadMentionOutcome::PersistedFailed(CollaborationError::DeliveryStateRecoveryFailed {
+        primary,
+        recovery,
+    }) = outcome
+    else {
+        panic!("expected combined recording and recovery failure, got {outcome:?}");
+    };
+    assert!(
+        primary
+            .to_string()
+            .contains("fixture all delivery updates fail")
+    );
+    assert!(
+        recovery
+            .to_string()
+            .contains("fixture all delivery updates fail")
+    );
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Pending
+    );
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![BODY]
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_all_delivery_updates")
+        .unwrap();
+    mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}

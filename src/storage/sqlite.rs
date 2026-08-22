@@ -428,7 +428,7 @@ impl SqliteStore {
         source_agent_id: AgentId,
         target_agent_id: AgentId,
         capsule: &str,
-    ) -> Result<Option<bool>, StoreError> {
+    ) -> Result<Option<(bool, MessageDelivery)>, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -494,7 +494,7 @@ impl SqliteStore {
         delivery.validate()?;
         insert_message_delivery(&transaction, &delivery)?;
         transaction.commit()?;
-        Ok(Some(!active))
+        Ok(Some((!active, delivery)))
     }
 
     pub fn remove_thread_member(
@@ -805,14 +805,7 @@ impl SqliteStore {
     }
 
     pub fn get_message(&self, id: MessageId) -> Result<Option<Message>, StoreError> {
-        query_optional(
-            &self.connection,
-            "SELECT id, conversation_id, sender_type, sender_id, body, reply_to,
-                    metadata_json, created_at
-             FROM messages WHERE id = ?1",
-            params![id.to_string()],
-            records::message,
-        )
+        get_message(&self.connection, id)
     }
 
     pub fn insert_message_with_pending_delivery(
@@ -945,6 +938,54 @@ impl SqliteStore {
                 claimed_at
             ],
         )? == 1)
+    }
+
+    pub fn claim_failed_thread_mention_delivery(
+        &mut self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        claimed_at: &str,
+    ) -> Result<Option<(Message, MessageDelivery)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut delivery) = get_message_delivery(&transaction, message_id, target_agent_id)?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if delivery.status != DeliveryStatus::Failed {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let message = get_message(&transaction, message_id)?.ok_or(
+            StoreError::InvalidStoredValue("message_delivery.message_id"),
+        )?;
+        let thread = require_open_thread(&transaction, message.conversation_id)?;
+        let room_id = thread.room_id.expect("validated thread has a room");
+        require_active_room(&transaction, room_id)?;
+        require_active_agent(&transaction, target_agent_id)?;
+        require_active_room_membership(&transaction, room_id, target_agent_id)?;
+        require_active_thread_membership(&transaction, message.conversation_id, target_agent_id)?;
+        if transaction.execute(
+            "UPDATE message_deliveries
+             SET status = 'pending', updated_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2 AND status = 'failed'",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                claimed_at
+            ],
+        )? != 1
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        delivery.status = DeliveryStatus::Pending;
+        delivery.updated_at = claimed_at.into();
+        delivery.validate()?;
+        transaction.commit()?;
+        Ok(Some((message, delivery)))
     }
 
     pub fn list_messages(
@@ -1481,6 +1522,20 @@ fn insert_message_delivery(
         ],
     )?;
     Ok(())
+}
+
+fn get_message(
+    connection: &Connection,
+    message_id: MessageId,
+) -> Result<Option<Message>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, conversation_id, sender_type, sender_id, body, reply_to,
+                metadata_json, created_at
+         FROM messages WHERE id = ?1",
+        params![message_id.to_string()],
+        records::message,
+    )
 }
 
 fn get_message_delivery(

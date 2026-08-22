@@ -631,22 +631,12 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                 capsule,
                 reply,
             ) => {
-                let result = (|| {
-                    let Some(changed) = store.persist_thread_mention(
-                        &message,
-                        source_agent_id,
-                        target_agent_id,
-                        &capsule,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    let delivery = store
-                        .get_message_delivery(message.id, target_agent_id)?
-                        .ok_or(StoreError::InvalidStoredValue("message_delivery"))?;
-                    Ok(Some((changed, delivery)))
-                })();
-                let _ = reply.send(result);
+                let _ = reply.send(store.persist_thread_mention(
+                    &message,
+                    source_agent_id,
+                    target_agent_id,
+                    &capsule,
+                ));
             }
             Command::MarkDeliveryCapsuleDelivered(
                 message_id,
@@ -672,20 +662,11 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                     reply.send(store.mark_delivery_failed(message_id, target_agent_id, &failed_at));
             }
             Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply) => {
-                let result =
-                    (|| {
-                        if !store.claim_failed_delivery(message_id, target_agent_id, &claimed_at)? {
-                            return Ok(None);
-                        }
-                        let message = store.get_message(message_id)?.ok_or(
-                            StoreError::InvalidStoredValue("message_delivery.message_id"),
-                        )?;
-                        let delivery = store
-                            .get_message_delivery(message_id, target_agent_id)?
-                            .ok_or(StoreError::InvalidStoredValue("message_delivery"))?;
-                        Ok(Some((message, delivery)))
-                    })();
-                let _ = reply.send(result);
+                let _ = reply.send(store.claim_failed_thread_mention_delivery(
+                    message_id,
+                    target_agent_id,
+                    &claimed_at,
+                ));
             }
             Command::ListMessages(conversation_id, reply) => {
                 let _ = reply.send(store.list_messages(conversation_id));

@@ -146,13 +146,12 @@ fn mention_joins_target_and_persists_source_message() {
     let mut fixture = setup(true, true, false);
     let message = mention(&fixture);
 
-    assert_eq!(
-        fixture
-            .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
-            .unwrap(),
-        Some(true)
-    );
+    let (membership_changed, returned_delivery) = fixture
+        .store
+        .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
+        .unwrap()
+        .unwrap();
+    assert!(membership_changed);
 
     let members = target_members(&fixture);
     assert_eq!(members.len(), 1);
@@ -168,6 +167,7 @@ fn mention_joins_target_and_persists_source_message() {
         .get_message_delivery(message.id, fixture.target.id)
         .unwrap()
         .unwrap();
+    assert_eq!(returned_delivery, delivery);
     assert_eq!(delivery.status, DeliveryStatus::Pending);
     assert_eq!(delivery.capsule.as_deref(), Some(CAPSULE));
     assert_eq!(delivery.capsule_delivered_at, None);
@@ -189,13 +189,12 @@ fn mention_keeps_active_target_membership_and_persists_message() {
     let mut fixture = setup(true, true, true);
     let message = mention(&fixture);
 
-    assert_eq!(
-        fixture
-            .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
-            .unwrap(),
-        Some(false)
-    );
+    let (membership_changed, returned_delivery) = fixture
+        .store
+        .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
+        .unwrap()
+        .unwrap();
+    assert!(!membership_changed);
 
     let members = target_members(&fixture);
     assert_eq!(members.len(), 1);
@@ -210,6 +209,7 @@ fn mention_keeps_active_target_membership_and_persists_message() {
         .get_message_delivery(message.id, fixture.target.id)
         .unwrap()
         .unwrap();
+    assert_eq!(returned_delivery, delivery);
     assert_eq!(delivery.status, DeliveryStatus::Pending);
     assert_eq!(delivery.capsule, None);
 }
@@ -223,13 +223,12 @@ fn mention_rejoins_target_with_next_generation() {
         .unwrap();
     let message = mention(&fixture);
 
-    assert_eq!(
-        fixture
-            .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
-            .unwrap(),
-        Some(true)
-    );
+    let (membership_changed, returned_delivery) = fixture
+        .store
+        .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
+        .unwrap()
+        .unwrap();
+    assert!(membership_changed);
 
     let members = target_members(&fixture);
     assert_eq!(members.len(), 2);
@@ -242,6 +241,7 @@ fn mention_rejoins_target_with_next_generation() {
         (2, MENTIONED)
     );
     assert_eq!(members[1].left_at, None);
+    assert_eq!(returned_delivery.capsule.as_deref(), Some(CAPSULE));
     assert_eq!(
         fixture
             .store
@@ -251,6 +251,48 @@ fn mention_rejoins_target_with_next_generation() {
             .capsule
             .as_deref(),
         Some(CAPSULE)
+    );
+}
+
+#[test]
+fn failed_retry_hydration_error_rolls_back_the_claim() {
+    let mut fixture = setup(true, true, false);
+    let message = mention(&fixture);
+    fixture
+        .store
+        .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
+        .unwrap();
+    fixture
+        .store
+        .mark_delivery_failed(message.id, fixture.target.id, LEFT)
+        .unwrap();
+    let connection = rusqlite::Connection::open(fixture._database.path()).unwrap();
+    connection
+        .pragma_update(None, "ignore_check_constraints", true)
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE messages SET metadata_json = 'not-json' WHERE id = ?1",
+            [message.id.to_string()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        fixture.store.claim_failed_thread_mention_delivery(
+            message.id,
+            fixture.target.id,
+            MENTIONED,
+        ),
+        Err(StoreError::Json(_))
+    ));
+    assert_eq!(
+        fixture
+            .store
+            .get_message_delivery(message.id, fixture.target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Failed
     );
 }
 
