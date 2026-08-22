@@ -1,5 +1,5 @@
 use july_workspace::domain::{
-    Agent, AgentId, DeliveryStatus, MemberType, Message, MessageDelivery, MessageId,
+    Agent, AgentId, DeliveryStatus, DomainError, MemberType, Message, MessageDelivery, MessageId,
 };
 use july_workspace::storage::{SqliteStore, StoreError};
 use serde_json::json;
@@ -103,6 +103,101 @@ fn message_and_pending_delivery_are_atomic_and_exact_idempotent() {
             target_agent_id,
         }) if message_id == message.id && target_agent_id == target.id
     ));
+}
+
+#[test]
+fn exact_message_can_add_one_delivery_per_target() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let first_target = agent("codex");
+    let second_target = agent("claude");
+    store.insert_agent(&first_target).unwrap();
+    store.insert_agent(&second_target).unwrap();
+    let message = message(&mut store, &first_target);
+
+    assert!(
+        store
+            .insert_message_with_pending_delivery(&message, first_target.id, None)
+            .unwrap()
+    );
+    assert!(
+        store
+            .insert_message_with_pending_delivery(
+                &message,
+                second_target.id,
+                Some("second capsule"),
+            )
+            .unwrap()
+    );
+
+    assert_eq!(
+        store.get_message(message.id).unwrap(),
+        Some(message.clone())
+    );
+    for target_id in [first_target.id, second_target.id] {
+        assert_eq!(
+            store
+                .get_message_delivery(message.id, target_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DeliveryStatus::Pending
+        );
+    }
+    assert!(matches!(
+        store.insert_message_with_pending_delivery(
+            &message,
+            second_target.id,
+            Some("changed capsule"),
+        ),
+        Err(StoreError::DeliveryConflict {
+            message_id,
+            target_agent_id,
+        }) if message_id == message.id && target_agent_id == second_target.id
+    ));
+}
+
+#[test]
+fn delivery_validation_rejects_cross_field_progress_mismatches() {
+    let valid = MessageDelivery {
+        message_id: MessageId::new(),
+        target_agent_id: AgentId::new(),
+        status: DeliveryStatus::Pending,
+        capsule: None,
+        capsule_delivered_at: None,
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+        delivered_at: None,
+    };
+
+    assert_eq!(
+        MessageDelivery {
+            capsule_delivered_at: Some(LATER.into()),
+            ..valid.clone()
+        }
+        .validate(),
+        Err(DomainError::CapsuleDeliveryWithoutCapsule)
+    );
+    for invalid in [
+        MessageDelivery {
+            status: DeliveryStatus::Delivered,
+            ..valid.clone()
+        },
+        MessageDelivery {
+            delivered_at: Some(LATER.into()),
+            ..valid.clone()
+        },
+        MessageDelivery {
+            status: DeliveryStatus::Failed,
+            delivered_at: Some(LATER.into()),
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            invalid.validate(),
+            Err(DomainError::DeliveryTimestampStatusMismatch)
+        );
+    }
 }
 
 #[test]

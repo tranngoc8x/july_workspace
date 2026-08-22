@@ -16,6 +16,10 @@ pub enum DomainError {
     InvalidSessionGeneration,
     #[error("membership generation must be greater than zero")]
     InvalidMembershipGeneration,
+    #[error("capsule delivery timestamp requires a capsule")]
+    CapsuleDeliveryWithoutCapsule,
+    #[error("delivered_at must be set exactly when delivery status is delivered")]
+    DeliveryTimestampStatusMismatch,
     #[error("permission option was not advertised: {0}")]
     PermissionOptionNotAdvertised(String),
     #[error("invalid {kind}: {value}")]

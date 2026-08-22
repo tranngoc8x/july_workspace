@@ -253,6 +253,12 @@ impl MessageDelivery {
         if let Some(delivered_at) = &self.delivered_at {
             require_text(delivered_at, "message_delivery.delivered_at")?;
         }
+        if self.capsule_delivered_at.is_some() && self.capsule.is_none() {
+            return Err(DomainError::CapsuleDeliveryWithoutCapsule);
+        }
+        if (self.status == DeliveryStatus::Delivered) != self.delivered_at.is_some() {
+            return Err(DomainError::DeliveryTimestampStatusMismatch);
+        }
         Ok(())
     }
 }

@@ -824,25 +824,32 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !insert_message(&transaction, message)? {
+        let inserted = if insert_message(&transaction, message)? {
+            insert_message_delivery(&transaction, &delivery)?;
+            true
+        } else {
             let existing = get_message_delivery(&transaction, message.id, target_agent_id)?;
-            if existing.as_ref().is_some_and(|existing| {
-                existing.message_id == delivery.message_id
-                    && existing.target_agent_id == delivery.target_agent_id
-                    && existing.capsule == delivery.capsule
-                    && existing.created_at == delivery.created_at
-            }) {
-                transaction.commit()?;
-                return Ok(false);
+            match existing {
+                Some(existing)
+                    if existing.capsule == delivery.capsule
+                        && existing.created_at == delivery.created_at =>
+                {
+                    false
+                }
+                Some(_) => {
+                    return Err(StoreError::DeliveryConflict {
+                        message_id: message.id,
+                        target_agent_id,
+                    });
+                }
+                None => {
+                    insert_message_delivery(&transaction, &delivery)?;
+                    true
+                }
             }
-            return Err(StoreError::DeliveryConflict {
-                message_id: message.id,
-                target_agent_id,
-            });
-        }
-        insert_message_delivery(&transaction, &delivery)?;
+        };
         transaction.commit()?;
-        Ok(true)
+        Ok(inserted)
     }
 
     pub fn get_message_delivery(
