@@ -1,5 +1,18 @@
 # July Workspace — Messaging, Publish and Dependencies
 
+## Phase 6 implementation status
+
+The Work, Result, Publish, and dependency contract below is implemented and
+verified. Application callers use `WorkService`, `PublishService`, and
+`DependencyService`; dependency consumers receive a `DependencyOutcome` with
+the exact immutable upstream `WorkResult` when the edge is `SATISFIED` or
+`SUPERSEDED`.
+
+Phase 6 adds no CLI, external A2A protocol integration, semantic routing,
+transcript transfer, background dependency reconciliation/retry, or automatic
+downstream Work transition. Agent deliberation (Phase 6.5), session recovery
+(Phase 7), and the broader CLI (Phase 8) remain later roadmap work.
+
 ## Messaging goals
 
 Messages should support:

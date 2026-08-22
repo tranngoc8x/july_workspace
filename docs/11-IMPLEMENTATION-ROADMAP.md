@@ -237,22 +237,37 @@ remain out of scope for this phase.
 
 ---
 
-## Phase 6 — Work / Result / Publish / Dependency
+## Phase 6 — Work / Result / Publish / Dependency — Implemented
 
-Implement:
+Status: implemented and verified.
 
-- WorkItem lifecycle;
-- structured Result;
-- Result version/supersede semantics;
-- Publish;
-- dependency graph;
-- READY propagation.
+Implemented evidence:
 
-DoD:
+- WorkItem lifecycle and ownership — `tests/work_lifecycle.rs`;
+- structured immutable Result and atomic first Result + `READY` —
+  `tests/work_results.rs`;
+- same-Work Result correction/supersede semantics — `tests/work_results.rs`;
+- structured Publish with natural-key idempotency and no transcript copy —
+  `tests/result_publish.rs`;
+- durable dependency graph with missing-Work, self-edge, and cycle rejection —
+  `tests/work_dependencies.rs`;
+- transactional `READY`, `FAILED`, and Result-correction propagation to only
+  matching outgoing edges — `tests/work_dependencies.rs`.
 
-- Thread A can unblock Thread B;
-- publish transfers structured Result, not transcript;
-- dependency transitions are transactional/idempotent.
+Verified DoD:
+
+- Thread A's Result becomes a structured dependency outcome consumable by
+  Thread B's Work without automatically changing that downstream Work —
+  `tests/work_dependencies.rs`;
+- Publish transfers the immutable structured Result and source reference, not
+  transcript Messages — `tests/result_publish.rs`;
+- dependency transitions are transactional and exact retries are no-ops,
+  including forced SQLite rollback coverage — `tests/work_dependencies.rs`.
+
+Phase 6 adds no CLI, external A2A protocol integration, semantic routing,
+transcript transfer, background dependency reconciliation/retry, or automatic
+downstream Work status change. Phase 6.5, Phase 7, and Phase 8 remain future
+roadmap phases.
 
 ---
 

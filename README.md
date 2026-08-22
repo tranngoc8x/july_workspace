@@ -82,7 +82,7 @@ July is designed to sit around coding agents such as Codex, Claude Code, and oth
 
 ## Current Status
 
-July Workspace is currently under active development. Core roadmap Phases 0-5
+July Workspace is currently under active development. Core roadmap Phases 0-6
 are implemented and tested: durable agent/DM state, ACP
 session lifecycle, Room/Thread membership, atomic Thread creation with primary
 Work, targeted isolated Thread sessions, explicit Agent-to-Agent DM, explicit
@@ -90,15 +90,20 @@ Thread mentions with dynamic member join, and durable per-target offline
 delivery. Startup reconciles persisted `PENDING` deliveries to `FAILED` before
 the storage worker is ready; an explicit failed-only retry after restart reuses
 the stored target/body and preserves Thread capsule progress. Delivery remains
-at-least-once. The executable remains intentionally limited to `july dm <agent>`;
-no Agent-to-Agent messaging CLI exists yet.
+at-least-once. Phase 6 adds typed Work lifecycle and ownership, immutable
+structured Results with atomic `READY`, structured Publish without transcript
+copying, and durable dependency propagation with structured downstream Result
+outcomes. The executable remains intentionally limited to `july dm <agent>`;
+Phase 6 adds no CLI surface.
 
 Next milestones focus on:
 
-- structured Results and publishing
-- dependencies between agents
-- session recovery
-- developer-friendly CLI workflows
+- agent deliberation and decisions (Phase 6.5)
+- session recovery (Phase 7)
+- developer-friendly CLI workflows (Phase 8)
+
+Those later phases, external A2A protocol integration, semantic routing, and
+transcript transfer are not part of the Phase 6 implementation.
 
 Expect breaking changes while the project is still experimental.
 

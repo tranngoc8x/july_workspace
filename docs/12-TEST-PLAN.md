@@ -22,8 +22,14 @@ Conversation:
 
 Work:
 - exactly one primary Work is created with each new Thread;
-- valid transitions;
-- invalid transition rejection.
+- valid lifecycle and owner transitions with exact-retry no-ops;
+- invalid transition, owner, and terminal timestamp rejection;
+- atomic first structured Result + `READY` and rollback on Result failure;
+- immutable same-Work Result correction with supersede validation.
+
+Current Phase 6 Work/Result coverage is in `tests/work_lifecycle.rs` and
+`tests/work_results.rs`. SQLite migration tests additionally verify durable
+Work completion and dependency Result-reference invariants.
 
 ## 2. Context isolation
 
@@ -83,19 +89,43 @@ Current Phase 5.4 coverage:
 
 ## 4. Publish
 
-Assert:
-- Result copied structurally;
-- source transcript not copied;
-- duplicate publish idempotent;
-- superseding result handled.
+Current Phase 6 coverage in `tests/result_publish.rs` asserts:
+- the target query returns the complete immutable structured Result and source
+  conversation reference;
+- source transcript Messages are not copied;
+- natural-key duplicate Publish is idempotent;
+- conflicting IDs and missing Result, Work, or target roll back without a
+  partial mapping;
+- same-conversation and superseding-Result Publish follow the same contract.
 
 ## 5. Dependency
 
 ```text
-A READY → B SATISFIED
-A FAILED → B notified
-A superseded → downstream sees new state
+A first Result + READY → matching outgoing edge SATISFIED + Result
+A FAILED → matching outgoing WAITING edge FAILED
+A corrected Result → matching outgoing SATISFIED edge SUPERSEDED + replacement Result
 ```
+
+Current Phase 6 coverage in `tests/work_dependencies.rs` asserts:
+- new edges start `WAITING`; exact add/retry is idempotent;
+- missing Work, self-dependency, and recursive cycles are rejected without
+  partial rows;
+- downstream queries hydrate the same-upstream immutable Result, including its
+  summary, outputs, and evidence, for `SATISFIED` and `SUPERSEDED`, and no
+  Result for `WAITING` and `FAILED`;
+- only matching outgoing edges change; unrelated edges, Work, Messages, and
+  Publish rows remain unchanged;
+- real SQLite trigger failures roll back each atomic `SATISFIED`, `FAILED`, and
+  `SUPERSEDED` operation.
+
+Migration and hydration tests in `src/storage/sqlite.rs` additionally verify
+raw-write guards, conservative reconciliation of invalid legacy references,
+and rejection of cross-Work Result references. Phase 6 does not notify through
+Message/transport or automatically change downstream Work status.
+
+Phase 6.5 deliberation, Phase 7 recovery, Phase 8 CLI, external A2A protocol
+integration, semantic routing, and transcript transfer are outside this test
+slice.
 
 ## 6. Session
 
