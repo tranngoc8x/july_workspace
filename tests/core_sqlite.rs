@@ -162,13 +162,6 @@ fn full_graph_round_trips_after_reopen() {
         updated_at: LATER.into(),
         completed_at: Some(LATER.into()),
     };
-    let dependency = WorkDependency {
-        upstream_work_id: upstream.id,
-        downstream_work_id: downstream.id,
-        dependency_type: DependencyType::Requires,
-        status: DependencyStatus::Satisfied,
-        created_at: CREATED.into(),
-    };
     let first_result = WorkResult {
         id: Default::default(),
         work_id: upstream.id,
@@ -188,6 +181,14 @@ fn full_graph_round_trips_after_reopen() {
         evidence: vec!["focused test: pass".into()],
         supersedes_result_id: Some(first_result.id),
         created_at: LATER.into(),
+    };
+    let dependency = WorkDependency {
+        upstream_work_id: upstream.id,
+        downstream_work_id: downstream.id,
+        dependency_type: DependencyType::Requires,
+        status: DependencyStatus::Superseded,
+        result_id: Some(final_result.id),
+        created_at: CREATED.into(),
     };
     let publish = Publish {
         id: Default::default(),
@@ -259,7 +260,13 @@ fn full_graph_round_trips_after_reopen() {
         store.insert_message(&null_message).unwrap();
         store.insert_message(&json_message).unwrap();
         store.insert_work_item(&downstream).unwrap();
-        store.insert_work_dependency(&dependency).unwrap();
+        store
+            .add_work_dependency(
+                dependency.upstream_work_id,
+                dependency.downstream_work_id,
+                &dependency.created_at,
+            )
+            .unwrap();
         store
             .transition_work(upstream.id, WorkStatus::Working, CREATED)
             .unwrap();

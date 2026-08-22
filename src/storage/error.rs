@@ -62,6 +62,20 @@ pub enum StoreError {
     PrimaryWorkIdConflict(WorkItemId),
     #[error("work {0} does not exist")]
     WorkItemNotFound(WorkItemId),
+    #[error("work dependency cannot reference itself: {0}")]
+    WorkDependencySelf(WorkItemId),
+    #[error("work dependency {upstream_work_id} -> {downstream_work_id} would create a cycle")]
+    WorkDependencyCycle {
+        upstream_work_id: WorkItemId,
+        downstream_work_id: WorkItemId,
+    },
+    #[error(
+        "work dependency {upstream_work_id} -> {downstream_work_id} already exists with different content"
+    )]
+    WorkDependencyConflict {
+        upstream_work_id: WorkItemId,
+        downstream_work_id: WorkItemId,
+    },
     #[error("agent {owner_agent_id} is not an active member of work {work_id}'s conversation")]
     WorkOwnerScopeRequired {
         work_id: WorkItemId,

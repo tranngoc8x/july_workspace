@@ -326,6 +326,7 @@ pub struct WorkDependency {
     pub downstream_work_id: WorkItemId,
     pub dependency_type: DependencyType,
     pub status: DependencyStatus,
+    pub result_id: Option<ResultId>,
     pub created_at: String,
 }
 
@@ -741,6 +742,7 @@ mod tests {
             downstream_work_id: WorkItemId::new(),
             dependency_type: DependencyType::Requires,
             status: DependencyStatus::Waiting,
+            result_id: None,
             created_at: String::new(),
         };
         assert_eq!(
@@ -867,6 +869,7 @@ mod tests {
             downstream_work_id: work_id,
             dependency_type: DependencyType::Requires,
             status: DependencyStatus::Waiting,
+            result_id: None,
             created_at: "2026-08-09T00:00:00Z".into(),
         };
         assert_eq!(dependency.validate(), Err(DomainError::SelfDependency));

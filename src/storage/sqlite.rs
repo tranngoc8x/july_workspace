@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 7] = [
+const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -41,6 +41,10 @@ const MIGRATIONS: [Migration; 7] = [
         version: 7,
         sql: include_str!("migrations/0007_work_completion_whitespace.sql"),
     },
+    Migration {
+        version: 8,
+        sql: include_str!("migrations/0008_dependency_result.sql"),
+    },
 ];
 
 /// Durable SQLite access which keeps Work Result lifecycle and Publish writes guarded.
@@ -64,6 +68,17 @@ const MIGRATIONS: [Migration; 7] = [
 ///     publish: &july_workspace::domain::Publish,
 /// ) {
 ///     store.insert_publish(publish).unwrap();
+/// }
+/// ```
+///
+/// Dependency status and Result references cannot be supplied through a raw insert:
+///
+/// ```compile_fail
+/// fn bypass(
+///     store: &july_workspace::storage::SqliteStore,
+///     dependency: &july_workspace::domain::WorkDependency,
+/// ) {
+///     store.insert_work_dependency(dependency).unwrap();
 /// }
 /// ```
 pub struct SqliteStore {
@@ -1160,25 +1175,88 @@ impl SqliteStore {
                 work.completed_at,
             ],
         )?;
+        if target == WorkStatus::Failed {
+            transaction.execute(
+                "UPDATE work_dependencies
+                 SET status = 'failed', result_id = NULL
+                 WHERE upstream_work_id = ?1 AND status = 'waiting'",
+                params![work_id.to_string()],
+            )?;
+        }
         transaction.commit()?;
         Ok(work)
     }
 
-    pub fn insert_work_dependency(&self, dependency: &WorkDependency) -> Result<(), StoreError> {
+    pub fn add_work_dependency(
+        &mut self,
+        upstream_work_id: WorkItemId,
+        downstream_work_id: WorkItemId,
+        created_at: &str,
+    ) -> Result<WorkDependency, StoreError> {
+        if upstream_work_id == downstream_work_id {
+            return Err(StoreError::WorkDependencySelf(upstream_work_id));
+        }
+        let dependency = WorkDependency {
+            upstream_work_id,
+            downstream_work_id,
+            dependency_type: crate::domain::DependencyType::Requires,
+            status: crate::domain::DependencyStatus::Waiting,
+            result_id: None,
+            created_at: created_at.into(),
+        };
         dependency.validate()?;
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_work_item(&transaction, upstream_work_id)?;
+        require_work_item(&transaction, downstream_work_id)?;
+        if let Some(stored) =
+            get_work_dependency(&transaction, upstream_work_id, downstream_work_id)?
+        {
+            if stored.created_at == dependency.created_at {
+                transaction.commit()?;
+                return Ok(stored);
+            }
+            return Err(StoreError::WorkDependencyConflict {
+                upstream_work_id,
+                downstream_work_id,
+            });
+        }
+        let cyclic: bool = transaction.query_row(
+            "WITH RECURSIVE reachable(work_id) AS (
+                 SELECT downstream_work_id
+                 FROM work_dependencies
+                 WHERE upstream_work_id = ?1
+                 UNION
+                 SELECT dependency.downstream_work_id
+                 FROM work_dependencies AS dependency
+                 JOIN reachable ON dependency.upstream_work_id = reachable.work_id
+             )
+             SELECT EXISTS(SELECT 1 FROM reachable WHERE work_id = ?2)",
+            params![downstream_work_id.to_string(), upstream_work_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if cyclic {
+            return Err(StoreError::WorkDependencyCycle {
+                upstream_work_id,
+                downstream_work_id,
+            });
+        }
+        transaction.execute(
             "INSERT INTO work_dependencies(
-                upstream_work_id, downstream_work_id, dependency_type, status, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                upstream_work_id, downstream_work_id, dependency_type, status, result_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 dependency.upstream_work_id.to_string(),
                 dependency.downstream_work_id.to_string(),
                 dependency.dependency_type.to_string(),
                 dependency.status.to_string(),
+                dependency.result_id.map(|id| id.to_string()),
                 dependency.created_at,
             ],
         )?;
-        Ok(())
+        transaction.commit()?;
+        Ok(dependency)
     }
 
     pub fn get_work_dependency(
@@ -1186,12 +1264,22 @@ impl SqliteStore {
         upstream_work_id: WorkItemId,
         downstream_work_id: WorkItemId,
     ) -> Result<Option<WorkDependency>, StoreError> {
-        query_optional(
+        get_work_dependency(&self.connection, upstream_work_id, downstream_work_id)
+    }
+
+    pub fn list_work_dependencies_for_downstream(
+        &self,
+        downstream_work_id: WorkItemId,
+    ) -> Result<Vec<WorkDependency>, StoreError> {
+        require_work_item(&self.connection, downstream_work_id)?;
+        query_all(
             &self.connection,
-            "SELECT upstream_work_id, downstream_work_id, dependency_type, status, created_at
+            "SELECT upstream_work_id, downstream_work_id, dependency_type, status, result_id,
+                    created_at
              FROM work_dependencies
-             WHERE upstream_work_id = ?1 AND downstream_work_id = ?2",
-            params![upstream_work_id.to_string(), downstream_work_id.to_string()],
+             WHERE downstream_work_id = ?1
+             ORDER BY created_at, upstream_work_id",
+            params![downstream_work_id.to_string()],
             records::work_dependency,
         )
     }
@@ -1249,6 +1337,27 @@ impl SqliteStore {
         }
 
         insert_work_result(&transaction, result)?;
+        if let Some(supersedes_result_id) = result.supersedes_result_id {
+            transaction.execute(
+                "UPDATE work_dependencies
+                 SET status = 'superseded', result_id = ?2
+                 WHERE upstream_work_id = ?1
+                   AND status = 'satisfied'
+                   AND result_id = ?3",
+                params![
+                    result.work_id.to_string(),
+                    result.id.to_string(),
+                    supersedes_result_id.to_string(),
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE work_dependencies
+                 SET status = 'satisfied', result_id = ?2
+                 WHERE upstream_work_id = ?1 AND status = 'waiting'",
+                params![result.work_id.to_string(), result.id.to_string()],
+            )?;
+        }
         transaction.commit()?;
         Ok(result.clone())
     }
@@ -1910,6 +2019,22 @@ fn get_work_item(
     )
 }
 
+fn get_work_dependency(
+    connection: &Connection,
+    upstream_work_id: WorkItemId,
+    downstream_work_id: WorkItemId,
+) -> Result<Option<WorkDependency>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT upstream_work_id, downstream_work_id, dependency_type, status, result_id,
+                created_at
+         FROM work_dependencies
+         WHERE upstream_work_id = ?1 AND downstream_work_id = ?2",
+        params![upstream_work_id.to_string(), downstream_work_id.to_string()],
+        records::work_dependency,
+    )
+}
+
 fn get_conversation(
     connection: &Connection,
     conversation_id: ConversationId,
@@ -2395,11 +2520,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_seven() {
+    fn fresh_database_has_schema_version_eight() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
     }
 
     #[test]
@@ -2479,7 +2604,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 27);
+        assert_eq!(foreign_key_count, 28);
     }
 
     #[test]
@@ -2763,14 +2888,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            7
+            8
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            7
+            8
         );
     }
 
@@ -3112,7 +3237,7 @@ mod tests {
                 .unwrap();
         }
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..7]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 7);
         for (id, expected) in [
@@ -3157,6 +3282,57 @@ mod tests {
                 .execute(
                     "UPDATE work_items SET completed_at = ?1 WHERE id = 'valid-surrounded'",
                     ["\t\n"],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn migration_eight_preserves_edges_and_adds_result_reference_foreign_key() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..7]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES
+                    ('work-upstream', 'conversation-1', 'prerequisite', 'working', 'now', 'now'),
+                    ('work-downstream', 'conversation-1', 'consumer', 'blocked', 'now', 'now');
+                 INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type, status, created_at
+                 ) VALUES (
+                    'work-upstream', 'work-downstream', 'requires', 'waiting', 'created'
+                 );",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 8);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status, result_id, created_at FROM work_dependencies",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?
+                    )),
+                )
+                .unwrap(),
+            ("waiting".into(), None, "created".into())
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE work_dependencies SET result_id = 'missing-result'",
+                    [],
                 )
                 .is_err()
         );
@@ -3280,15 +3456,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (8);",
+                 INSERT INTO schema_migrations(version) VALUES (9);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 8,
-                supported: 7,
+                found: 9,
+                supported: 8,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

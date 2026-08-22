@@ -1,13 +1,13 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState, PublishError,
-    PublishRuntime, PublishedResult, WorkError, WorkRuntime,
+    CollaborationError, CollaborationRuntime, DependencyError, DependencyRuntime, MembershipChange,
+    MembershipState, PublishError, PublishRuntime, PublishedResult, WorkError, WorkRuntime,
 };
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
     MessageId, PermissionDecision, Publish, PublishId, ResultId, Room, RoomId, RoomMember,
-    SessionBinding, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId, WorkResult,
-    WorkStatus,
+    SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem, WorkItemId,
+    WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -42,6 +42,8 @@ enum Command {
     AssignWorkOwner(WorkItemId, AgentId, String, Reply<WorkItem>),
     TransitionWork(WorkItemId, WorkStatus, String, Reply<WorkItem>),
     CreateWorkResult(WorkResult, Reply<WorkResult>),
+    AddWorkDependency(WorkItemId, WorkItemId, String, Reply<WorkDependency>),
+    ListWorkDependenciesForDownstream(WorkItemId, Reply<Vec<WorkDependency>>),
     PublishResult(
         PublishId,
         ResultId,
@@ -466,6 +468,21 @@ impl StorageHandle {
             .map_err(map_work_error)
     }
 
+    async fn dependency_request<R>(
+        &self,
+        build: impl FnOnce(Reply<R>) -> Command,
+    ) -> Result<R, DependencyError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| DependencyError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| DependencyError::Runtime("storage owner channel closed".into()))?
+            .map_err(map_dependency_error)
+    }
+
     async fn publish_request<R>(
         &self,
         build: impl FnOnce(Reply<R>) -> Command,
@@ -659,6 +676,30 @@ impl WorkRuntime for StorageWorker {
     }
 }
 
+impl DependencyRuntime for StorageWorker {
+    async fn add_work_dependency(
+        &mut self,
+        upstream_work_id: WorkItemId,
+        downstream_work_id: WorkItemId,
+        created_at: String,
+    ) -> Result<WorkDependency, DependencyError> {
+        self.dependency_request(|reply| {
+            Command::AddWorkDependency(upstream_work_id, downstream_work_id, created_at, reply)
+        })
+        .await
+    }
+
+    async fn list_work_dependencies_for_downstream(
+        &mut self,
+        downstream_work_id: WorkItemId,
+    ) -> Result<Vec<WorkDependency>, DependencyError> {
+        self.dependency_request(|reply| {
+            Command::ListWorkDependenciesForDownstream(downstream_work_id, reply)
+        })
+        .await
+    }
+}
+
 impl PublishRuntime for StorageWorker {
     async fn publish_result(
         &mut self,
@@ -770,6 +811,16 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::CreateWorkResult(result, reply) => {
                 let _ = reply.send(store.create_work_result(&result));
+            }
+            Command::AddWorkDependency(upstream_work_id, downstream_work_id, created_at, reply) => {
+                let _ = reply.send(store.add_work_dependency(
+                    upstream_work_id,
+                    downstream_work_id,
+                    &created_at,
+                ));
+            }
+            Command::ListWorkDependenciesForDownstream(downstream_work_id, reply) => {
+                let _ = reply.send(store.list_work_dependencies_for_downstream(downstream_work_id));
             }
             Command::PublishResult(
                 publish_id,
@@ -975,6 +1026,31 @@ fn map_work_error(error: StoreError) -> WorkError {
             supersedes_result_id,
         },
         error => WorkError::Runtime(error.to_string()),
+    }
+}
+
+fn map_dependency_error(error: StoreError) -> DependencyError {
+    match error {
+        StoreError::WorkItemNotFound(id) => DependencyError::WorkNotFound(id),
+        StoreError::WorkDependencySelf(id) => DependencyError::SelfDependency(id),
+        StoreError::WorkDependencyCycle {
+            upstream_work_id,
+            downstream_work_id,
+        } => DependencyError::Cycle {
+            upstream_work_id,
+            downstream_work_id,
+        },
+        StoreError::WorkDependencyConflict {
+            upstream_work_id,
+            downstream_work_id,
+        } => DependencyError::Conflict {
+            upstream_work_id,
+            downstream_work_id,
+        },
+        StoreError::Domain(crate::domain::DomainError::EmptyField(
+            "work_dependency.created_at",
+        )) => DependencyError::InvalidTimestamp,
+        error => DependencyError::Runtime(error.to_string()),
     }
 }
 
