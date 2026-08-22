@@ -1,7 +1,8 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    CollaborationError, CollaborationRuntime, DependencyError, DependencyRuntime, MembershipChange,
-    MembershipState, PublishError, PublishRuntime, PublishedResult, WorkError, WorkRuntime,
+    CollaborationError, CollaborationRuntime, DependencyError, DependencyOutcome,
+    DependencyRuntime, MembershipChange, MembershipState, PublishError, PublishRuntime,
+    PublishedResult, WorkError, WorkRuntime,
 };
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
@@ -43,7 +44,10 @@ enum Command {
     TransitionWork(WorkItemId, WorkStatus, String, Reply<WorkItem>),
     CreateWorkResult(WorkResult, Reply<WorkResult>),
     AddWorkDependency(WorkItemId, WorkItemId, String, Reply<WorkDependency>),
-    ListWorkDependenciesForDownstream(WorkItemId, Reply<Vec<WorkDependency>>),
+    ListWorkDependencyOutcomesForDownstream(
+        WorkItemId,
+        Reply<Vec<(WorkDependency, Option<WorkResult>)>>,
+    ),
     PublishResult(
         PublishId,
         ResultId,
@@ -689,14 +693,15 @@ impl DependencyRuntime for StorageWorker {
         .await
     }
 
-    async fn list_work_dependencies_for_downstream(
+    async fn list_work_dependency_outcomes_for_downstream(
         &mut self,
         downstream_work_id: WorkItemId,
-    ) -> Result<Vec<WorkDependency>, DependencyError> {
+    ) -> Result<Vec<DependencyOutcome>, DependencyError> {
         self.dependency_request(|reply| {
-            Command::ListWorkDependenciesForDownstream(downstream_work_id, reply)
+            Command::ListWorkDependencyOutcomesForDownstream(downstream_work_id, reply)
         })
         .await
+        .map(|outcomes| outcomes.into_iter().map(DependencyOutcome::from).collect())
     }
 }
 
@@ -819,8 +824,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                     &created_at,
                 ));
             }
-            Command::ListWorkDependenciesForDownstream(downstream_work_id, reply) => {
-                let _ = reply.send(store.list_work_dependencies_for_downstream(downstream_work_id));
+            Command::ListWorkDependencyOutcomesForDownstream(downstream_work_id, reply) => {
+                let _ = reply
+                    .send(store.list_work_dependency_outcomes_for_downstream(downstream_work_id));
             }
             Command::PublishResult(
                 publish_id,

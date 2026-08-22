@@ -157,14 +157,16 @@ pub(super) fn work_item(row: &Row<'_>) -> Result<WorkItem, StoreError> {
 }
 
 pub(super) fn work_dependency(row: &Row<'_>) -> Result<WorkDependency, StoreError> {
-    Ok(WorkDependency {
+    let dependency = WorkDependency {
         upstream_work_id: id(row.get(0)?)?,
         downstream_work_id: id(row.get(1)?)?,
         dependency_type: domain_enum(row.get(2)?)?,
         status: domain_enum(row.get(3)?)?,
         result_id: optional_id(row.get(4)?)?,
         created_at: row.get(5)?,
-    })
+    };
+    dependency.validate()?;
+    Ok(dependency)
 }
 
 pub(super) fn work_result(row: &Row<'_>) -> Result<WorkResult, StoreError> {

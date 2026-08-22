@@ -12,6 +12,8 @@ pub enum DomainError {
     ThreadMissingTitle,
     #[error("work dependency cannot reference itself")]
     SelfDependency,
+    #[error("work dependency result reference does not match its status")]
+    DependencyResultStatusMismatch,
     #[error("session generation must be greater than zero")]
     InvalidSessionGeneration,
     #[error("membership generation must be greater than zero")]

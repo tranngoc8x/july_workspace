@@ -1,6 +1,6 @@
 use july_workspace::application::{
-    AddWorkDependency, CreateWorkResult, DependencyError, DependencyService, TransitionWork,
-    WorkError, WorkService,
+    AddWorkDependency, CreateWorkResult, DependencyError, DependencyOutcome, DependencyService,
+    TransitionWork, WorkError, WorkService,
 };
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, DependencyStatus, MemberType, Message,
@@ -176,7 +176,10 @@ async fn add_starts_waiting_and_exact_retry_lists_one_downstream_outcome() {
     );
     assert_eq!(
         service.list_for_downstream(downstream.id).await.unwrap(),
-        vec![added.clone()]
+        vec![DependencyOutcome {
+            dependency: added.clone(),
+            result: None,
+        }]
     );
     assert_eq!(
         read_dependency(database.path(), upstream.id, downstream.id),
@@ -227,7 +230,7 @@ async fn add_rejects_missing_self_and_cyclic_edges_without_partial_rows() {
 
     assert_eq!(
         service.list_for_downstream(first.id).await.unwrap(),
-        Vec::<WorkDependency>::new()
+        Vec::<DependencyOutcome>::new()
     );
 }
 
@@ -358,8 +361,21 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
             .list_for_downstream(downstream.id)
             .await
             .unwrap(),
-        vec![satisfied]
+        vec![DependencyOutcome {
+            dependency: satisfied,
+            result: Some(result.clone()),
+        }]
     );
+    let outcome = dependency_service
+        .list_for_downstream(downstream.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let structured = outcome.result.unwrap();
+    assert_eq!(structured.work_id, outcome.dependency.upstream_work_id);
+    assert_eq!(structured.summary, result.summary);
+    assert_eq!(structured.outputs, result.outputs);
+    assert_eq!(structured.evidence, result.evidence);
 }
 
 #[tokio::test]
@@ -407,7 +423,18 @@ async fn failed_work_marks_only_waiting_outgoing_edges_failed_and_exact_retry_is
     assert_eq!(service.transition(command).await.unwrap(), failed);
     assert_eq!(
         read_dependency(database.path(), upstream.id, downstream.id),
-        Some(dependency)
+        Some(dependency.clone())
+    );
+    drop(service);
+    assert_eq!(
+        DependencyService::new(StorageWorker::open(database.path()).unwrap())
+            .list_for_downstream(downstream.id)
+            .await
+            .unwrap(),
+        vec![DependencyOutcome {
+            dependency,
+            result: None,
+        }]
     );
 }
 
@@ -460,7 +487,18 @@ async fn correction_supersedes_only_satisfied_edges_and_new_edges_still_start_wa
     );
     assert_eq!(
         read_dependency(database.path(), upstream.id, first_downstream.id),
-        Some(superseded)
+        Some(superseded.clone())
+    );
+    drop(service);
+    assert_eq!(
+        DependencyService::new(StorageWorker::open(database.path()).unwrap())
+            .list_for_downstream(first_downstream.id)
+            .await
+            .unwrap(),
+        vec![DependencyOutcome {
+            dependency: superseded,
+            result: Some(correction),
+        }]
     );
 }
 

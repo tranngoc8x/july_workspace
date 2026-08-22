@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 8] = [
+const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -44,6 +44,10 @@ const MIGRATIONS: [Migration; 8] = [
     Migration {
         version: 8,
         sql: include_str!("migrations/0008_dependency_result.sql"),
+    },
+    Migration {
+        version: 9,
+        sql: include_str!("migrations/0009_dependency_result_invariant.sql"),
     },
 ];
 
@@ -1267,10 +1271,10 @@ impl SqliteStore {
         get_work_dependency(&self.connection, upstream_work_id, downstream_work_id)
     }
 
-    pub fn list_work_dependencies_for_downstream(
+    pub fn list_work_dependency_outcomes_for_downstream(
         &self,
         downstream_work_id: WorkItemId,
-    ) -> Result<Vec<WorkDependency>, StoreError> {
+    ) -> Result<Vec<(WorkDependency, Option<WorkResult>)>, StoreError> {
         require_work_item(&self.connection, downstream_work_id)?;
         query_all(
             &self.connection,
@@ -1281,7 +1285,26 @@ impl SqliteStore {
              ORDER BY created_at, upstream_work_id",
             params![downstream_work_id.to_string()],
             records::work_dependency,
-        )
+        )?
+        .into_iter()
+        .map(|dependency| {
+            let result = match dependency.result_id {
+                Some(result_id) => {
+                    let result = get_work_result(&self.connection, result_id)?.ok_or(
+                        StoreError::InvalidStoredValue("work dependency result reference"),
+                    )?;
+                    if result.work_id != dependency.upstream_work_id {
+                        return Err(StoreError::InvalidStoredValue(
+                            "work dependency result reference",
+                        ));
+                    }
+                    Some(result)
+                }
+                None => None,
+            };
+            Ok((dependency, result))
+        })
+        .collect()
     }
 
     pub fn get_work_result(&self, id: ResultId) -> Result<Option<WorkResult>, StoreError> {
@@ -2461,7 +2484,7 @@ fn current_schema_version(connection: &Connection) -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::{MIGRATIONS, Migration, SqliteStore, apply_migrations};
-    use crate::domain::{ConversationId, DomainError, WorkItemId};
+    use crate::domain::{ConversationId, DomainError, ResultId, WorkItemId};
     use crate::storage::StoreError;
     use rusqlite::{Connection, params};
     use std::env;
@@ -2520,11 +2543,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_eight() {
+    fn fresh_database_has_schema_version_nine() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
     }
 
     #[test]
@@ -2888,14 +2911,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            8
+            9
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            8
+            9
         );
     }
 
@@ -3311,7 +3334,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..8]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 8);
         assert_eq!(
@@ -3336,6 +3359,236 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn migration_nine_reconciles_dependency_results_and_guards_raw_writes() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..8]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES
+                    ('upstream-1', 'conversation-1', 'upstream 1', 'working', 'now', 'now'),
+                    ('upstream-2', 'conversation-1', 'upstream 2', 'working', 'now', 'now'),
+                    ('upstream-3', 'conversation-1', 'upstream 3', 'working', 'now', 'now'),
+                    ('downstream-1', 'conversation-1', 'downstream 1', 'blocked', 'now', 'now'),
+                    ('downstream-2', 'conversation-1', 'downstream 2', 'blocked', 'now', 'now'),
+                    ('downstream-3', 'conversation-1', 'downstream 3', 'blocked', 'now', 'now');
+                 INSERT INTO work_results(id, work_id, status, summary, created_at) VALUES
+                    ('result-1', 'upstream-1', 'accepted', 'result 1', 'now'),
+                    ('result-3', 'upstream-3', 'accepted', 'result 3', 'now');
+                 INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type,
+                    status, result_id, created_at
+                 ) VALUES
+                    ('upstream-1', 'downstream-1', 'requires', 'satisfied', 'result-1', 'now'),
+                    ('upstream-1', 'downstream-2', 'requires', 'superseded', 'result-1', 'now'),
+                    ('upstream-2', 'downstream-1', 'requires', 'satisfied', NULL, 'now'),
+                    ('upstream-2', 'downstream-2', 'requires', 'superseded', 'result-1', 'now'),
+                    ('upstream-3', 'downstream-1', 'requires', 'waiting', 'result-3', 'now'),
+                    ('upstream-3', 'downstream-2', 'requires', 'failed', 'result-3', 'now');",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 9);
+        let read = |upstream: &str, downstream: &str| {
+            connection
+                .query_row(
+                    "SELECT status, result_id
+                     FROM work_dependencies
+                     WHERE upstream_work_id = ?1 AND downstream_work_id = ?2",
+                    params![upstream, downstream],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            read("upstream-1", "downstream-1"),
+            ("satisfied".into(), Some("result-1".into()))
+        );
+        assert_eq!(
+            read("upstream-1", "downstream-2"),
+            ("superseded".into(), Some("result-1".into()))
+        );
+        for (upstream, downstream) in [
+            ("upstream-2", "downstream-1"),
+            ("upstream-2", "downstream-2"),
+            ("upstream-3", "downstream-1"),
+            ("upstream-3", "downstream-2"),
+        ] {
+            assert_eq!(
+                read(upstream, downstream),
+                ("waiting".into(), None),
+                "mismatch was not normalized: {upstream} -> {downstream}"
+            );
+        }
+
+        for values in [
+            "'satisfied', NULL",
+            "'superseded', NULL",
+            "'waiting', 'result-1'",
+            "'failed', 'result-1'",
+            "'satisfied', 'result-3'",
+            "'satisfied', 'result-1'",
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        &format!(
+                            "INSERT INTO work_dependencies(
+                                upstream_work_id, downstream_work_id, dependency_type,
+                                status, result_id, created_at
+                             ) VALUES (
+                                'upstream-1', 'downstream-3', 'requires', {values}, 'now'
+                             )"
+                        ),
+                        [],
+                    )
+                    .is_err(),
+                "accepted invalid dependency insert: {values}"
+            );
+        }
+        connection
+            .execute(
+                "INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type,
+                    status, result_id, created_at
+                 ) VALUES (
+                    'upstream-1', 'downstream-3', 'requires', 'waiting', NULL, 'now'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE work_dependencies
+                 SET status = 'satisfied', result_id = 'result-1'
+                 WHERE upstream_work_id = 'upstream-1'
+                   AND downstream_work_id = 'downstream-3'",
+                [],
+            )
+            .unwrap();
+        for update in [
+            "SET result_id = NULL",
+            "SET status = 'waiting'",
+            "SET status = 'failed'",
+            "SET status = 'superseded', result_id = NULL",
+            "SET result_id = 'result-3'",
+            "SET upstream_work_id = 'upstream-2'",
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        &format!(
+                            "UPDATE work_dependencies {update}
+                             WHERE upstream_work_id = 'upstream-1'
+                               AND downstream_work_id = 'downstream-3'"
+                        ),
+                        [],
+                    )
+                    .is_err(),
+                "accepted invalid dependency update: {update}"
+            );
+        }
+        assert_eq!(
+            read("upstream-1", "downstream-3"),
+            ("satisfied".into(), Some("result-1".into()))
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE work_results SET work_id = 'upstream-3' WHERE id = 'result-1'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn dependency_hydration_rejects_invalid_status_or_cross_work_result() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..8]).unwrap();
+        let conversation_id = ConversationId::new();
+        let upstream_id = WorkItemId::new();
+        let other_work_id = WorkItemId::new();
+        let downstream_id = WorkItemId::new();
+        let other_result_id = ResultId::new();
+        connection
+            .execute(
+                "INSERT INTO conversations(id, type, status, created_at, updated_at)
+                 VALUES (?1, 'dm', 'open', 'now', 'now')",
+                [conversation_id.to_string()],
+            )
+            .unwrap();
+        for (id, title, status) in [
+            (upstream_id, "upstream", "working"),
+            (other_work_id, "other", "working"),
+            (downstream_id, "downstream", "blocked"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO work_items(
+                        id, conversation_id, title, status, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'now', 'now')",
+                    params![id.to_string(), conversation_id.to_string(), title, status],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO work_results(id, work_id, status, summary, created_at)
+                 VALUES (?1, ?2, 'accepted', 'other result', 'now')",
+                params![other_result_id.to_string(), other_work_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type,
+                    status, result_id, created_at
+                 ) VALUES (?1, ?2, 'requires', 'satisfied', NULL, 'now')",
+                params![upstream_id.to_string(), downstream_id.to_string()],
+            )
+            .unwrap();
+        let store = SqliteStore { connection };
+
+        assert!(matches!(
+            store.get_work_dependency(upstream_id, downstream_id),
+            Err(StoreError::Domain(
+                DomainError::DependencyResultStatusMismatch
+            ))
+        ));
+        store
+            .connection
+            .execute(
+                "UPDATE work_dependencies SET result_id = ?3
+                 WHERE upstream_work_id = ?1 AND downstream_work_id = ?2",
+                params![
+                    upstream_id.to_string(),
+                    downstream_id.to_string(),
+                    other_result_id.to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.list_work_dependency_outcomes_for_downstream(downstream_id),
+            Err(StoreError::InvalidStoredValue(
+                "work dependency result reference"
+            ))
+        ));
     }
 
     #[test]
@@ -3456,15 +3709,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (9);",
+                 INSERT INTO schema_migrations(version) VALUES (10);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 9,
-                supported: 8,
+                found: 10,
+                supported: 9,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

@@ -335,7 +335,15 @@ impl WorkDependency {
         if self.upstream_work_id == self.downstream_work_id {
             return Err(DomainError::SelfDependency);
         }
-        require_text(&self.created_at, "work_dependency.created_at")
+        require_text(&self.created_at, "work_dependency.created_at")?;
+        let result_matches_status = match self.status {
+            DependencyStatus::Waiting | DependencyStatus::Failed => self.result_id.is_none(),
+            DependencyStatus::Satisfied | DependencyStatus::Superseded => self.result_id.is_some(),
+        };
+        if !result_matches_status {
+            return Err(DomainError::DependencyResultStatusMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -873,6 +881,43 @@ mod tests {
             created_at: "2026-08-09T00:00:00Z".into(),
         };
         assert_eq!(dependency.validate(), Err(DomainError::SelfDependency));
+    }
+
+    #[test]
+    fn dependency_result_reference_must_match_status() {
+        let mut dependency = WorkDependency {
+            upstream_work_id: WorkItemId::new(),
+            downstream_work_id: WorkItemId::new(),
+            dependency_type: DependencyType::Requires,
+            status: DependencyStatus::Waiting,
+            result_id: None,
+            created_at: "2026-08-09T00:00:00Z".into(),
+        };
+
+        for (status, result_id) in [
+            (DependencyStatus::Waiting, Some(ResultId::new())),
+            (DependencyStatus::Failed, Some(ResultId::new())),
+            (DependencyStatus::Satisfied, None),
+            (DependencyStatus::Superseded, None),
+        ] {
+            dependency.status = status;
+            dependency.result_id = result_id;
+            assert_eq!(
+                dependency.validate(),
+                Err(DomainError::DependencyResultStatusMismatch)
+            );
+        }
+
+        for (status, result_id) in [
+            (DependencyStatus::Waiting, None),
+            (DependencyStatus::Failed, None),
+            (DependencyStatus::Satisfied, Some(ResultId::new())),
+            (DependencyStatus::Superseded, Some(ResultId::new())),
+        ] {
+            dependency.status = status;
+            dependency.result_id = result_id;
+            assert!(dependency.validate().is_ok());
+        }
     }
 
     #[test]

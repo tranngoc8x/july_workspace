@@ -1,4 +1,4 @@
-use crate::domain::{WorkDependency, WorkItemId};
+use crate::domain::{WorkDependency, WorkItemId, WorkResult};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6,6 +6,18 @@ pub struct AddWorkDependency {
     pub upstream_work_id: WorkItemId,
     pub downstream_work_id: WorkItemId,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyOutcome {
+    pub dependency: WorkDependency,
+    pub result: Option<WorkResult>,
+}
+
+impl From<(WorkDependency, Option<WorkResult>)> for DependencyOutcome {
+    fn from((dependency, result): (WorkDependency, Option<WorkResult>)) -> Self {
+        Self { dependency, result }
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -41,10 +53,10 @@ pub trait DependencyRuntime {
         created_at: String,
     ) -> Result<WorkDependency, DependencyError>;
 
-    async fn list_work_dependencies_for_downstream(
+    async fn list_work_dependency_outcomes_for_downstream(
         &mut self,
         downstream_work_id: WorkItemId,
-    ) -> Result<Vec<WorkDependency>, DependencyError>;
+    ) -> Result<Vec<DependencyOutcome>, DependencyError>;
 }
 
 pub struct DependencyService<R> {
@@ -72,9 +84,9 @@ impl<R: DependencyRuntime> DependencyService<R> {
     pub async fn list_for_downstream(
         &mut self,
         downstream_work_id: WorkItemId,
-    ) -> Result<Vec<WorkDependency>, DependencyError> {
+    ) -> Result<Vec<DependencyOutcome>, DependencyError> {
         self.runtime
-            .list_work_dependencies_for_downstream(downstream_work_id)
+            .list_work_dependency_outcomes_for_downstream(downstream_work_id)
             .await
     }
 }
