@@ -1,8 +1,9 @@
 use super::{RuntimeError, RuntimeSession, StorageWorker, WorkspaceHandle, WorkspaceRuntime};
 use crate::application::{
-    AgentDirectMessageOutcome, DirectMessageError, DirectMessageFailureKind,
-    DirectMessagePermissionRequestId, DirectMessageRuntime, DirectMessageRuntimeEvent,
-    OpenAgentDirectMessage, OpenedDirectMessage, RetryAgentDirectMessage, SendAgentDirectMessage,
+    AgentDirectMessageOutcome, DeliveredAgentDirectMessage, DirectMessageError,
+    DirectMessageFailureKind, DirectMessagePermissionRequestId, DirectMessageRuntime,
+    DirectMessageRuntimeEvent, OpenAgentDirectMessage, OpenedDirectMessage,
+    RetryAgentDirectMessage, SendAgentDirectMessage,
 };
 use crate::domain::{
     Agent, AgentId, ConversationId, Message, MessageDelivery, MessageId, PermissionOutcome,
@@ -253,6 +254,19 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         delivery: MessageDelivery,
         attempted_at: String,
     ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        let source_agent_id: AgentId = match message.sender_id.parse() {
+            Ok(source_agent_id) => source_agent_id,
+            Err(error) => {
+                return self
+                    .persisted_failure(
+                        message.id,
+                        delivery.target_agent_id,
+                        attempted_at,
+                        DirectMessageError::Runtime(error.to_string()),
+                    )
+                    .await;
+            }
+        };
         let conversation_id = match self
             .open_persisted(&message, delivery.target_agent_id, attempted_at.clone())
             .await
@@ -275,7 +289,13 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
             .mark_delivery_delivered(message.id, delivery.target_agent_id, attempted_at.clone())
             .await;
         match recorded {
-            Ok(true) => Ok(Some(AgentDirectMessageOutcome::Delivered(conversation_id))),
+            Ok(true) => Ok(Some(AgentDirectMessageOutcome::Delivered(
+                DeliveredAgentDirectMessage {
+                    conversation_id,
+                    source_agent_id,
+                    target_agent_id: delivery.target_agent_id,
+                },
+            ))),
             Ok(false) => {
                 self.persisted_failure(
                     message.id,

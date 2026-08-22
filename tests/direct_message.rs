@@ -1357,7 +1357,7 @@ async fn offline_agent_message_is_durable_and_explicit_retry_delivers_exact_body
         .insert_agent(&target)
         .unwrap();
     let (source_transport, _source_events, source_observed) = FakeTransport::new();
-    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let (target_transport, target_events, target_observed) = FakeTransport::new();
     let mut workspace =
         WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
     let mut source_owner =
@@ -1411,10 +1411,13 @@ async fn offline_agent_message_is_durable_and_explicit_retry_delivers_exact_body
         target_agent_id: target.id,
         retried_at: LATER.into(),
     };
-    assert!(matches!(
-        routed.retry_agent_message(retry.clone()).await.unwrap(),
-        Some(AgentDirectMessageOutcome::Delivered(_))
-    ));
+    let Some(AgentDirectMessageOutcome::Delivered(delivered)) =
+        routed.retry_agent_message(retry.clone()).await.unwrap()
+    else {
+        panic!("expected delivered Agent message retry")
+    };
+    assert_eq!(delivered.source_agent_id, source.id);
+    assert_eq!(delivered.target_agent_id, target.id);
     assert_eq!(routed.retry_agent_message(retry).await.unwrap(), None);
     assert_eq!(
         target_observed
@@ -1435,6 +1438,40 @@ async fn offline_agent_message_is_durable_and_explicit_retry_delivers_exact_body
             .status,
         DeliveryStatus::Delivered
     );
+    let routed_session = target_observed.lock().unwrap().messages[0].session.clone();
+    target_events
+        .send(TransportEvent::AgentTextDelta {
+            session: routed_session.clone(),
+            text: "retry response".into(),
+        })
+        .await
+        .unwrap();
+    target_events
+        .send(TransportEvent::AgentMessageCompleted {
+            session: routed_session,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        routed.next_event(LATER.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("retry response".into()))
+    );
+    let Some(DirectMessageEvent::MessageCompleted(completed)) =
+        routed.next_event(LATER.into()).await.unwrap()
+    else {
+        panic!("expected completed retry response")
+    };
+    assert_eq!(completed.sender_id, target.id.to_string());
+    let messages = SqliteStore::open(database.path())
+        .unwrap()
+        .list_messages(delivered.conversation_id)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].id, message_id);
+    assert_eq!(messages[0].sender_type, MemberType::Agent);
+    assert_eq!(messages[0].sender_id, source.id.to_string());
+    assert_eq!(messages[1].sender_type, MemberType::Agent);
+    assert_eq!(messages[1], completed);
 
     routed.shutdown(LATER.into()).await.unwrap();
     source_owner.shutdown(LATER.into()).await.unwrap();
@@ -1448,7 +1485,7 @@ async fn agent_message_success_routes_only_to_the_exact_target() {
     let source = seed_agent(&database);
     let target = seed_named_agent(&database, "claude");
     let (source_transport, _source_events, source_observed) = FakeTransport::new();
-    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let (target_transport, target_events, target_observed) = FakeTransport::new();
     let mut workspace =
         WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
     let mut source_owner =
@@ -1468,10 +1505,13 @@ async fn agent_message_success_routes_only_to_the_exact_target() {
     let message_id = MessageId::new();
     let command = agent_send(message_id, source.id, target.id, "exact target body");
 
-    assert!(matches!(
-        routed.send_agent_message(command.clone()).await.unwrap(),
-        Some(AgentDirectMessageOutcome::Delivered(_))
-    ));
+    let Some(AgentDirectMessageOutcome::Delivered(delivered)) =
+        routed.send_agent_message(command.clone()).await.unwrap()
+    else {
+        panic!("expected delivered Agent message")
+    };
+    assert_eq!(delivered.source_agent_id, source.id);
+    assert_eq!(delivered.target_agent_id, target.id);
     assert_eq!(routed.send_agent_message(command).await.unwrap(), None);
     assert!(source_observed.lock().unwrap().messages.is_empty());
     assert_eq!(
@@ -1493,6 +1533,40 @@ async fn agent_message_success_routes_only_to_the_exact_target() {
             .status,
         DeliveryStatus::Delivered
     );
+    let routed_session = target_observed.lock().unwrap().messages[0].session.clone();
+    target_events
+        .send(TransportEvent::AgentTextDelta {
+            session: routed_session.clone(),
+            text: "initial response".into(),
+        })
+        .await
+        .unwrap();
+    target_events
+        .send(TransportEvent::AgentMessageCompleted {
+            session: routed_session,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        routed.next_event(LATER.into()).await.unwrap(),
+        Some(DirectMessageEvent::TextDelta("initial response".into()))
+    );
+    let Some(DirectMessageEvent::MessageCompleted(completed)) =
+        routed.next_event(LATER.into()).await.unwrap()
+    else {
+        panic!("expected completed target response")
+    };
+    assert_eq!(completed.sender_id, target.id.to_string());
+    let messages = SqliteStore::open(database.path())
+        .unwrap()
+        .list_messages(delivered.conversation_id)
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].id, message_id);
+    assert_eq!(messages[0].sender_type, MemberType::Agent);
+    assert_eq!(messages[0].sender_id, source.id.to_string());
+    assert_eq!(messages[1].sender_type, MemberType::Agent);
+    assert_eq!(messages[1], completed);
 
     routed.shutdown(LATER.into()).await.unwrap();
     source_owner.shutdown(LATER.into()).await.unwrap();

@@ -36,9 +36,16 @@ pub struct RetryAgentDirectMessage {
     pub retried_at: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeliveredAgentDirectMessage {
+    pub conversation_id: ConversationId,
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum AgentDirectMessageOutcome {
-    Delivered(ConversationId),
+    Delivered(DeliveredAgentDirectMessage),
     PersistedFailed(DirectMessageError),
 }
 
@@ -224,13 +231,12 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
             .runtime
             .open(user_id.clone(), agent_name, opened_at)
             .await?;
-        self.active = Some(ActiveDirectMessage {
-            conversation_id: opened.conversation_id,
-            agent_id: opened.agent_id,
-            sender_type: crate::domain::MemberType::User,
-            sender_id: user_id,
-            response: String::new(),
-        });
+        self.activate(
+            opened.conversation_id,
+            opened.agent_id,
+            crate::domain::MemberType::User,
+            user_id,
+        )?;
         Ok(opened)
     }
 
@@ -243,13 +249,12 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
         }
         let source_agent_id = command.source_agent_id;
         let opened = self.runtime.open_agent(command).await?;
-        self.active = Some(ActiveDirectMessage {
-            conversation_id: opened.conversation_id,
-            agent_id: opened.agent_id,
-            sender_type: crate::domain::MemberType::Agent,
-            sender_id: source_agent_id.to_string(),
-            response: String::new(),
-        });
+        self.activate(
+            opened.conversation_id,
+            opened.agent_id,
+            crate::domain::MemberType::Agent,
+            source_agent_id.to_string(),
+        )?;
         Ok(opened)
     }
 
@@ -281,14 +286,18 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
         &mut self,
         command: SendAgentDirectMessage,
     ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
-        self.runtime.send_agent_message(command).await
+        let outcome = self.runtime.send_agent_message(command).await?;
+        self.activate_delivered(outcome.as_ref())?;
+        Ok(outcome)
     }
 
     pub async fn retry_agent_message(
         &mut self,
         command: RetryAgentDirectMessage,
     ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
-        self.runtime.retry_agent_message(command).await
+        let outcome = self.runtime.retry_agent_message(command).await?;
+        self.activate_delivered(outcome.as_ref())?;
+        Ok(outcome)
     }
 
     pub async fn next_event(
@@ -401,6 +410,49 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
             .ok_or(DirectMessageError::NotOpen)?
             .response
             .clear();
+        Ok(())
+    }
+
+    fn activate_delivered(
+        &mut self,
+        outcome: Option<&AgentDirectMessageOutcome>,
+    ) -> Result<(), DirectMessageError> {
+        if let Some(AgentDirectMessageOutcome::Delivered(delivered)) = outcome {
+            self.activate(
+                delivered.conversation_id,
+                delivered.target_agent_id,
+                crate::domain::MemberType::Agent,
+                delivered.source_agent_id.to_string(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn activate(
+        &mut self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+        sender_type: crate::domain::MemberType,
+        sender_id: String,
+    ) -> Result<(), DirectMessageError> {
+        if let Some(active) = self.active.as_ref() {
+            return if active.conversation_id == conversation_id
+                && active.agent_id == agent_id
+                && active.sender_type == sender_type
+                && active.sender_id == sender_id
+            {
+                Ok(())
+            } else {
+                Err(DirectMessageError::AlreadyOpen)
+            };
+        }
+        self.active = Some(ActiveDirectMessage {
+            conversation_id,
+            agent_id,
+            sender_type,
+            sender_id,
+            response: String::new(),
+        });
         Ok(())
     }
 }
