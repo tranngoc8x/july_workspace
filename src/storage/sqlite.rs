@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -36,6 +36,10 @@ const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 6,
         sql: include_str!("migrations/0006_work_completion_invariant.sql"),
+    },
+    Migration {
+        version: 7,
+        sql: include_str!("migrations/0007_work_completion_whitespace.sql"),
     },
 ];
 
@@ -2198,11 +2202,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_six() {
+    fn fresh_database_has_schema_version_seven() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
     }
 
     #[test]
@@ -2566,14 +2570,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            6
+            7
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            6
+            7
         );
     }
 
@@ -2784,7 +2788,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..6]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 6);
         for (id, expected) in [
@@ -2877,6 +2881,92 @@ mod tests {
                 DomainError::WorkCompletionTimestampMismatch
             ))
         ));
+    }
+
+    #[test]
+    fn migration_seven_repairs_and_rejects_rust_whitespace_completion() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..6]).unwrap();
+        seed_conversation(&connection);
+        let rust_whitespace = "\u{0009}\u{000a}\u{000b}\u{000c}\u{000d}\u{0020}\u{0085}\u{00a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
+        for (id, updated_at, completed_at) in [
+            ("terminal-tab", "tab-updated", "\t"),
+            ("terminal-newline", "newline-updated", "\n"),
+            (
+                "terminal-ascii-whitespace",
+                "ascii-whitespace-updated",
+                "\t\n\u{000b}\u{000c}\r ",
+            ),
+            (
+                "terminal-rust-whitespace",
+                "rust-whitespace-updated",
+                rust_whitespace,
+            ),
+            ("valid-surrounded", "valid-updated", "\tcompleted\n"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO work_items(
+                        id, conversation_id, title, status,
+                        created_at, updated_at, completed_at
+                     ) VALUES (?1, 'conversation-1', 'legacy', 'done', 'created', ?2, ?3)",
+                    params![id, updated_at, completed_at],
+                )
+                .unwrap();
+        }
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 7);
+        for (id, expected) in [
+            ("terminal-tab", "tab-updated"),
+            ("terminal-newline", "newline-updated"),
+            ("terminal-ascii-whitespace", "ascii-whitespace-updated"),
+            ("terminal-rust-whitespace", "rust-whitespace-updated"),
+            ("valid-surrounded", "\tcompleted\n"),
+        ] {
+            let completed_at: String = connection
+                .query_row(
+                    "SELECT completed_at FROM work_items WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(completed_at, expected, "wrong migration value for {id}");
+        }
+
+        for (id, completed_at) in [
+            ("raw-tab", "\t"),
+            ("raw-newline", "\n"),
+            ("raw-ascii-whitespace", "\t\n\u{000b}\u{000c}\r "),
+            ("raw-rust-whitespace", rust_whitespace),
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO work_items(
+                            id, conversation_id, title, status,
+                            created_at, updated_at, completed_at
+                         ) VALUES (?1, 'conversation-1', 'raw', 'done',
+                                   'created', 'updated', ?2)",
+                        params![id, completed_at],
+                    )
+                    .is_err(),
+                "accepted whitespace-only completed_at for {id}"
+            );
+        }
+        assert!(
+            connection
+                .execute(
+                    "UPDATE work_items SET completed_at = ?1 WHERE id = 'valid-surrounded'",
+                    ["\t\n"],
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2997,15 +3087,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (7);",
+                 INSERT INTO schema_migrations(version) VALUES (8);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 7,
-                supported: 6,
+                found: 8,
+                supported: 7,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),
