@@ -279,7 +279,7 @@ async fn conflicting_publish_id_is_rejected_without_a_second_mapping() {
 }
 
 #[tokio::test]
-async fn missing_result_work_or_target_and_same_context_publish_leave_no_row() {
+async fn missing_result_work_or_target_leave_no_row() {
     let database = TestDatabase::new();
     let source = conversation();
     let target = conversation();
@@ -345,16 +345,33 @@ async fn missing_result_work_or_target_and_same_context_publish_leave_no_row() {
             .await,
         Err(PublishError::TargetNotFound(missing_target_id))
     );
-    assert_eq!(
-        service
-            .publish(publish_command(
-                PublishId::new(),
-                valid.id,
-                source.id,
-                PUBLISHED_AT,
-            ))
-            .await,
-        Err(PublishError::SourceEqualsTarget(source.id))
-    );
     assert_eq!(publish_count(database.path()), 0);
+}
+
+#[tokio::test]
+async fn same_conversation_publish_returns_the_structured_result_and_is_exactly_idempotent() {
+    let database = TestDatabase::new();
+    let conversation = conversation();
+    let result = {
+        let mut store = SqliteStore::open(database.path()).unwrap();
+        store.insert_conversation(&conversation).unwrap();
+        seed_result(&mut store, &conversation, None, "Same-context result")
+    };
+    let command = publish_command(PublishId::new(), result.id, conversation.id, PUBLISHED_AT);
+    let expected = PublishedResult {
+        publish_id: command.publish_id,
+        result,
+        source_conversation_id: conversation.id,
+        target_conversation_id: conversation.id,
+        published_at: PUBLISHED_AT.into(),
+    };
+    let mut service = PublishService::new(StorageWorker::open(database.path()).unwrap());
+
+    assert_eq!(service.publish(command.clone()).await.unwrap(), expected);
+    assert_eq!(service.publish(command).await.unwrap(), expected);
+    assert_eq!(
+        service.list_for_target(conversation.id).await.unwrap(),
+        vec![expected]
+    );
+    assert_eq!(publish_count(database.path()), 1);
 }

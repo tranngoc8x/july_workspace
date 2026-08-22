@@ -1298,11 +1298,6 @@ impl SqliteStore {
         if get_conversation(&transaction, target_conversation_id)?.is_none() {
             return Err(StoreError::PublishTargetNotFound(target_conversation_id));
         }
-        if source_conversation_id == target_conversation_id {
-            return Err(StoreError::PublishSourceEqualsTarget(
-                source_conversation_id,
-            ));
-        }
 
         let publish = Publish {
             id: publish_id,

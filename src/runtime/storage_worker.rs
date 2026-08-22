@@ -984,7 +984,6 @@ fn map_publish_error(error: StoreError) -> PublishError {
         StoreError::WorkItemNotFound(id) => PublishError::WorkNotFound(id),
         StoreError::PublishSourceNotFound(id) => PublishError::SourceNotFound(id),
         StoreError::PublishTargetNotFound(id) => PublishError::TargetNotFound(id),
-        StoreError::PublishSourceEqualsTarget(id) => PublishError::SourceEqualsTarget(id),
         StoreError::PublishIdConflict(id) => PublishError::PublishIdConflict(id),
         StoreError::InvalidPublishTimestamp => PublishError::InvalidTimestamp,
         error => PublishError::Runtime(error.to_string()),

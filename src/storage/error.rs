@@ -92,8 +92,6 @@ pub enum StoreError {
     PublishSourceNotFound(ConversationId),
     #[error("target conversation {0} does not exist")]
     PublishTargetNotFound(ConversationId),
-    #[error("result source and publish target cannot both be conversation {0}")]
-    PublishSourceEqualsTarget(ConversationId),
     #[error("publish id {0} already maps a different result or target")]
     PublishIdConflict(PublishId),
     #[error("publish timestamp must not be blank")]
