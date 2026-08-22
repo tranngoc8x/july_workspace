@@ -721,82 +721,71 @@ impl SqliteStore {
         target_agent_id: AgentId,
         now: &str,
     ) -> Result<Conversation, StoreError> {
-        if source_agent_id == target_agent_id {
-            return Err(StoreError::InvalidStoredValue(
-                "agent DM requires distinct agent IDs",
-            ));
-        }
-        let conversation = Conversation {
-            id: ConversationId::new(),
-            kind: ConversationKind::Dm,
-            room_id: None,
-            title: None,
-            goal: None,
-            parent_conversation_id: None,
-            origin_conversation_id: None,
-            status: "open".into(),
-            created_at: now.into(),
-            updated_at: now.into(),
-        };
-        let members = [
-            ConversationMember {
-                conversation_id: conversation.id,
-                member_type: MemberType::Agent,
-                member_id: source_agent_id.to_string(),
-                generation: 1,
-                joined_at: now.into(),
-                left_at: None,
-            },
-            ConversationMember {
-                conversation_id: conversation.id,
-                member_type: MemberType::Agent,
-                member_id: target_agent_id.to_string(),
-                generation: 1,
-                joined_at: now.into(),
-                left_at: None,
-            },
-        ];
-        conversation.validate()?;
-        for member in &members {
-            member.validate()?;
-        }
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_active_agent(&transaction, source_agent_id)?;
-        require_active_agent(&transaction, target_agent_id)?;
-        let existing = query_optional(
-            &transaction,
-            "SELECT c.id, c.type, c.room_id, c.title, c.goal, c.parent_conversation_id,
-                    c.origin_conversation_id, c.status, c.created_at, c.updated_at
-             FROM conversations c
-             WHERE c.type = 'dm' AND c.status = 'open'
-               AND 2 = (
-                   SELECT COUNT(*) FROM conversation_members m
-                   WHERE m.conversation_id = c.id AND m.left_at IS NULL
-               )
-               AND 2 = (
-                   SELECT COUNT(*) FROM conversation_members m
-                   WHERE m.conversation_id = c.id AND m.member_type = 'agent'
-                     AND m.member_id IN (?1, ?2) AND m.left_at IS NULL
-               )
-             ORDER BY c.created_at, c.id
-             LIMIT 1",
-            params![source_agent_id.to_string(), target_agent_id.to_string()],
-            records::conversation,
-        )?;
-        if let Some(existing) = existing {
-            transaction.commit()?;
-            return Ok(existing);
-        }
-
-        insert_conversation(&transaction, &conversation)?;
-        for member in &members {
-            insert_conversation_member(&transaction, member)?;
-        }
+        let conversation =
+            get_or_create_agent_dm(&transaction, source_agent_id, target_agent_id, now)?;
         transaction.commit()?;
         Ok(conversation)
+    }
+
+    pub fn persist_agent_direct_message(
+        &mut self,
+        message_id: MessageId,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+        body: &str,
+        sent_at: &str,
+    ) -> Result<Option<(Message, MessageDelivery)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conversation =
+            get_or_create_agent_dm(&transaction, source_agent_id, target_agent_id, sent_at)?;
+        let message = Message {
+            id: message_id,
+            conversation_id: conversation.id,
+            sender_type: MemberType::Agent,
+            sender_id: source_agent_id.to_string(),
+            body: body.into(),
+            reply_to: None,
+            metadata: serde_json::json!({
+                "july": {"schema": 1, "channel": "dm", "direction": "outbound"}
+            }),
+            created_at: sent_at.into(),
+        };
+        message.validate()?;
+        let delivery = MessageDelivery {
+            message_id,
+            target_agent_id,
+            status: DeliveryStatus::Pending,
+            capsule: None,
+            capsule_delivered_at: None,
+            created_at: sent_at.into(),
+            updated_at: sent_at.into(),
+            delivered_at: None,
+        };
+        delivery.validate()?;
+        if !insert_message(&transaction, &message)? {
+            match get_message_delivery(&transaction, message_id, target_agent_id)? {
+                Some(existing)
+                    if existing.capsule.is_none() && existing.created_at == delivery.created_at =>
+                {
+                    transaction.commit()?;
+                    return Ok(None);
+                }
+                _ => {
+                    return Err(StoreError::DeliveryConflict {
+                        message_id,
+                        target_agent_id,
+                    });
+                }
+            }
+        }
+        insert_message_delivery(&transaction, &delivery)?;
+        transaction.commit()?;
+        Ok(Some((message, delivery)))
     }
 
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
@@ -967,6 +956,49 @@ impl SqliteStore {
         require_active_agent(&transaction, target_agent_id)?;
         require_active_room_membership(&transaction, room_id, target_agent_id)?;
         require_active_thread_membership(&transaction, message.conversation_id, target_agent_id)?;
+        if transaction.execute(
+            "UPDATE message_deliveries
+             SET status = 'pending', updated_at = ?3
+             WHERE message_id = ?1 AND target_agent_id = ?2 AND status = 'failed'",
+            params![
+                message_id.to_string(),
+                target_agent_id.to_string(),
+                claimed_at
+            ],
+        )? != 1
+        {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        delivery.status = DeliveryStatus::Pending;
+        delivery.updated_at = claimed_at.into();
+        delivery.validate()?;
+        transaction.commit()?;
+        Ok(Some((message, delivery)))
+    }
+
+    pub fn claim_failed_agent_direct_message_delivery(
+        &mut self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        claimed_at: &str,
+    ) -> Result<Option<(Message, MessageDelivery)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(mut delivery) = get_message_delivery(&transaction, message_id, target_agent_id)?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        if delivery.status != DeliveryStatus::Failed {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let message = get_message(&transaction, message_id)?.ok_or(
+            StoreError::InvalidStoredValue("message_delivery.message_id"),
+        )?;
+        require_agent_dm_scope(&transaction, &message, target_agent_id)?;
         if transaction.execute(
             "UPDATE message_deliveries
              SET status = 'pending', updated_at = ?3
@@ -1457,6 +1489,118 @@ fn insert_conversation_member(
             member.left_at,
         ],
     )?;
+    Ok(())
+}
+
+fn get_or_create_agent_dm(
+    connection: &Connection,
+    source_agent_id: AgentId,
+    target_agent_id: AgentId,
+    now: &str,
+) -> Result<Conversation, StoreError> {
+    if source_agent_id == target_agent_id {
+        return Err(StoreError::InvalidStoredValue(
+            "agent DM requires distinct agent IDs",
+        ));
+    }
+    require_active_agent(connection, source_agent_id)?;
+    require_active_agent(connection, target_agent_id)?;
+    let existing = query_optional(
+        connection,
+        "SELECT c.id, c.type, c.room_id, c.title, c.goal, c.parent_conversation_id,
+                c.origin_conversation_id, c.status, c.created_at, c.updated_at
+         FROM conversations c
+         WHERE c.type = 'dm' AND c.status = 'open'
+           AND 2 = (
+               SELECT COUNT(*) FROM conversation_members m
+               WHERE m.conversation_id = c.id AND m.left_at IS NULL
+           )
+           AND 2 = (
+               SELECT COUNT(*) FROM conversation_members m
+               WHERE m.conversation_id = c.id AND m.member_type = 'agent'
+                 AND m.member_id IN (?1, ?2) AND m.left_at IS NULL
+           )
+         ORDER BY c.created_at, c.id
+         LIMIT 1",
+        params![source_agent_id.to_string(), target_agent_id.to_string()],
+        records::conversation,
+    )?;
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+
+    let conversation = Conversation {
+        id: ConversationId::new(),
+        kind: ConversationKind::Dm,
+        room_id: None,
+        title: None,
+        goal: None,
+        parent_conversation_id: None,
+        origin_conversation_id: None,
+        status: "open".into(),
+        created_at: now.into(),
+        updated_at: now.into(),
+    };
+    conversation.validate()?;
+    insert_conversation(connection, &conversation)?;
+    for agent_id in [source_agent_id, target_agent_id] {
+        insert_conversation_member(
+            connection,
+            &ConversationMember {
+                conversation_id: conversation.id,
+                member_type: MemberType::Agent,
+                member_id: agent_id.to_string(),
+                generation: 1,
+                joined_at: now.into(),
+                left_at: None,
+            },
+        )?;
+    }
+    Ok(conversation)
+}
+
+fn require_agent_dm_scope(
+    connection: &Connection,
+    message: &Message,
+    target_agent_id: AgentId,
+) -> Result<(), StoreError> {
+    if message.sender_type != MemberType::Agent {
+        return Err(StoreError::InvalidStoredValue("message.sender_type"));
+    }
+    let source_agent_id: AgentId = message.sender_id.parse()?;
+    if source_agent_id == target_agent_id {
+        return Err(StoreError::InvalidStoredValue(
+            "agent DM requires distinct agent IDs",
+        ));
+    }
+    require_active_agent(connection, source_agent_id)?;
+    require_active_agent(connection, target_agent_id)?;
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM conversations c
+             WHERE c.id = ?1 AND c.type = 'dm' AND c.status = 'open'
+               AND 2 = (
+                   SELECT COUNT(*) FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.left_at IS NULL
+               )
+               AND 2 = (
+                   SELECT COUNT(*) FROM conversation_members m
+                   WHERE m.conversation_id = c.id AND m.member_type = 'agent'
+                     AND m.member_id IN (?2, ?3) AND m.left_at IS NULL
+               )
+         )",
+        params![
+            message.conversation_id.to_string(),
+            source_agent_id.to_string(),
+            target_agent_id.to_string()
+        ],
+        |row| row.get(0),
+    )?;
+    if !valid {
+        return Err(StoreError::InvalidStoredValue(
+            "message_delivery.agent_dm_scope",
+        ));
+    }
     Ok(())
 }
 

@@ -1,10 +1,12 @@
 use july_workspace::application::{
-    DirectMessageError, DirectMessageEvent, DirectMessagePermissionRequestId, DirectMessageRuntime,
-    DirectMessageRuntimeEvent, DirectMessageService, OpenAgentDirectMessage, OpenedDirectMessage,
+    AgentDirectMessageOutcome, DirectMessageError, DirectMessageEvent,
+    DirectMessagePermissionRequestId, DirectMessageRuntime, DirectMessageRuntimeEvent,
+    DirectMessageService, OpenAgentDirectMessage, OpenedDirectMessage, RetryAgentDirectMessage,
+    SendAgentDirectMessage,
 };
 use july_workspace::domain::{
-    Agent, AgentId, ConversationId, MemberType, Message, PermissionOption, PermissionOutcome,
-    SessionBinding, SessionBindingId, SessionBindingStatus,
+    Agent, AgentId, ConversationId, DeliveryStatus, MemberType, Message, MessageId,
+    PermissionOption, PermissionOutcome, SessionBinding, SessionBindingId, SessionBindingStatus,
 };
 use july_workspace::runtime::{AgentDirectMessageRuntime, StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
@@ -61,6 +63,8 @@ struct FakeTransport {
     events: Option<tokio::sync::mpsc::Receiver<TransportEvent>>,
     observed: Arc<Mutex<ObservedTransport>>,
     resume_lost: bool,
+    create_fails_at: Option<usize>,
+    send_fails_at: Option<usize>,
 }
 
 impl FakeTransport {
@@ -76,6 +80,8 @@ impl FakeTransport {
                 events: Some(receiver),
                 observed: observed.clone(),
                 resume_lost: false,
+                create_fails_at: None,
+                send_fails_at: None,
             },
             sender,
             observed,
@@ -98,6 +104,9 @@ impl AgentTransport for FakeTransport {
         request: CreateSession,
     ) -> Result<SessionCreated, TransportError> {
         self.observed.lock().unwrap().creates.push(request.clone());
+        if self.create_fails_at == Some(self.observed.lock().unwrap().creates.len()) {
+            return Err(TransportError::Protocol("fixture open failure".into()));
+        }
         Ok(SessionCreated {
             session: SessionRef {
                 binding_id: request.binding_id,
@@ -124,6 +133,9 @@ impl AgentTransport for FakeTransport {
 
     async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError> {
         self.observed.lock().unwrap().messages.push(request);
+        if self.send_fails_at == Some(self.observed.lock().unwrap().messages.len()) {
+            return Err(TransportError::Protocol("fixture send failure".into()));
+        }
         Ok(())
     }
 
@@ -172,6 +184,40 @@ fn seed_agent(database: &TestDatabase) -> Agent {
     let store = SqliteStore::open(database.path()).unwrap();
     store.insert_agent(&agent).unwrap();
     agent
+}
+
+fn seed_named_agent(database: &TestDatabase, name: &str) -> Agent {
+    let agent = Agent {
+        id: Default::default(),
+        name: name.into(),
+        project_root: format!("/workspace/{name}"),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&agent)
+        .unwrap();
+    agent
+}
+
+fn agent_send(
+    message_id: MessageId,
+    source_agent_id: AgentId,
+    target_agent_id: AgentId,
+    body: &str,
+) -> SendAgentDirectMessage {
+    SendAgentDirectMessage {
+        message_id,
+        source_agent_id,
+        target_agent_id,
+        body: body.into(),
+        sent_at: NOW.into(),
+    }
 }
 
 fn runtime(database: &TestDatabase, transport: FakeTransport) -> TestDirectMessageRuntime {
@@ -1287,6 +1333,545 @@ async fn agent_direct_message_context_is_terminal_after_shutdown() {
         SessionBindingStatus::Disconnected
     );
 
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_agent_message_is_durable_and_explicit_retry_delivers_exact_body() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = Agent {
+        id: AgentId::new(),
+        name: "claude".into(),
+        project_root: "/workspace/target".into(),
+        transport_type: "acp".into(),
+        transport_config: json!({}),
+        status: "active".into(),
+        metadata: json!({}),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&target)
+        .unwrap();
+    let (source_transport, _source_events, source_observed) = FakeTransport::new();
+    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut source_owner =
+        DirectMessageService::new(workspace.direct_message(source_transport).unwrap());
+    source_owner
+        .open("source-owner".into(), source.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+    let body = "  durable exact body\n";
+    let command = SendAgentDirectMessage {
+        message_id,
+        source_agent_id: source.id,
+        target_agent_id: target.id,
+        body: body.into(),
+        sent_at: NOW.into(),
+    };
+
+    assert!(matches!(
+        routed.send_agent_message(command.clone()).await.unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(DirectMessageError::Runtime(message)))
+            if message.contains("no runtime owner")
+    ));
+    assert_eq!(routed.send_agent_message(command).await.unwrap(), None);
+    let store = SqliteStore::open(database.path()).unwrap();
+    let persisted = store.get_message(message_id).unwrap().unwrap();
+    assert_eq!(persisted.sender_type, MemberType::Agent);
+    assert_eq!(persisted.sender_id, source.id.to_string());
+    assert_eq!(persisted.body, body);
+    assert_eq!(
+        store
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Failed
+    );
+    drop(store);
+    assert!(source_observed.lock().unwrap().messages.is_empty());
+
+    let mut target_owner =
+        DirectMessageService::new(workspace.direct_message(target_transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let retry = RetryAgentDirectMessage {
+        message_id,
+        target_agent_id: target.id,
+        retried_at: LATER.into(),
+    };
+    assert!(matches!(
+        routed.retry_agent_message(retry.clone()).await.unwrap(),
+        Some(AgentDirectMessageOutcome::Delivered(_))
+    ));
+    assert_eq!(routed.retry_agent_message(retry).await.unwrap(), None);
+    assert_eq!(
+        target_observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![body]
+    );
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Delivered
+    );
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    source_owner.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_success_routes_only_to_the_exact_target() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let (source_transport, _source_events, source_observed) = FakeTransport::new();
+    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut source_owner =
+        DirectMessageService::new(workspace.direct_message(source_transport).unwrap());
+    source_owner
+        .open("source-owner".into(), source.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let mut target_owner =
+        DirectMessageService::new(workspace.direct_message(target_transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name.clone(), NOW.into())
+        .await
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+    let command = agent_send(message_id, source.id, target.id, "exact target body");
+
+    assert!(matches!(
+        routed.send_agent_message(command.clone()).await.unwrap(),
+        Some(AgentDirectMessageOutcome::Delivered(_))
+    ));
+    assert_eq!(routed.send_agent_message(command).await.unwrap(), None);
+    assert!(source_observed.lock().unwrap().messages.is_empty());
+    assert_eq!(
+        target_observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["exact target body"]
+    );
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Delivered
+    );
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    source_owner.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_agent_message_retry_is_claimed_once_under_concurrency() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let mut workspace =
+        WorkspaceRuntime::<FakeTransport>::new(StorageWorker::open(database.path()).unwrap())
+            .unwrap();
+    let mut initial =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+    assert!(matches!(
+        initial
+            .send_agent_message(agent_send(message_id, source.id, target.id, "retry body"))
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(_))
+    ));
+
+    let (target_transport, _target_events, target_observed) = FakeTransport::new();
+    let mut target_owner =
+        DirectMessageService::new(workspace.direct_message(target_transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name, NOW.into())
+        .await
+        .unwrap();
+    let mut retry_a =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let mut retry_b =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let command = RetryAgentDirectMessage {
+        message_id,
+        target_agent_id: target.id,
+        retried_at: LATER.into(),
+    };
+    let (a, b) = tokio::join!(
+        retry_a.retry_agent_message(command.clone()),
+        retry_b.retry_agent_message(command.clone())
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Some(AgentDirectMessageOutcome::Delivered(_))))
+            .count(),
+        1
+    );
+    assert_eq!(initial.retry_agent_message(command).await.unwrap(), None);
+    assert_eq!(target_observed.lock().unwrap().messages.len(), 1);
+
+    initial.shutdown(LATER.into()).await.unwrap();
+    retry_a.shutdown(LATER.into()).await.unwrap();
+    retry_b.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_agent_message_retry_revalidates_the_stored_dm_without_replacement() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let mut workspace =
+        WorkspaceRuntime::<FakeTransport>::new(StorageWorker::open(database.path()).unwrap())
+            .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+    assert!(matches!(
+        routed
+            .send_agent_message(agent_send(message_id, source.id, target.id, "stored scope"))
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(_))
+    ));
+    let conversation_id = SqliteStore::open(database.path())
+        .unwrap()
+        .get_message(message_id)
+        .unwrap()
+        .unwrap()
+        .conversation_id;
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE conversations SET status = 'closed' WHERE id = ?1",
+            [conversation_id.to_string()],
+        )
+        .unwrap();
+
+    assert!(matches!(
+        routed
+            .retry_agent_message(RetryAgentDirectMessage {
+                message_id,
+                target_agent_id: target.id,
+                retried_at: LATER.into(),
+            })
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(DirectMessageError::Runtime(message)))
+            if message.contains("message_delivery.agent_dm_scope")
+    ));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM conversations", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Failed
+    );
+
+    routed.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_replay_rejects_message_and_delivery_conflicts() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let other = seed_named_agent(&database, "gemini");
+    let mut workspace =
+        WorkspaceRuntime::<FakeTransport>::new(StorageWorker::open(database.path()).unwrap())
+            .unwrap();
+    let mut target_route =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+    assert!(matches!(
+        target_route
+            .send_agent_message(agent_send(message_id, source.id, target.id, "original"))
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(_))
+    ));
+    assert!(matches!(
+        target_route
+            .send_agent_message(agent_send(message_id, source.id, target.id, "changed"))
+            .await,
+        Err(DirectMessageError::Runtime(message)) if message.contains("different content")
+    ));
+    let mut other_route =
+        DirectMessageService::new(workspace.direct_message_for_agent(other.id).unwrap());
+    assert!(matches!(
+        other_route
+            .send_agent_message(agent_send(message_id, source.id, other.id, "original"))
+            .await,
+        Err(DirectMessageError::Runtime(message)) if message.contains("different content")
+    ));
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, other.id)
+            .unwrap(),
+        None
+    );
+
+    let delivery_conflict_id = MessageId::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let conversation = store
+        .get_or_create_agent_dm(source.id, target.id, NOW)
+        .unwrap();
+    store
+        .insert_message(&Message {
+            id: delivery_conflict_id,
+            conversation_id: conversation.id,
+            sender_type: MemberType::Agent,
+            sender_id: source.id.to_string(),
+            body: "legacy exact body".into(),
+            reply_to: None,
+            metadata: json!({
+                "july": {"schema": 1, "channel": "dm", "direction": "outbound"}
+            }),
+            created_at: NOW.into(),
+        })
+        .unwrap();
+    drop(store);
+    assert!(matches!(
+        target_route
+            .send_agent_message(agent_send(
+                delivery_conflict_id,
+                source.id,
+                target.id,
+                "legacy exact body",
+            ))
+            .await,
+        Err(DirectMessageError::Runtime(message)) if message.contains("delivery for message")
+    ));
+
+    target_route.shutdown(LATER.into()).await.unwrap();
+    other_route.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_open_and_send_failures_leave_failed_deliveries() {
+    for failure in ["open", "send"] {
+        let database = TestDatabase::new();
+        let source = seed_agent(&database);
+        let target = seed_named_agent(&database, "claude");
+        let (mut transport, _events, observed) = FakeTransport::new();
+        transport.create_fails_at = (failure == "open").then_some(2);
+        transport.send_fails_at = (failure == "send").then_some(1);
+        let mut workspace =
+            WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+        let mut target_owner =
+            DirectMessageService::new(workspace.direct_message(transport).unwrap());
+        target_owner
+            .open("target-owner".into(), target.name, NOW.into())
+            .await
+            .unwrap();
+        let mut routed =
+            DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+        let message_id = MessageId::new();
+
+        assert!(matches!(
+            routed
+                .send_agent_message(agent_send(message_id, source.id, target.id, "failure body"))
+                .await
+                .unwrap(),
+            Some(AgentDirectMessageOutcome::PersistedFailed(DirectMessageError::Runtime(message)))
+                if message.contains(&format!("fixture {failure} failure"))
+        ));
+        assert_eq!(
+            SqliteStore::open(database.path())
+                .unwrap()
+                .get_message_delivery(message_id, target.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DeliveryStatus::Failed
+        );
+        assert_eq!(
+            observed.lock().unwrap().messages.len(),
+            usize::from(failure == "send")
+        );
+
+        routed.shutdown(LATER.into()).await.unwrap();
+        target_owner.shutdown(LATER.into()).await.unwrap();
+        workspace.shutdown(LATER.into()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn delivery_record_failure_immediately_recovers_agent_message_to_failed() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = DirectMessageService::new(workspace.direct_message(transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name, NOW.into())
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_dm_delivered_record
+             BEFORE UPDATE OF status ON message_deliveries
+             WHEN NEW.status = 'delivered'
+             BEGIN SELECT RAISE(ABORT, 'fixture delivered record failure'); END;",
+        )
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+
+    assert!(matches!(
+        routed
+            .send_agent_message(agent_send(message_id, source.id, target.id, "record body"))
+            .await
+            .unwrap(),
+        Some(AgentDirectMessageOutcome::PersistedFailed(DirectMessageError::Runtime(message)))
+            if message.contains("fixture delivered record failure")
+    ));
+    assert_eq!(observed.lock().unwrap().messages.len(), 1);
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Failed
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_dm_delivered_record")
+        .unwrap();
+    routed.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn agent_message_record_and_failed_recovery_errors_are_combined() {
+    let database = TestDatabase::new();
+    let source = seed_agent(&database);
+    let target = seed_named_agent(&database, "claude");
+    let (transport, _events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = DirectMessageService::new(workspace.direct_message(transport).unwrap());
+    target_owner
+        .open("target-owner".into(), target.name, NOW.into())
+        .await
+        .unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_all_dm_delivery_updates
+             BEFORE UPDATE ON message_deliveries
+             BEGIN SELECT RAISE(ABORT, 'fixture all delivery updates fail'); END;",
+        )
+        .unwrap();
+    let mut routed =
+        DirectMessageService::new(workspace.direct_message_for_agent(target.id).unwrap());
+    let message_id = MessageId::new();
+
+    let outcome = routed
+        .send_agent_message(agent_send(
+            message_id,
+            source.id,
+            target.id,
+            "dual error body",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let AgentDirectMessageOutcome::PersistedFailed(
+        DirectMessageError::DeliveryStateRecoveryFailed { primary, recovery },
+    ) = outcome
+    else {
+        panic!("expected combined delivery-state error, got {outcome:?}")
+    };
+    assert!(
+        primary
+            .to_string()
+            .contains("fixture all delivery updates fail")
+    );
+    assert!(
+        recovery
+            .to_string()
+            .contains("fixture all delivery updates fail")
+    );
+    assert_eq!(observed.lock().unwrap().messages.len(), 1);
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_message_delivery(message_id, target.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DeliveryStatus::Pending
+    );
+
+    connection
+        .execute_batch("DROP TRIGGER fail_all_dm_delivery_updates")
+        .unwrap();
+    routed.shutdown(LATER.into()).await.unwrap();
     target_owner.shutdown(LATER.into()).await.unwrap();
     workspace.shutdown(LATER.into()).await.unwrap();
 }

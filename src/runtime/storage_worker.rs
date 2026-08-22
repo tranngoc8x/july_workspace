@@ -51,6 +51,14 @@ enum Command {
     ),
     GetOrCreateAgentDm(AgentId, AgentId, String, Reply<Conversation>),
     InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
+    PersistAgentDirectMessage(
+        MessageId,
+        AgentId,
+        AgentId,
+        String,
+        String,
+        Reply<Option<(Message, MessageDelivery)>>,
+    ),
     PersistThreadMention(
         Message,
         AgentId,
@@ -62,6 +70,12 @@ enum Command {
     MarkDeliveryDelivered(MessageId, AgentId, String, Reply<bool>),
     MarkDeliveryFailed(MessageId, AgentId, String, Reply<bool>),
     ClaimThreadMentionRetry(
+        MessageId,
+        AgentId,
+        String,
+        Reply<Option<(Message, MessageDelivery)>>,
+    ),
+    ClaimAgentDirectMessageRetry(
         MessageId,
         AgentId,
         String,
@@ -222,6 +236,27 @@ impl StorageHandle {
             .await
     }
 
+    pub(crate) async fn persist_agent_direct_message(
+        &self,
+        message_id: MessageId,
+        source_agent_id: AgentId,
+        target_agent_id: AgentId,
+        body: String,
+        sent_at: String,
+    ) -> Result<Option<(Message, MessageDelivery)>, RuntimeError> {
+        self.request(|reply| {
+            Command::PersistAgentDirectMessage(
+                message_id,
+                source_agent_id,
+                target_agent_id,
+                body,
+                sent_at,
+                reply,
+            )
+        })
+        .await
+    }
+
     pub async fn persist_thread_mention(
         &self,
         message: Message,
@@ -279,6 +314,18 @@ impl StorageHandle {
     ) -> Result<Option<(Message, MessageDelivery)>, CollaborationError> {
         self.collaboration_request(|reply| {
             Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply)
+        })
+        .await
+    }
+
+    pub(crate) async fn claim_agent_direct_message_retry(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        claimed_at: String,
+    ) -> Result<Option<(Message, MessageDelivery)>, RuntimeError> {
+        self.request(|reply| {
+            Command::ClaimAgentDirectMessageRetry(message_id, target_agent_id, claimed_at, reply)
         })
         .await
     }
@@ -624,6 +671,22 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::InsertMessage(message, reply) => {
                 let _ = reply.send(store.insert_message(&message));
             }
+            Command::PersistAgentDirectMessage(
+                message_id,
+                source_agent_id,
+                target_agent_id,
+                body,
+                sent_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.persist_agent_direct_message(
+                    message_id,
+                    source_agent_id,
+                    target_agent_id,
+                    &body,
+                    &sent_at,
+                ));
+            }
             Command::PersistThreadMention(
                 message,
                 source_agent_id,
@@ -663,6 +726,18 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply) => {
                 let _ = reply.send(store.claim_failed_thread_mention_delivery(
+                    message_id,
+                    target_agent_id,
+                    &claimed_at,
+                ));
+            }
+            Command::ClaimAgentDirectMessageRetry(
+                message_id,
+                target_agent_id,
+                claimed_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.claim_failed_agent_direct_message_delivery(
                     message_id,
                     target_agent_id,
                     &claimed_at,

@@ -1,11 +1,12 @@
 use super::{RuntimeError, RuntimeSession, StorageWorker, WorkspaceHandle, WorkspaceRuntime};
 use crate::application::{
-    DirectMessageError, DirectMessageFailureKind, DirectMessagePermissionRequestId,
-    DirectMessageRuntime, DirectMessageRuntimeEvent, OpenAgentDirectMessage, OpenedDirectMessage,
+    AgentDirectMessageOutcome, DirectMessageError, DirectMessageFailureKind,
+    DirectMessagePermissionRequestId, DirectMessageRuntime, DirectMessageRuntimeEvent,
+    OpenAgentDirectMessage, OpenedDirectMessage, RetryAgentDirectMessage, SendAgentDirectMessage,
 };
 use crate::domain::{
-    Agent, AgentId, ConversationId, Message, PermissionOutcome, SessionBinding,
-    SessionBindingStatus,
+    Agent, AgentId, ConversationId, Message, MessageDelivery, MessageId, PermissionOutcome,
+    SessionBinding, SessionBindingStatus,
 };
 use crate::storage::SqliteStore;
 use crate::transport::{
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 struct ActiveDirectMessage {
+    conversation_id: ConversationId,
     agent_id: AgentId,
     session: SessionRef,
     permissions: HashMap<String, SessionRef>,
@@ -153,6 +155,7 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
         let session_ref = session.session().clone();
 
         self.active = Some(ActiveDirectMessage {
+            conversation_id,
             agent_id: agent.id,
             session: session_ref,
             permissions: HashMap::new(),
@@ -164,6 +167,136 @@ impl<T: AgentTransport + Send + 'static> AgentDirectMessageRuntime<T> {
             agent_name: agent.name,
             messages,
         })
+    }
+
+    fn ensure_delivery_target(&self, target_agent_id: AgentId) -> Result<(), DirectMessageError> {
+        if self.stopped {
+            return Err(DirectMessageError::ContextStopped);
+        }
+        self.workspace.ensure_running().map_err(runtime_error)?;
+        let expected = self
+            .expected_agent_id
+            .ok_or(DirectMessageError::AgentTargetNotBound)?;
+        if expected != target_agent_id {
+            return Err(DirectMessageError::AgentNotFound(
+                target_agent_id.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn persisted_failure(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        attempted_at: String,
+        error: DirectMessageError,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        let recorded_error = match self
+            .workspace
+            .storage()
+            .mark_delivery_failed(message_id, target_agent_id, attempted_at)
+            .await
+        {
+            Ok(true) => error,
+            Ok(false) => DirectMessageError::DeliveryStateRecoveryFailed {
+                primary: Box::new(error),
+                recovery: Box::new(DirectMessageError::Runtime(
+                    "FAILED recovery found delivery no longer pending".into(),
+                )),
+            },
+            Err(recovery) => DirectMessageError::DeliveryStateRecoveryFailed {
+                primary: Box::new(error),
+                recovery: Box::new(DirectMessageError::Runtime(recovery.to_string())),
+            },
+        };
+        Ok(Some(AgentDirectMessageOutcome::PersistedFailed(
+            recorded_error,
+        )))
+    }
+
+    async fn open_persisted(
+        &mut self,
+        message: &Message,
+        target_agent_id: AgentId,
+        opened_at: String,
+    ) -> Result<ConversationId, DirectMessageError> {
+        if let Some(active) = self.active.as_ref() {
+            if active.agent_id == target_agent_id
+                && active.conversation_id == message.conversation_id
+            {
+                return Ok(message.conversation_id);
+            }
+            return Err(DirectMessageError::AlreadyOpen);
+        }
+        if self.session.is_some() {
+            return Err(DirectMessageError::AlreadyOpen);
+        }
+        let storage = self.workspace.storage();
+        let agent = storage
+            .get_agent(target_agent_id)
+            .await
+            .map_err(runtime_error)?
+            .ok_or_else(|| DirectMessageError::AgentNotFound(target_agent_id.to_string()))?;
+        let messages = storage
+            .list_messages(message.conversation_id)
+            .await
+            .map_err(runtime_error)?;
+        self.finish_open(agent, message.conversation_id, messages, opened_at)
+            .await
+            .map(|opened| opened.conversation_id)
+    }
+
+    async fn deliver_persisted(
+        &mut self,
+        message: Message,
+        delivery: MessageDelivery,
+        attempted_at: String,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        let conversation_id = match self
+            .open_persisted(&message, delivery.target_agent_id, attempted_at.clone())
+            .await
+        {
+            Ok(conversation_id) => conversation_id,
+            Err(error) => {
+                return self
+                    .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                    .await;
+            }
+        };
+        if let Err(error) = self.send_exact(message.body).await {
+            return self
+                .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                .await;
+        }
+        let recorded = self
+            .workspace
+            .storage()
+            .mark_delivery_delivered(message.id, delivery.target_agent_id, attempted_at.clone())
+            .await;
+        match recorded {
+            Ok(true) => Ok(Some(AgentDirectMessageOutcome::Delivered(conversation_id))),
+            Ok(false) => {
+                self.persisted_failure(
+                    message.id,
+                    delivery.target_agent_id,
+                    attempted_at,
+                    DirectMessageError::Runtime(
+                        "Agent direct message delivery is no longer pending".into(),
+                    ),
+                )
+                .await
+            }
+            Err(error) => {
+                self.persisted_failure(
+                    message.id,
+                    delivery.target_agent_id,
+                    attempted_at,
+                    DirectMessageError::Runtime(error.to_string()),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -367,6 +500,60 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
             .await
             .map_err(runtime_error)?;
         self.finish_open(agent, conversation.id, messages, command.opened_at)
+            .await
+    }
+
+    async fn send_agent_message(
+        &mut self,
+        command: SendAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        self.ensure_delivery_target(command.target_agent_id)?;
+        if command.body.trim().is_empty() {
+            return Err(DirectMessageError::EmptyMessage);
+        }
+        let persisted = self
+            .workspace
+            .storage()
+            .persist_agent_direct_message(
+                command.message_id,
+                command.source_agent_id,
+                command.target_agent_id,
+                command.body,
+                command.sent_at.clone(),
+            )
+            .await
+            .map_err(runtime_error)?;
+        let Some((message, delivery)) = persisted else {
+            return Ok(None);
+        };
+        self.deliver_persisted(message, delivery, command.sent_at)
+            .await
+    }
+
+    async fn retry_agent_message(
+        &mut self,
+        command: RetryAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        self.ensure_delivery_target(command.target_agent_id)?;
+        let claimed = self
+            .workspace
+            .storage()
+            .claim_agent_direct_message_retry(
+                command.message_id,
+                command.target_agent_id,
+                command.retried_at.clone(),
+            )
+            .await;
+        let (message, delivery) = match claimed {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                return Ok(Some(AgentDirectMessageOutcome::PersistedFailed(
+                    runtime_error(error),
+                )));
+            }
+        };
+        self.deliver_persisted(message, delivery, command.retried_at)
             .await
     }
 

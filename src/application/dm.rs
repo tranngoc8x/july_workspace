@@ -1,6 +1,6 @@
 use crate::domain::{
-    AgentId, ConversationId, Message, PermissionOption, PermissionOutcome, SessionBindingId,
-    SessionBindingStatus,
+    AgentId, ConversationId, Message, MessageId, PermissionOption, PermissionOutcome,
+    SessionBindingId, SessionBindingStatus,
 };
 use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
@@ -18,6 +18,28 @@ pub struct OpenAgentDirectMessage {
     pub source_agent_id: AgentId,
     pub target_agent_id: AgentId,
     pub opened_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SendAgentDirectMessage {
+    pub message_id: MessageId,
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub body: String,
+    pub sent_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryAgentDirectMessage {
+    pub message_id: MessageId,
+    pub target_agent_id: AgentId,
+    pub retried_at: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum AgentDirectMessageOutcome {
+    Delivered(ConversationId),
+    PersistedFailed(DirectMessageError),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -100,6 +122,11 @@ pub enum DirectMessageError {
     PermissionRequestNotFound(String),
     #[error("agent completed an empty message")]
     EmptyAgentMessage,
+    #[error("delivery state recording failed: {primary}; FAILED recovery also failed: {recovery}")]
+    DeliveryStateRecoveryFailed {
+        primary: Box<DirectMessageError>,
+        recovery: Box<DirectMessageError>,
+    },
     #[error("direct message runtime failed: {0}")]
     Runtime(String),
 }
@@ -119,6 +146,24 @@ pub trait DirectMessageRuntime {
     ) -> Result<OpenedDirectMessage, DirectMessageError> {
         Err(DirectMessageError::Runtime(
             "agent direct messages are unsupported by this runtime".into(),
+        ))
+    }
+
+    async fn send_agent_message(
+        &mut self,
+        _command: SendAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        Err(DirectMessageError::Runtime(
+            "durable agent direct messages are unsupported by this runtime".into(),
+        ))
+    }
+
+    async fn retry_agent_message(
+        &mut self,
+        _command: RetryAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        Err(DirectMessageError::Runtime(
+            "durable agent direct messages are unsupported by this runtime".into(),
         ))
     }
 
@@ -230,6 +275,20 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
             })
             .await?;
         self.runtime.send_exact(content).await
+    }
+
+    pub async fn send_agent_message(
+        &mut self,
+        command: SendAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        self.runtime.send_agent_message(command).await
+    }
+
+    pub async fn retry_agent_message(
+        &mut self,
+        command: RetryAgentDirectMessage,
+    ) -> Result<Option<AgentDirectMessageOutcome>, DirectMessageError> {
+        self.runtime.retry_agent_message(command).await
     }
 
     pub async fn next_event(
