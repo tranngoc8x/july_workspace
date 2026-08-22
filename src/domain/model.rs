@@ -309,7 +309,11 @@ impl WorkItem {
     pub fn validate(&self) -> Result<(), DomainError> {
         require_text(&self.title, "work_item.title")?;
         require_text(&self.created_at, "work_item.created_at")?;
-        require_text(&self.updated_at, "work_item.updated_at")
+        require_text(&self.updated_at, "work_item.updated_at")?;
+        if self.status.is_terminal() != self.completed_at.is_some() {
+            return Err(DomainError::WorkCompletionTimestampMismatch);
+        }
+        Ok(())
     }
 }
 

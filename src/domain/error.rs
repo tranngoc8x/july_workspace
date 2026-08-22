@@ -20,6 +20,8 @@ pub enum DomainError {
     CapsuleDeliveryWithoutCapsule,
     #[error("delivered_at must be set exactly when delivery status is delivered")]
     DeliveryTimestampStatusMismatch,
+    #[error("completed_at must be set exactly when work status is terminal")]
+    WorkCompletionTimestampMismatch,
     #[error("permission option was not advertised: {0}")]
     PermissionOptionNotAdvertised(String),
     #[error("invalid {kind}: {value}")]

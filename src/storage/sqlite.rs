@@ -1114,7 +1114,7 @@ impl SqliteStore {
             transaction.commit()?;
             return Ok(work);
         }
-        if !work.status.can_transition_to(target) {
+        if target == WorkStatus::Ready || !work.status.can_transition_to(target) {
             return Err(StoreError::InvalidWorkTransition {
                 work_id,
                 from: work.status,

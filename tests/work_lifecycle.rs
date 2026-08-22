@@ -1,7 +1,7 @@
 use july_workspace::application::{AssignWorkOwner, TransitionWork, WorkError, WorkService};
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, Room, RoomId, WorkItem,
-    WorkItemId, WorkStatus,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, DomainError, Room, RoomId,
+    WorkItem, WorkItemId, WorkStatus,
 };
 use july_workspace::runtime::StorageWorker;
 use july_workspace::storage::SqliteStore;
@@ -181,6 +181,26 @@ fn phase4_primary_work_remains_open_and_unowned() {
     assert_eq!(work.completed_at, None);
 }
 
+#[test]
+fn work_validation_requires_completed_at_exactly_for_terminal_status() {
+    let database = TestDatabase::new();
+    let seeded = seed(database.path());
+    let mut work = read_work(database.path(), seeded.primary_work_id);
+
+    work.status = WorkStatus::Done;
+    assert_eq!(
+        work.validate(),
+        Err(DomainError::WorkCompletionTimestampMismatch)
+    );
+
+    work.status = WorkStatus::Working;
+    work.completed_at = Some(CHANGED.into());
+    assert_eq!(
+        work.validate(),
+        Err(DomainError::WorkCompletionTimestampMismatch)
+    );
+}
+
 #[tokio::test]
 async fn assigns_and_replaces_owner_for_primary_and_non_primary_work_with_exact_retry() {
     let database = TestDatabase::new();
@@ -309,7 +329,8 @@ async fn owner_validation_and_terminal_immutability_are_side_effect_free() {
 }
 
 #[tokio::test]
-async fn every_allowed_transition_persists_terminal_semantics_and_exact_retry_is_unchanged() {
+async fn every_directly_allowed_transition_persists_terminal_semantics_and_exact_retry_is_unchanged()
+ {
     let database = TestDatabase::new();
     let seeded = seed(database.path());
     let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
@@ -318,7 +339,6 @@ async fn every_allowed_transition_persists_terminal_semantics_and_exact_retry_is
         (WorkStatus::Open, WorkStatus::Blocked),
         (WorkStatus::Open, WorkStatus::Cancelled),
         (WorkStatus::Working, WorkStatus::Blocked),
-        (WorkStatus::Working, WorkStatus::Ready),
         (WorkStatus::Working, WorkStatus::Failed),
         (WorkStatus::Working, WorkStatus::Cancelled),
         (WorkStatus::Blocked, WorkStatus::Working),
@@ -358,6 +378,31 @@ async fn every_allowed_transition_persists_terminal_semantics_and_exact_retry_is
             .unwrap();
         assert_eq!(retried, transitioned);
     }
+}
+
+#[tokio::test]
+async fn direct_ready_transition_is_rejected_until_result_creation_can_be_atomic() {
+    let database = TestDatabase::new();
+    let seeded = seed(database.path());
+    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let working = insert_work(database.path(), conversation_id, WorkStatus::Working);
+    let mut service = WorkService::new(StorageWorker::open(database.path()).unwrap());
+
+    assert_eq!(
+        service
+            .transition(TransitionWork {
+                work_id: working.id,
+                target: WorkStatus::Ready,
+                transitioned_at: CHANGED.into(),
+            })
+            .await,
+        Err(WorkError::InvalidTransition {
+            work_id: working.id,
+            from: WorkStatus::Working,
+            to: WorkStatus::Ready,
+        })
+    );
+    assert_eq!(read_work(database.path(), working.id), working);
 }
 
 #[tokio::test]
