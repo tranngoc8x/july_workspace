@@ -69,7 +69,7 @@ fn seed_result(
             conversation_id: source.id,
             title: "Produce structured output".into(),
             goal: None,
-            status: WorkStatus::Working,
+            status: WorkStatus::Open,
             owner_agent_id: None,
             is_primary: false,
             created_at: CREATED.into(),
@@ -77,6 +77,9 @@ fn seed_result(
             completed_at: None,
         };
         store.insert_work_item(&work).unwrap();
+        store
+            .transition_work(work.id, WorkStatus::Working, CREATED)
+            .unwrap();
         work.id
     };
     let result = WorkResult {

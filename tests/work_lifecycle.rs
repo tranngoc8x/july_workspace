@@ -146,18 +146,57 @@ fn insert_work(path: &Path, conversation_id: ConversationId, status: WorkStatus)
         conversation_id,
         title: format!("{status} work"),
         goal: None,
-        status,
+        status: WorkStatus::Open,
         owner_agent_id: None,
         is_primary: false,
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
-        completed_at: status.is_terminal().then(|| CREATED.to_owned()),
+        completed_at: None,
     };
-    SqliteStore::open(path)
-        .unwrap()
-        .insert_work_item(&work)
-        .unwrap();
-    work
+    let mut store = SqliteStore::open(path).unwrap();
+    store.insert_work_item(&work).unwrap();
+    match status {
+        WorkStatus::Open => {}
+        WorkStatus::Working => {
+            store
+                .transition_work(work.id, WorkStatus::Working, CREATED)
+                .unwrap();
+        }
+        WorkStatus::Blocked | WorkStatus::Cancelled => {
+            store.transition_work(work.id, status, CREATED).unwrap();
+        }
+        WorkStatus::Failed => {
+            store
+                .transition_work(work.id, WorkStatus::Working, CREATED)
+                .unwrap();
+            store
+                .transition_work(work.id, WorkStatus::Failed, CREATED)
+                .unwrap();
+        }
+        WorkStatus::Ready | WorkStatus::Done => {
+            store
+                .transition_work(work.id, WorkStatus::Working, CREATED)
+                .unwrap();
+            store
+                .create_work_result(&july_workspace::domain::WorkResult {
+                    id: Default::default(),
+                    work_id: work.id,
+                    status: "accepted".into(),
+                    summary: "Lifecycle fixture".into(),
+                    outputs: Vec::new(),
+                    evidence: Vec::new(),
+                    supersedes_result_id: None,
+                    created_at: CREATED.into(),
+                })
+                .unwrap();
+            if status == WorkStatus::Done {
+                store
+                    .transition_work(work.id, WorkStatus::Done, CREATED)
+                    .unwrap();
+            }
+        }
+    }
+    store.get_work_item(work.id).unwrap().unwrap()
 }
 
 fn read_work(path: &Path, id: WorkItemId) -> WorkItem {
@@ -206,6 +245,41 @@ fn work_validation_requires_completed_at_exactly_for_terminal_status() {
         work.validate(),
         Err(DomainError::EmptyField("work_item.completed_at"))
     );
+}
+
+#[test]
+fn public_work_insert_accepts_only_open_unowned_non_primary_work() {
+    let database = TestDatabase::new();
+    let seeded = seed(database.path());
+    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let store = SqliteStore::open(database.path()).unwrap();
+    let mut work = WorkItem {
+        id: WorkItemId::new(),
+        conversation_id,
+        title: "Guard public insert".into(),
+        goal: None,
+        status: WorkStatus::Ready,
+        owner_agent_id: None,
+        is_primary: false,
+        created_at: CREATED.into(),
+        updated_at: CREATED.into(),
+        completed_at: None,
+    };
+
+    assert!(store.insert_work_item(&work).is_err());
+    assert_eq!(store.get_work_item(work.id).unwrap(), None);
+
+    work.id = WorkItemId::new();
+    work.status = WorkStatus::Open;
+    work.owner_agent_id = Some(seeded.member_id);
+    assert!(store.insert_work_item(&work).is_err());
+    assert_eq!(store.get_work_item(work.id).unwrap(), None);
+
+    work.id = WorkItemId::new();
+    work.owner_agent_id = None;
+    work.is_primary = true;
+    assert!(store.insert_work_item(&work).is_err());
+    assert_eq!(store.get_work_item(work.id).unwrap(), None);
 }
 
 #[tokio::test]

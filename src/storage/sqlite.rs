@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 9] = [
+const MIGRATIONS: [Migration; 10] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -48,6 +48,10 @@ const MIGRATIONS: [Migration; 9] = [
     Migration {
         version: 9,
         sql: include_str!("migrations/0009_dependency_result_invariant.sql"),
+    },
+    Migration {
+        version: 10,
+        sql: include_str!("migrations/0010_phase6_invariants.sql"),
     },
 ];
 
@@ -1099,6 +1103,14 @@ impl SqliteStore {
     }
 
     pub fn insert_work_item(&self, work_item: &WorkItem) -> Result<(), StoreError> {
+        if work_item.status != WorkStatus::Open
+            || work_item.owner_agent_id.is_some()
+            || work_item.is_primary
+        {
+            return Err(StoreError::InvalidStoredValue(
+                "public work insert must be non-primary, open, and unowned",
+            ));
+        }
         insert_work_item(&self.connection, work_item)
     }
 
@@ -1365,7 +1377,7 @@ impl SqliteStore {
                 "UPDATE work_dependencies
                  SET status = 'superseded', result_id = ?2
                  WHERE upstream_work_id = ?1
-                   AND status = 'satisfied'
+                   AND status IN ('satisfied', 'superseded')
                    AND result_id = ?3",
                 params![
                     result.work_id.to_string(),
@@ -2484,7 +2496,7 @@ fn current_schema_version(connection: &Connection) -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::{MIGRATIONS, Migration, SqliteStore, apply_migrations};
-    use crate::domain::{ConversationId, DomainError, ResultId, WorkItemId};
+    use crate::domain::{ConversationId, DomainError, PublishId, ResultId, WorkItemId};
     use crate::storage::StoreError;
     use rusqlite::{Connection, params};
     use std::env;
@@ -2543,11 +2555,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_nine() {
+    fn fresh_database_has_schema_version_ten() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
     }
 
     #[test]
@@ -2749,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn work_result_fts_tracks_insert_update_and_delete() {
+    fn work_result_fts_tracks_insert_and_immutable_rows_reject_mutation() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
         seed_conversation(&store.connection);
@@ -2788,20 +2800,22 @@ mod tests {
             1
         );
 
-        store
-            .connection
-            .execute(
-                "UPDATE work_results SET
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE work_results SET
                     summary = 'revisedsummary',
                     outputs_json = '[\"revisedoutput\"]',
                     evidence_json = '[\"revisedevidence\"]'
                  WHERE id = 'result-1'",
-                [],
-            )
-            .unwrap();
+                    [],
+                )
+                .is_err()
+        );
         assert_eq!(
             fts_count(&store.connection, "work_results_fts", "initialsummary"),
-            0
+            1
         );
         assert_eq!(
             fts_count(
@@ -2809,16 +2823,18 @@ mod tests {
                 "work_results_fts",
                 "revisedsummary revisedoutput revisedevidence"
             ),
-            1
+            0
         );
 
-        store
-            .connection
-            .execute("DELETE FROM work_results WHERE id = 'result-1'", [])
-            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute("DELETE FROM work_results WHERE id = 'result-1'", [])
+                .is_err()
+        );
         assert_eq!(
-            fts_count(&store.connection, "work_results_fts", "revisedsummary"),
-            0
+            fts_count(&store.connection, "work_results_fts", "initialsummary"),
+            1
         );
     }
 
@@ -2911,14 +2927,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            9
+            10
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            9
+            10
         );
     }
 
@@ -3397,7 +3413,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..9]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 9);
         let read = |upstream: &str, downstream: &str| {
@@ -3511,6 +3527,372 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn migration_ten_reconciles_phase_six_references_and_preserves_valid_rows() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..9]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO conversations(id, type, status, created_at, updated_at)
+                 VALUES ('conversation-2', 'dm', 'open', 'now', 'now');
+                 INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES
+                    ('ready-work', 'conversation-1', 'ready', 'ready', 'now', 'now'),
+                    ('working-work', 'conversation-1', 'working', 'working', 'now', 'now'),
+                    ('other-work', 'conversation-2', 'other', 'ready', 'now', 'now'),
+                    ('downstream-1', 'conversation-2', 'downstream 1', 'blocked', 'now', 'now'),
+                    ('downstream-2', 'conversation-2', 'downstream 2', 'blocked', 'now', 'now'),
+                    ('downstream-3', 'conversation-2', 'downstream 3', 'blocked', 'now', 'now');
+                 INSERT INTO work_results(
+                    id, work_id, status, summary, supersedes_result_id, created_at
+                 ) VALUES
+                    ('prior-result', 'ready-work', 'accepted', 'prior', NULL, 'now'),
+                    ('valid-result', 'ready-work', 'accepted', 'valid', 'prior-result', 'now'),
+                    ('working-result', 'working-work', 'accepted', 'working', NULL, 'now'),
+                    ('self-result', 'ready-work', 'accepted', 'self', 'self-result', 'now'),
+                    ('cross-result', 'other-work', 'accepted', 'cross', 'valid-result', 'now');
+                 INSERT INTO publishes(
+                    id, result_id, source_conversation_id, target_conversation_id, created_at
+                 ) VALUES
+                    ('valid-publish', 'valid-result', 'conversation-1', 'conversation-2', 'now'),
+                    ('false-publish', 'working-result', 'conversation-2', 'conversation-1', 'now');
+                 INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type,
+                    status, result_id, created_at
+                 ) VALUES
+                    ('ready-work', 'downstream-1', 'requires', 'waiting', NULL, 'now'),
+                    ('working-work', 'downstream-2', 'requires', 'waiting', NULL, 'now'),
+                    ('other-work', 'downstream-3', 'requires', 'waiting', NULL, 'now');
+                 UPDATE work_dependencies
+                 SET status = 'satisfied', result_id = 'valid-result'
+                 WHERE upstream_work_id = 'ready-work';
+                 UPDATE work_dependencies
+                 SET status = 'superseded', result_id = 'working-result'
+                 WHERE upstream_work_id = 'working-work';
+                 DROP TRIGGER work_dependency_result_update_guard;
+                 UPDATE work_dependencies
+                 SET status = 'satisfied', result_id = 'valid-result'
+                 WHERE upstream_work_id = 'other-work';
+                 CREATE TRIGGER work_dependency_result_update_guard
+                 BEFORE UPDATE OF upstream_work_id, status, result_id ON work_dependencies
+                 WHEN NOT (
+                    (NEW.status IN ('waiting', 'failed') AND NEW.result_id IS NULL)
+                    OR (
+                        NEW.status IN ('satisfied', 'superseded')
+                        AND NEW.result_id IS NOT NULL
+                        AND EXISTS (
+                            SELECT 1 FROM work_results
+                            WHERE work_results.id = NEW.result_id
+                              AND work_results.work_id = NEW.upstream_work_id
+                        )
+                    )
+                 )
+                 BEGIN
+                    SELECT RAISE(ABORT, 'work dependency result does not match status or upstream work');
+                 END;",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 10);
+        for (id, expected) in [
+            ("valid-result", Some("prior-result")),
+            ("self-result", None),
+            ("cross-result", None),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT supersedes_result_id FROM work_results WHERE id = ?1",
+                        [id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .unwrap()
+                    .as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_conversation_id FROM publishes WHERE id = 'valid-publish'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "conversation-1"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_conversation_id FROM publishes WHERE id = 'false-publish'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "conversation-1"
+        );
+        let dependency = |upstream: &str| {
+            connection
+                .query_row(
+                    "SELECT status, result_id FROM work_dependencies WHERE upstream_work_id = ?1",
+                    [upstream],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            dependency("ready-work"),
+            ("satisfied".into(), Some("valid-result".into()))
+        );
+        for upstream in ["working-work", "other-work"] {
+            assert_eq!(dependency(upstream), ("waiting".into(), None));
+        }
+    }
+
+    #[test]
+    fn migration_ten_guards_raw_phase_six_mutations() {
+        let database = TestDatabase::new();
+        let store = SqliteStore::open(database.path()).unwrap();
+        seed_conversation(&store.connection);
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO conversations(id, type, status, created_at, updated_at)
+                 VALUES ('conversation-2', 'dm', 'open', 'now', 'now');
+                 INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES
+                    ('ready-work', 'conversation-1', 'ready', 'ready', 'now', 'now'),
+                    ('working-work', 'conversation-1', 'working', 'working', 'now', 'now'),
+                    ('other-work', 'conversation-2', 'other', 'ready', 'now', 'now'),
+                    ('downstream-1', 'conversation-2', 'downstream 1', 'blocked', 'now', 'now'),
+                    ('downstream-2', 'conversation-2', 'downstream 2', 'blocked', 'now', 'now');
+                 INSERT INTO work_results(id, work_id, status, summary, created_at) VALUES
+                    ('prior-result', 'ready-work', 'accepted', 'prior', 'now'),
+                    ('delete-result', 'ready-work', 'accepted', 'delete', 'now'),
+                    ('working-result', 'working-work', 'accepted', 'working', 'now');",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE work_results SET summary = 'changed' WHERE id = 'prior-result'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute("DELETE FROM work_results WHERE id = 'delete-result'", [])
+                .is_err()
+        );
+        for (id, work_id, supersedes) in [
+            ("self-result", "ready-work", "self-result"),
+            ("cross-result", "other-work", "prior-result"),
+            ("missing-result", "ready-work", "absent-result"),
+        ] {
+            assert!(
+                store
+                    .connection
+                    .execute(
+                        "INSERT INTO work_results(
+                            id, work_id, status, summary, supersedes_result_id, created_at
+                         ) VALUES (?1, ?2, 'accepted', 'invalid', ?3, 'now')",
+                        params![id, work_id, supersedes],
+                    )
+                    .is_err(),
+                "accepted invalid supersede {id}"
+            );
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO work_results(
+                    id, work_id, status, summary, supersedes_result_id, created_at
+                 ) VALUES ('valid-result', 'ready-work', 'accepted', 'valid', 'prior-result', 'now')",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO publishes(
+                        id, result_id, source_conversation_id, target_conversation_id, created_at
+                     ) VALUES (
+                        'false-publish', 'valid-result', 'conversation-2', 'conversation-1', 'now'
+                     )",
+                    [],
+                )
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO publishes(
+                    id, result_id, source_conversation_id, target_conversation_id, created_at
+                 ) VALUES (
+                    'valid-publish', 'valid-result', 'conversation-1', 'conversation-2', 'now'
+                 )",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE publishes SET source_conversation_id = 'conversation-2'
+                     WHERE id = 'valid-publish'",
+                    [],
+                )
+                .is_err()
+        );
+
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type,
+                    status, result_id, created_at
+                 ) VALUES
+                    ('ready-work', 'downstream-1', 'requires', 'waiting', NULL, 'now'),
+                    ('working-work', 'downstream-2', 'requires', 'waiting', NULL, 'now');
+                 UPDATE work_dependencies
+                 SET status = 'satisfied', result_id = 'valid-result'
+                 WHERE upstream_work_id = 'ready-work';",
+            )
+            .unwrap();
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE work_dependencies
+                     SET status = 'satisfied', result_id = 'working-result'
+                     WHERE upstream_work_id = 'working-work'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE work_items SET status = 'working' WHERE id = 'ready-work'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_migration_ten_leaves_version_nine_without_partial_guards_or_repairs() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..9]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(id, conversation_id, title, status, created_at, updated_at)
+                 VALUES ('work-1', 'conversation-1', 'work', 'ready', 'now', 'now');
+                 INSERT INTO work_results(
+                    id, work_id, status, summary, supersedes_result_id, created_at
+                 ) VALUES ('self-result', 'work-1', 'accepted', 'self', 'self-result', 'now');
+                 CREATE TRIGGER publishes_source_insert_guard
+                 BEFORE INSERT ON publishes BEGIN SELECT 1; END;",
+            )
+            .unwrap();
+
+        assert!(apply_migrations(&mut connection, &MIGRATIONS).is_err());
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 9);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT supersedes_result_id FROM work_results WHERE id = 'self-result'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .as_deref(),
+            Some("self-result")
+        );
+        for trigger in ["work_results_no_update", "work_results_no_delete"] {
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                        [trigger],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+                "migration leaked trigger {trigger}"
+            );
+        }
+    }
+
+    #[test]
+    fn work_result_and_publish_hydration_validate_domain_records() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..9]).unwrap();
+        let conversation_id = ConversationId::new();
+        let target_id = ConversationId::new();
+        let work_id = WorkItemId::new();
+        let invalid_result_id = ResultId::new();
+        let valid_result_id = ResultId::new();
+        let publish_id = PublishId::new();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO conversations(id, type, status, created_at, updated_at) VALUES
+                    ('{conversation_id}', 'dm', 'open', 'now', 'now'),
+                    ('{target_id}', 'dm', 'open', 'now', 'now');
+                 INSERT INTO work_items(id, conversation_id, title, status, created_at, updated_at)
+                 VALUES ('{work_id}', '{conversation_id}', 'work', 'ready', 'now', 'now');
+                 INSERT INTO work_results(id, work_id, status, summary, created_at) VALUES
+                    ('{invalid_result_id}', '{work_id}', char(160), 'invalid', 'now'),
+                    ('{valid_result_id}', '{work_id}', 'accepted', 'valid', 'now');
+                 INSERT INTO publishes(
+                    id, result_id, source_conversation_id, target_conversation_id, created_at
+                 ) VALUES (
+                    '{publish_id}', '{valid_result_id}', '{conversation_id}', '{target_id}', char(160)
+                 );"
+            ))
+            .unwrap();
+        let store = SqliteStore { connection };
+
+        assert!(matches!(
+            store.get_work_result(invalid_result_id),
+            Err(StoreError::Domain(DomainError::EmptyField(
+                "work_result.status"
+            )))
+        ));
+        assert!(matches!(
+            store.get_publish(publish_id),
+            Err(StoreError::Domain(DomainError::EmptyField(
+                "publish.created_at"
+            )))
+        ));
     }
 
     #[test]
@@ -3709,15 +4091,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (10);",
+                 INSERT INTO schema_migrations(version) VALUES (11);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 10,
-                supported: 9,
+                found: 11,
+                supported: 10,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

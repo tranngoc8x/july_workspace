@@ -40,11 +40,11 @@ impl Drop for TestDatabase {
     }
 }
 
-fn seed_work(store: &SqliteStore, title: &str) -> WorkItem {
+fn seed_work(store: &mut SqliteStore, title: &str) -> WorkItem {
     seed_work_with_status(store, title, WorkStatus::Open)
 }
 
-fn seed_work_with_status(store: &SqliteStore, title: &str, status: WorkStatus) -> WorkItem {
+fn seed_work_with_status(store: &mut SqliteStore, title: &str, status: WorkStatus) -> WorkItem {
     let conversation = Conversation {
         id: ConversationId::new(),
         kind: ConversationKind::Dm,
@@ -62,16 +62,20 @@ fn seed_work_with_status(store: &SqliteStore, title: &str, status: WorkStatus) -
         conversation_id: conversation.id,
         title: title.into(),
         goal: None,
-        status,
+        status: WorkStatus::Open,
         owner_agent_id: None,
         is_primary: false,
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
-        completed_at: status.is_terminal().then(|| CREATED.into()),
+        completed_at: None,
     };
     store.insert_conversation(&conversation).unwrap();
     store.insert_work_item(&work).unwrap();
-    work
+    if status == WorkStatus::Open {
+        work
+    } else {
+        store.transition_work(work.id, status, CREATED).unwrap()
+    }
 }
 
 fn work_result(
@@ -151,10 +155,10 @@ fn install_dependency_transition_failure(path: &Path, status: &str) {
 async fn add_starts_waiting_and_exact_retry_lists_one_downstream_outcome() {
     let database = TestDatabase::new();
     let (upstream, downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work(&store, "Prerequisite"),
-            seed_work(&store, "Consumer"),
+            seed_work(&mut store, "Prerequisite"),
+            seed_work(&mut store, "Consumer"),
         )
     };
     let command = dependency(upstream.id, downstream.id);
@@ -191,11 +195,11 @@ async fn add_starts_waiting_and_exact_retry_lists_one_downstream_outcome() {
 async fn add_rejects_missing_self_and_cyclic_edges_without_partial_rows() {
     let database = TestDatabase::new();
     let (first, second, third) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work(&store, "First"),
-            seed_work(&store, "Second"),
-            seed_work(&store, "Third"),
+            seed_work(&mut store, "First"),
+            seed_work(&mut store, "Second"),
+            seed_work(&mut store, "Third"),
         )
     };
     let missing = WorkItemId::new();
@@ -239,13 +243,13 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
  {
     let database = TestDatabase::new();
     let (upstream, downstream, unrelated_upstream, unrelated_downstream, messages) = {
-        let store = SqliteStore::open(database.path()).unwrap();
-        let upstream = seed_work_with_status(&store, "Prerequisite", WorkStatus::Working);
-        let downstream = seed_work_with_status(&store, "Consumer", WorkStatus::Blocked);
+        let mut store = SqliteStore::open(database.path()).unwrap();
+        let upstream = seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working);
+        let downstream = seed_work_with_status(&mut store, "Consumer", WorkStatus::Blocked);
         let unrelated_upstream =
-            seed_work_with_status(&store, "Other prerequisite", WorkStatus::Working);
+            seed_work_with_status(&mut store, "Other prerequisite", WorkStatus::Working);
         let unrelated_downstream =
-            seed_work_with_status(&store, "Other consumer", WorkStatus::Blocked);
+            seed_work_with_status(&mut store, "Other consumer", WorkStatus::Blocked);
         let messages = [
             Message {
                 id: MessageId::new(),
@@ -382,12 +386,12 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
 async fn failed_work_marks_only_waiting_outgoing_edges_failed_and_exact_retry_is_a_noop() {
     let database = TestDatabase::new();
     let (upstream, downstream, unrelated_upstream, unrelated_downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work_with_status(&store, "Prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "Consumer", WorkStatus::Blocked),
-            seed_work_with_status(&store, "Other prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "Other consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "Consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Other prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "Other consumer", WorkStatus::Blocked),
         )
     };
     add_dependency(database.path(), upstream.id, downstream.id).await;
@@ -442,16 +446,22 @@ async fn failed_work_marks_only_waiting_outgoing_edges_failed_and_exact_retry_is
 async fn correction_supersedes_only_satisfied_edges_and_new_edges_still_start_waiting() {
     let database = TestDatabase::new();
     let (upstream, first_downstream, later_downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work_with_status(&store, "Prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "First consumer", WorkStatus::Blocked),
-            seed_work_with_status(&store, "Later consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "First consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Later consumer", WorkStatus::Blocked),
         )
     };
     add_dependency(database.path(), upstream.id, first_downstream.id).await;
     let first = work_result(upstream.id, ResultId::new(), None, READY_AT);
     let correction = work_result(upstream.id, ResultId::new(), Some(first.id), CORRECTED_AT);
+    let final_correction = work_result(
+        upstream.id,
+        ResultId::new(),
+        Some(correction.id),
+        "2026-08-22T12:00:00Z",
+    );
     let mut service = WorkService::new(StorageWorker::open(database.path()).unwrap());
     service
         .create_result(CreateWorkResult {
@@ -469,10 +479,16 @@ async fn correction_supersedes_only_satisfied_edges_and_new_edges_still_start_wa
         })
         .await
         .unwrap();
+    service
+        .create_result(CreateWorkResult {
+            result: final_correction.clone(),
+        })
+        .await
+        .unwrap();
 
     let superseded = read_dependency(database.path(), upstream.id, first_downstream.id).unwrap();
     assert_eq!(superseded.status, DependencyStatus::Superseded);
-    assert_eq!(superseded.result_id, Some(correction.id));
+    assert_eq!(superseded.result_id, Some(final_correction.id));
     let waiting = read_dependency(database.path(), upstream.id, later_downstream.id).unwrap();
     assert_eq!(waiting.status, DependencyStatus::Waiting);
     assert_eq!(waiting.result_id, None);
@@ -497,7 +513,7 @@ async fn correction_supersedes_only_satisfied_edges_and_new_edges_still_start_wa
             .unwrap(),
         vec![DependencyOutcome {
             dependency: superseded,
-            result: Some(correction),
+            result: Some(final_correction),
         }]
     );
 }
@@ -506,10 +522,10 @@ async fn correction_supersedes_only_satisfied_edges_and_new_edges_still_start_wa
 async fn satisfied_dependency_failure_rolls_back_work_result_and_edge() {
     let database = TestDatabase::new();
     let (upstream, downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work_with_status(&store, "Prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "Consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "Consumer", WorkStatus::Blocked),
         )
     };
     add_dependency(database.path(), upstream.id, downstream.id).await;
@@ -536,10 +552,10 @@ async fn satisfied_dependency_failure_rolls_back_work_result_and_edge() {
 async fn failed_dependency_failure_rolls_back_work_and_edge() {
     let database = TestDatabase::new();
     let (upstream, downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work_with_status(&store, "Prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "Consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "Consumer", WorkStatus::Blocked),
         )
     };
     add_dependency(database.path(), upstream.id, downstream.id).await;
@@ -566,10 +582,10 @@ async fn failed_dependency_failure_rolls_back_work_and_edge() {
 async fn superseded_dependency_failure_rolls_back_replacement_result_and_edge() {
     let database = TestDatabase::new();
     let (upstream, downstream) = {
-        let store = SqliteStore::open(database.path()).unwrap();
+        let mut store = SqliteStore::open(database.path()).unwrap();
         (
-            seed_work_with_status(&store, "Prerequisite", WorkStatus::Working),
-            seed_work_with_status(&store, "Consumer", WorkStatus::Blocked),
+            seed_work_with_status(&mut store, "Prerequisite", WorkStatus::Working),
+            seed_work_with_status(&mut store, "Consumer", WorkStatus::Blocked),
         )
     };
     add_dependency(database.path(), upstream.id, downstream.id).await;

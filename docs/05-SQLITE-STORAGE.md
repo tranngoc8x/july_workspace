@@ -178,6 +178,9 @@ CREATE TABLE work_dependencies (
   upstream_work_id TEXT NOT NULL REFERENCES work_items(id),
   downstream_work_id TEXT NOT NULL REFERENCES work_items(id),
   dependency_type TEXT NOT NULL DEFAULT 'requires',
+  status TEXT NOT NULL DEFAULT 'waiting'
+    CHECK (status IN ('waiting', 'satisfied', 'failed', 'superseded')),
+  result_id TEXT REFERENCES work_results(id),
   created_at TEXT NOT NULL,
   PRIMARY KEY(upstream_work_id, downstream_work_id)
 );
@@ -493,6 +496,27 @@ table already referenced by dependencies and results. Existing WorkItems
 migrate with `is_primary = 0`; July does not infer historical primary
 ownership. The aggregate Phase 4 create operation is responsible for inserting
 one primary WorkItem for every new Thread.
+
+### Phase 6 migrations `0005` through `0010`
+
+Phase 6 adds dependency status and the optional structured Result reference.
+New public Work inserts are non-primary, `open`, and unowned; ownership,
+lifecycle transitions, and the first Result/`ready` transition use their
+guarded operations.
+
+`0010_phase6_invariants.sql` reconciles legacy rows before installing guards:
+
+- invalid self/cross-Work Result correction links are cleared;
+- Publish source is re-derived from Result -> Work -> Conversation;
+- `satisfied`/`superseded` dependency rows become `waiting` without a Result
+  unless the Result belongs to the upstream Work and that Work is `ready` or
+  `done`.
+
+After migration, WorkResults are append-only. A correction must reference an
+existing different Result from the same Work. Publish source remains derived,
+and a consumable dependency cannot outlive the matching upstream
+Result/`ready|done` state. The migration and its schema-version record commit
+atomically.
 
 Phase 5.4 message delivery is at-least-once. A crash after transport accepts a
 message but before SQLite records `delivered` can cause an explicit retry to

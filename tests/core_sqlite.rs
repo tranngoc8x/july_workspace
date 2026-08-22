@@ -155,12 +155,12 @@ fn full_graph_round_trips_after_reopen() {
         conversation_id: thread.id,
         title: "Review storage".into(),
         goal: None,
-        status: WorkStatus::Done,
+        status: WorkStatus::Open,
         owner_agent_id: None,
         is_primary: false,
         created_at: CREATED.into(),
-        updated_at: LATER.into(),
-        completed_at: Some(LATER.into()),
+        updated_at: CREATED.into(),
+        completed_at: None,
     };
     let first_result = WorkResult {
         id: Default::default(),

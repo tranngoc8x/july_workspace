@@ -54,17 +54,23 @@ fn seed_work(path: &Path, status: WorkStatus) -> WorkItem {
         conversation_id: conversation.id,
         title: "Produce structured output".into(),
         goal: None,
-        status,
+        status: WorkStatus::Open,
         owner_agent_id: None,
         is_primary: false,
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
-        completed_at: status.is_terminal().then(|| CREATED.into()),
+        completed_at: None,
     };
-    let store = SqliteStore::open(path).unwrap();
+    let mut store = SqliteStore::open(path).unwrap();
     store.insert_conversation(&conversation).unwrap();
     store.insert_work_item(&work).unwrap();
-    work
+    if status == WorkStatus::Working {
+        store
+            .transition_work(work.id, WorkStatus::Working, CREATED)
+            .unwrap()
+    } else {
+        work
+    }
 }
 
 fn work_result(

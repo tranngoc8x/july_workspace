@@ -170,7 +170,7 @@ pub(super) fn work_dependency(row: &Row<'_>) -> Result<WorkDependency, StoreErro
 }
 
 pub(super) fn work_result(row: &Row<'_>) -> Result<WorkResult, StoreError> {
-    Ok(WorkResult {
+    let result = WorkResult {
         id: id(row.get(0)?)?,
         work_id: id(row.get(1)?)?,
         status: row.get(2)?,
@@ -179,17 +179,21 @@ pub(super) fn work_result(row: &Row<'_>) -> Result<WorkResult, StoreError> {
         evidence: string_vec(row.get(5)?)?,
         supersedes_result_id: optional_id(row.get(6)?)?,
         created_at: row.get(7)?,
-    })
+    };
+    result.validate()?;
+    Ok(result)
 }
 
 pub(super) fn publish(row: &Row<'_>) -> Result<Publish, StoreError> {
-    Ok(Publish {
+    let publish = Publish {
         id: id(row.get(0)?)?,
         result_id: id(row.get(1)?)?,
         source_conversation_id: id(row.get(2)?)?,
         target_conversation_id: id(row.get(3)?)?,
         created_at: row.get(4)?,
-    })
+    };
+    publish.validate()?;
+    Ok(publish)
 }
 
 pub(super) fn session_binding(row: &Row<'_>) -> Result<SessionBinding, StoreError> {
