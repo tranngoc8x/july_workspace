@@ -4482,6 +4482,17 @@ mod tests {
         insert_raw_binding(&store.connection, "source-2", 3, "lost");
         insert_raw_binding(&store.connection, "replacement-2", 4, "lost");
 
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_recoveries(
+                        session_binding_id, source_binding_id, capsule, created_at
+                     ) VALUES (NULL, 'source-2', 'capsule', 'created')",
+                    [],
+                )
+                .is_err()
+        );
         store
             .connection
             .execute(

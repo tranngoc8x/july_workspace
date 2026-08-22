@@ -1,5 +1,5 @@
 CREATE TABLE session_recoveries (
-    session_binding_id TEXT PRIMARY KEY REFERENCES session_bindings(id),
+    session_binding_id TEXT PRIMARY KEY NOT NULL REFERENCES session_bindings(id),
     source_binding_id TEXT NOT NULL UNIQUE REFERENCES session_bindings(id),
     capsule TEXT NOT NULL CHECK (trim(capsule) <> ''),
     capsule_delivered_at TEXT CHECK (
