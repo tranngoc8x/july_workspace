@@ -1,12 +1,13 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState, WorkError,
-    WorkRuntime,
+    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState, PublishError,
+    PublishRuntime, PublishedResult, WorkError, WorkRuntime,
 };
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
-    MessageId, PermissionDecision, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    MessageId, PermissionDecision, Publish, PublishId, ResultId, Room, RoomId, RoomMember,
+    SessionBinding, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId, WorkResult,
+    WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -41,6 +42,14 @@ enum Command {
     AssignWorkOwner(WorkItemId, AgentId, String, Reply<WorkItem>),
     TransitionWork(WorkItemId, WorkStatus, String, Reply<WorkItem>),
     CreateWorkResult(WorkResult, Reply<WorkResult>),
+    PublishResult(
+        PublishId,
+        ResultId,
+        ConversationId,
+        String,
+        Reply<(Publish, WorkResult)>,
+    ),
+    ListPublishedResults(ConversationId, Reply<Vec<(Publish, WorkResult)>>),
     AdmitThreadSession(
         ConversationId,
         AgentId,
@@ -456,6 +465,21 @@ impl StorageHandle {
             .map_err(|_| WorkError::Runtime("storage owner channel closed".into()))?
             .map_err(map_work_error)
     }
+
+    async fn publish_request<R>(
+        &self,
+        build: impl FnOnce(Reply<R>) -> Command,
+    ) -> Result<R, PublishError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| PublishError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| PublishError::Runtime("storage owner channel closed".into()))?
+            .map_err(map_publish_error)
+    }
 }
 
 impl std::ops::Deref for StorageWorker {
@@ -635,6 +659,37 @@ impl WorkRuntime for StorageWorker {
     }
 }
 
+impl PublishRuntime for StorageWorker {
+    async fn publish_result(
+        &mut self,
+        publish_id: PublishId,
+        result_id: ResultId,
+        target_conversation_id: ConversationId,
+        published_at: String,
+    ) -> Result<PublishedResult, PublishError> {
+        self.publish_request(|reply| {
+            Command::PublishResult(
+                publish_id,
+                result_id,
+                target_conversation_id,
+                published_at,
+                reply,
+            )
+        })
+        .await
+        .map(PublishedResult::from)
+    }
+
+    async fn list_published_results(
+        &mut self,
+        target_conversation_id: ConversationId,
+    ) -> Result<Vec<PublishedResult>, PublishError> {
+        self.publish_request(|reply| Command::ListPublishedResults(target_conversation_id, reply))
+            .await
+            .map(|results| results.into_iter().map(PublishedResult::from).collect())
+    }
+}
+
 impl Drop for StorageWorker {
     fn drop(&mut self) {
         if self.thread.is_some() {
@@ -715,6 +770,23 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::CreateWorkResult(result, reply) => {
                 let _ = reply.send(store.create_work_result(&result));
+            }
+            Command::PublishResult(
+                publish_id,
+                result_id,
+                target_conversation_id,
+                published_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.publish_result(
+                    publish_id,
+                    result_id,
+                    target_conversation_id,
+                    &published_at,
+                ));
+            }
+            Command::ListPublishedResults(target_conversation_id, reply) => {
+                let _ = reply.send(store.list_published_results(target_conversation_id));
             }
             Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply) => {
                 let _ = reply.send(store.admit_thread_session(thread_id, agent_id, &admitted_at));
@@ -903,5 +975,18 @@ fn map_work_error(error: StoreError) -> WorkError {
             supersedes_result_id,
         },
         error => WorkError::Runtime(error.to_string()),
+    }
+}
+
+fn map_publish_error(error: StoreError) -> PublishError {
+    match error {
+        StoreError::PublishResultNotFound(id) => PublishError::ResultNotFound(id),
+        StoreError::WorkItemNotFound(id) => PublishError::WorkNotFound(id),
+        StoreError::PublishSourceNotFound(id) => PublishError::SourceNotFound(id),
+        StoreError::PublishTargetNotFound(id) => PublishError::TargetNotFound(id),
+        StoreError::PublishSourceEqualsTarget(id) => PublishError::SourceEqualsTarget(id),
+        StoreError::PublishIdConflict(id) => PublishError::PublishIdConflict(id),
+        StoreError::InvalidPublishTimestamp => PublishError::InvalidTimestamp,
+        error => PublishError::Runtime(error.to_string()),
     }
 }

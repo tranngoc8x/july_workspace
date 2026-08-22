@@ -43,7 +43,7 @@ const MIGRATIONS: [Migration; 7] = [
     },
 ];
 
-/// Durable SQLite access which keeps Work Result lifecycle writes guarded.
+/// Durable SQLite access which keeps Work Result lifecycle and Publish writes guarded.
 ///
 /// Result rows cannot be inserted without their lifecycle transaction:
 ///
@@ -53,6 +53,17 @@ const MIGRATIONS: [Migration; 7] = [
 ///     result: &july_workspace::domain::WorkResult,
 /// ) {
 ///     store.insert_work_result(result).unwrap();
+/// }
+/// ```
+///
+/// Publish source cannot be supplied through a raw insert:
+///
+/// ```compile_fail
+/// fn bypass(
+///     store: &july_workspace::storage::SqliteStore,
+///     publish: &july_workspace::domain::Publish,
+/// ) {
+///     store.insert_publish(publish).unwrap();
 /// }
 /// ```
 pub struct SqliteStore {
@@ -306,14 +317,7 @@ impl SqliteStore {
     }
 
     pub fn get_conversation(&self, id: ConversationId) -> Result<Option<Conversation>, StoreError> {
-        query_optional(
-            &self.connection,
-            "SELECT id, type, room_id, title, goal, parent_conversation_id,
-                    origin_conversation_id, status, created_at, updated_at
-             FROM conversations WHERE id = ?1",
-            params![id.to_string()],
-            records::conversation,
-        )
+        get_conversation(&self.connection, id)
     }
 
     pub fn get_thread(&self, id: ConversationId) -> Result<Option<Conversation>, StoreError> {
@@ -1249,31 +1253,96 @@ impl SqliteStore {
         Ok(result.clone())
     }
 
-    pub fn insert_publish(&self, publish: &Publish) -> Result<(), StoreError> {
-        publish.validate()?;
-        self.connection.execute(
-            "INSERT INTO publishes(
-                id, result_id, source_conversation_id, target_conversation_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                publish.id.to_string(),
-                publish.result_id.to_string(),
-                publish.source_conversation_id.to_string(),
-                publish.target_conversation_id.to_string(),
-                publish.created_at,
-            ],
-        )?;
-        Ok(())
+    pub fn publish_result(
+        &mut self,
+        publish_id: PublishId,
+        result_id: ResultId,
+        target_conversation_id: ConversationId,
+        published_at: &str,
+    ) -> Result<(Publish, WorkResult), StoreError> {
+        if published_at.trim().is_empty() {
+            return Err(StoreError::InvalidPublishTimestamp);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        if let Some(stored) = get_publish(&transaction, publish_id)? {
+            if stored.result_id != result_id
+                || stored.target_conversation_id != target_conversation_id
+            {
+                return Err(StoreError::PublishIdConflict(publish_id));
+            }
+            let result = get_work_result(&transaction, stored.result_id)?
+                .ok_or(StoreError::PublishResultNotFound(stored.result_id))?;
+            transaction.commit()?;
+            return Ok((stored, result));
+        }
+
+        if let Some(stored) =
+            get_publish_by_natural_key(&transaction, result_id, target_conversation_id)?
+        {
+            let result = get_work_result(&transaction, stored.result_id)?
+                .ok_or(StoreError::PublishResultNotFound(stored.result_id))?;
+            transaction.commit()?;
+            return Ok((stored, result));
+        }
+
+        let result = get_work_result(&transaction, result_id)?
+            .ok_or(StoreError::PublishResultNotFound(result_id))?;
+        let work = require_work_item(&transaction, result.work_id)?;
+        let source_conversation_id = work.conversation_id;
+        if get_conversation(&transaction, source_conversation_id)?.is_none() {
+            return Err(StoreError::PublishSourceNotFound(source_conversation_id));
+        }
+        if get_conversation(&transaction, target_conversation_id)?.is_none() {
+            return Err(StoreError::PublishTargetNotFound(target_conversation_id));
+        }
+        if source_conversation_id == target_conversation_id {
+            return Err(StoreError::PublishSourceEqualsTarget(
+                source_conversation_id,
+            ));
+        }
+
+        let publish = Publish {
+            id: publish_id,
+            result_id,
+            source_conversation_id,
+            target_conversation_id,
+            created_at: published_at.into(),
+        };
+        insert_publish(&transaction, &publish)?;
+        transaction.commit()?;
+        Ok((publish, result))
     }
 
     pub fn get_publish(&self, id: PublishId) -> Result<Option<Publish>, StoreError> {
-        query_optional(
+        get_publish(&self.connection, id)
+    }
+
+    pub fn list_published_results(
+        &self,
+        target_conversation_id: ConversationId,
+    ) -> Result<Vec<(Publish, WorkResult)>, StoreError> {
+        if get_conversation(&self.connection, target_conversation_id)?.is_none() {
+            return Err(StoreError::PublishTargetNotFound(target_conversation_id));
+        }
+        query_all(
             &self.connection,
             "SELECT id, result_id, source_conversation_id, target_conversation_id, created_at
-             FROM publishes WHERE id = ?1",
-            params![id.to_string()],
+             FROM publishes
+             WHERE target_conversation_id = ?1
+             ORDER BY created_at, id",
+            params![target_conversation_id.to_string()],
             records::publish,
-        )
+        )?
+        .into_iter()
+        .map(|publish| {
+            let result = get_work_result(&self.connection, publish.result_id)?
+                .ok_or(StoreError::PublishResultNotFound(publish.result_id))?;
+            Ok((publish, result))
+        })
+        .collect()
     }
 
     pub fn insert_session_binding(&self, binding: &SessionBinding) -> Result<(), StoreError> {
@@ -1846,6 +1915,20 @@ fn get_work_item(
     )
 }
 
+fn get_conversation(
+    connection: &Connection,
+    conversation_id: ConversationId,
+) -> Result<Option<Conversation>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, type, room_id, title, goal, parent_conversation_id,
+                origin_conversation_id, status, created_at, updated_at
+         FROM conversations WHERE id = ?1",
+        params![conversation_id.to_string()],
+        records::conversation,
+    )
+}
+
 fn get_work_result(
     connection: &Connection,
     result_id: ResultId,
@@ -1857,6 +1940,34 @@ fn get_work_result(
          FROM work_results WHERE id = ?1",
         params![result_id.to_string()],
         records::work_result,
+    )
+}
+
+fn get_publish(
+    connection: &Connection,
+    publish_id: PublishId,
+) -> Result<Option<Publish>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, result_id, source_conversation_id, target_conversation_id, created_at
+         FROM publishes WHERE id = ?1",
+        params![publish_id.to_string()],
+        records::publish,
+    )
+}
+
+fn get_publish_by_natural_key(
+    connection: &Connection,
+    result_id: ResultId,
+    target_conversation_id: ConversationId,
+) -> Result<Option<Publish>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, result_id, source_conversation_id, target_conversation_id, created_at
+         FROM publishes
+         WHERE result_id = ?1 AND target_conversation_id = ?2",
+        params![result_id.to_string(), target_conversation_id.to_string()],
+        records::publish,
     )
 }
 
@@ -1911,6 +2022,23 @@ fn insert_work_result(connection: &Connection, result: &WorkResult) -> Result<()
             serde_json::to_string(&result.evidence)?,
             result.supersedes_result_id.map(|id| id.to_string()),
             result.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_publish(connection: &Connection, publish: &Publish) -> Result<(), StoreError> {
+    publish.validate()?;
+    connection.execute(
+        "INSERT INTO publishes(
+            id, result_id, source_conversation_id, target_conversation_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            publish.id.to_string(),
+            publish.result_id.to_string(),
+            publish.source_conversation_id.to_string(),
+            publish.target_conversation_id.to_string(),
+            publish.created_at,
         ],
     )?;
     Ok(())

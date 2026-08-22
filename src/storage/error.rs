@@ -1,5 +1,6 @@
 use crate::domain::{
-    AgentId, ConversationId, DomainError, MessageId, ResultId, RoomId, WorkItemId, WorkStatus,
+    AgentId, ConversationId, DomainError, MessageId, PublishId, ResultId, RoomId, WorkItemId,
+    WorkStatus,
 };
 use thiserror::Error;
 
@@ -85,6 +86,18 @@ pub enum StoreError {
         result_id: ResultId,
         supersedes_result_id: ResultId,
     },
+    #[error("result {0} does not exist")]
+    PublishResultNotFound(ResultId),
+    #[error("source conversation {0} does not exist")]
+    PublishSourceNotFound(ConversationId),
+    #[error("target conversation {0} does not exist")]
+    PublishTargetNotFound(ConversationId),
+    #[error("result source and publish target cannot both be conversation {0}")]
+    PublishSourceEqualsTarget(ConversationId),
+    #[error("publish id {0} already maps a different result or target")]
+    PublishIdConflict(PublishId),
+    #[error("publish timestamp must not be blank")]
+    InvalidPublishTimestamp,
     #[error("message sender must be agent {0}")]
     MessageSenderMismatch(AgentId),
     #[error("message {id} already exists with different content")]

@@ -265,7 +265,17 @@ fn full_graph_round_trips_after_reopen() {
             .unwrap();
         store.create_work_result(&first_result).unwrap();
         store.create_work_result(&final_result).unwrap();
-        store.insert_publish(&publish).unwrap();
+        assert_eq!(
+            store
+                .publish_result(
+                    publish.id,
+                    publish.result_id,
+                    publish.target_conversation_id,
+                    &publish.created_at,
+                )
+                .unwrap(),
+            (publish.clone(), final_result.clone())
+        );
         store.insert_session_binding(&binding).unwrap();
         store.insert_checkpoint(&checkpoint).unwrap();
         store.insert_memory(&first_memory).unwrap();
