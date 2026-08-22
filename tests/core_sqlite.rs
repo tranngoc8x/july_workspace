@@ -143,7 +143,7 @@ fn full_graph_round_trips_after_reopen() {
         conversation_id: thread.id,
         title: "Storage rollout".into(),
         goal: Some("Persist the whole graph".into()),
-        status: WorkStatus::Open,
+        status: WorkStatus::Ready,
         owner_agent_id: None,
         is_primary: true,
         created_at: CREATED.into(),
@@ -260,8 +260,11 @@ fn full_graph_round_trips_after_reopen() {
         store.insert_message(&json_message).unwrap();
         store.insert_work_item(&downstream).unwrap();
         store.insert_work_dependency(&dependency).unwrap();
-        store.insert_work_result(&first_result).unwrap();
-        store.insert_work_result(&final_result).unwrap();
+        store
+            .transition_work(upstream.id, WorkStatus::Working, CREATED)
+            .unwrap();
+        store.create_work_result(&first_result).unwrap();
+        store.create_work_result(&final_result).unwrap();
         store.insert_publish(&publish).unwrap();
         store.insert_session_binding(&binding).unwrap();
         store.insert_checkpoint(&checkpoint).unwrap();

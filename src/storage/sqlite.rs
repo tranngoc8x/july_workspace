@@ -43,6 +43,18 @@ const MIGRATIONS: [Migration; 7] = [
     },
 ];
 
+/// Durable SQLite access which keeps Work Result lifecycle writes guarded.
+///
+/// Result rows cannot be inserted without their lifecycle transaction:
+///
+/// ```compile_fail
+/// fn bypass(
+///     store: &july_workspace::storage::SqliteStore,
+///     result: &july_workspace::domain::WorkResult,
+/// ) {
+///     store.insert_work_result(result).unwrap();
+/// }
+/// ```
 pub struct SqliteStore {
     connection: Connection,
 }
@@ -1178,10 +1190,6 @@ impl SqliteStore {
             params![upstream_work_id.to_string(), downstream_work_id.to_string()],
             records::work_dependency,
         )
-    }
-
-    pub fn insert_work_result(&self, result: &WorkResult) -> Result<(), StoreError> {
-        insert_work_result(&self.connection, result)
     }
 
     pub fn get_work_result(&self, id: ResultId) -> Result<Option<WorkResult>, StoreError> {
