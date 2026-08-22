@@ -1,4 +1,4 @@
-use super::RuntimeError;
+use super::{RuntimeError, timestamp};
 use crate::application::{
     CollaborationError, CollaborationRuntime, MembershipChange, MembershipState,
 };
@@ -136,7 +136,11 @@ impl StorageWorker {
         let (started, ready) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let store = match SqliteStore::open(path) {
-                Ok(store) => {
+                Ok(mut store) => {
+                    if let Err(error) = store.reconcile_pending_deliveries(&timestamp()) {
+                        let _ = started.send(Err(error));
+                        return;
+                    }
                     let _ = started.send(Ok(()));
                     store
                 }

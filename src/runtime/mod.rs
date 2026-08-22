@@ -1,5 +1,7 @@
 //! Runtime boundary for process, session, and cancellation lifecycle.
 
+use chrono::{SecondsFormat, Utc};
+
 mod direct_message;
 mod error;
 mod session_manager;
@@ -17,3 +19,7 @@ pub use storage_worker::StorageWorker;
 pub use thread::AgentThreadRuntime;
 pub use workspace::WorkspaceRuntime;
 pub(crate) use workspace::{RuntimeSession, WorkspaceHandle};
+
+pub(crate) fn timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}

@@ -1,6 +1,7 @@
 use july_workspace::domain::{
     Agent, AgentId, DeliveryStatus, DomainError, MemberType, Message, MessageDelivery, MessageId,
 };
+use july_workspace::runtime::StorageWorker;
 use july_workspace::storage::{SqliteStore, StoreError};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -311,4 +312,120 @@ fn capsule_transition_is_a_noop_without_a_capsule() {
             .mark_delivery_capsule_delivered(message.id, target.id, LATER)
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn storage_worker_startup_reconciles_pending_deliveries_before_ready() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let target = agent("codex");
+    store.insert_agent(&target).unwrap();
+
+    let stranded_with_capsule = message(&mut store, &target);
+    store
+        .insert_message_with_pending_delivery(&stranded_with_capsule, target.id, Some("capsule"))
+        .unwrap();
+    store
+        .mark_delivery_capsule_delivered(stranded_with_capsule.id, target.id, LATER)
+        .unwrap();
+
+    let stranded_without_capsule = message(&mut store, &target);
+    store
+        .insert_message_with_pending_delivery(&stranded_without_capsule, target.id, None)
+        .unwrap();
+
+    let failed = message(&mut store, &target);
+    store
+        .insert_message_with_pending_delivery(&failed, target.id, None)
+        .unwrap();
+    store
+        .mark_delivery_failed(failed.id, target.id, LATER)
+        .unwrap();
+    let failed_before = store
+        .get_message_delivery(failed.id, target.id)
+        .unwrap()
+        .unwrap();
+
+    let delivered = message(&mut store, &target);
+    store
+        .insert_message_with_pending_delivery(&delivered, target.id, Some("delivered capsule"))
+        .unwrap();
+    store
+        .mark_delivery_capsule_delivered(delivered.id, target.id, LATER)
+        .unwrap();
+    store
+        .mark_delivery_delivered(delivered.id, target.id, LATER)
+        .unwrap();
+    let delivered_before = store
+        .get_message_delivery(delivered.id, target.id)
+        .unwrap()
+        .unwrap();
+    drop(store);
+
+    let mut first_worker = StorageWorker::open(database.path()).unwrap();
+    let store = SqliteStore::open(database.path()).unwrap();
+    let stranded_with_capsule_after = store
+        .get_message_delivery(stranded_with_capsule.id, target.id)
+        .unwrap()
+        .unwrap();
+    let stranded_without_capsule_after = store
+        .get_message_delivery(stranded_without_capsule.id, target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stranded_with_capsule_after.status, DeliveryStatus::Failed);
+    assert_eq!(
+        stranded_without_capsule_after.status,
+        DeliveryStatus::Failed
+    );
+    assert_ne!(stranded_with_capsule_after.updated_at, LATER);
+    assert_eq!(
+        stranded_with_capsule_after.updated_at,
+        stranded_without_capsule_after.updated_at
+    );
+    assert_eq!(
+        stranded_with_capsule_after.capsule.as_deref(),
+        Some("capsule")
+    );
+    assert_eq!(
+        stranded_with_capsule_after.capsule_delivered_at.as_deref(),
+        Some(LATER)
+    );
+    assert_eq!(
+        store.get_message_delivery(failed.id, target.id).unwrap(),
+        Some(failed_before)
+    );
+    assert_eq!(
+        store.get_message_delivery(delivered.id, target.id).unwrap(),
+        Some(delivered_before)
+    );
+    let reconciled = (
+        stranded_with_capsule_after.clone(),
+        stranded_without_capsule_after.clone(),
+    );
+    drop(store);
+    first_worker.shutdown().await.unwrap();
+
+    let mut second_worker = StorageWorker::open(database.path()).unwrap();
+    let store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(
+        store
+            .get_message_delivery(stranded_with_capsule.id, target.id)
+            .unwrap()
+            .unwrap(),
+        reconciled.0
+    );
+    assert_eq!(
+        store
+            .get_message_delivery(stranded_without_capsule.id, target.id)
+            .unwrap()
+            .unwrap(),
+        reconciled.1
+    );
+    assert!(
+        store
+            .claim_failed_delivery(stranded_without_capsule.id, target.id, LATER)
+            .unwrap()
+    );
+    drop(store);
+    second_worker.shutdown().await.unwrap();
 }
