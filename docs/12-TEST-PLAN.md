@@ -53,8 +53,15 @@ Current Phase 5.1 coverage:
 - deterministic typed routing to the target owner;
 - durable source/target attribution for both sides of the DM.
 
+Current Phase 5.2 coverage:
+- explicit target-only Thread mention routing through the shared owner;
+- atomic message persistence with idempotent join and generational rejoin;
+- capsule-before-body delivery for new members and body-only active delivery;
+- duplicate replay suppression and typed scope rejection before side effects;
+- durable membership and message state after open or send failure;
+- isolation from unrelated Agents, Threads, Rooms, and DMs.
+
 Planned Phase 5 coverage:
-- thread mention and dynamic member join;
 - offline persistence/delivery with `PENDING`, `DELIVERED`, and `FAILED`;
 - restart, isolation, and delivery regression tests;
 - retry after transport failure.

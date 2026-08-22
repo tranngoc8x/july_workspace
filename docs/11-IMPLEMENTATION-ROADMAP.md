@@ -191,7 +191,12 @@ source/target attribution. It has no semantic router.
 
 ### Phase 5.2 — Thread mention and dynamic member join
 
-Status: planned.
+Status: implemented and verified. A typed mention names one source and one
+target Agent. One SQLite transaction validates both scopes, joins or rejoins
+the target, and persists the attributed source message. The target's existing
+shared owner opens or resumes an isolated Thread session; a new join receives
+the caller-provided capsule before the exact message body. Exact message
+replays are durable no-ops and transport failures do not roll back persistence.
 
 ### Phase 5.3 — Offline persistence and delivery
 
@@ -204,8 +209,6 @@ Status: planned.
 
 Remaining implementation:
 
-- thread mentions;
-- dynamic member join;
 - offline message persistence/delivery.
 
 DoD:
