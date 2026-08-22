@@ -1060,14 +1060,84 @@ impl SqliteStore {
     }
 
     pub fn get_work_item(&self, id: WorkItemId) -> Result<Option<WorkItem>, StoreError> {
-        query_optional(
-            &self.connection,
-            "SELECT id, conversation_id, title, goal, status, owner_agent_id,
-                    is_primary, created_at, updated_at, completed_at
-             FROM work_items WHERE id = ?1",
-            params![id.to_string()],
-            records::work_item,
-        )
+        get_work_item(&self.connection, id)
+    }
+
+    pub fn assign_work_owner(
+        &mut self,
+        work_id: WorkItemId,
+        owner_agent_id: AgentId,
+        assigned_at: &str,
+    ) -> Result<WorkItem, StoreError> {
+        require_work_timestamp(assigned_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut work = require_work_item(&transaction, work_id)?;
+        if work.owner_agent_id == Some(owner_agent_id) {
+            transaction.commit()?;
+            return Ok(work);
+        }
+        if work.status.is_terminal() {
+            return Err(StoreError::TerminalWorkOwnerImmutable(work_id));
+        }
+        require_active_agent(&transaction, owner_agent_id)?;
+        require_active_conversation_membership(
+            &transaction,
+            work.conversation_id,
+            work_id,
+            owner_agent_id,
+        )?;
+        work.owner_agent_id = Some(owner_agent_id);
+        work.updated_at = assigned_at.into();
+        work.validate()?;
+        transaction.execute(
+            "UPDATE work_items SET owner_agent_id = ?2, updated_at = ?3 WHERE id = ?1",
+            params![work_id.to_string(), owner_agent_id.to_string(), assigned_at],
+        )?;
+        transaction.commit()?;
+        Ok(work)
+    }
+
+    pub fn transition_work(
+        &mut self,
+        work_id: WorkItemId,
+        target: WorkStatus,
+        transitioned_at: &str,
+    ) -> Result<WorkItem, StoreError> {
+        require_work_timestamp(transitioned_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut work = require_work_item(&transaction, work_id)?;
+        if work.status == target {
+            transaction.commit()?;
+            return Ok(work);
+        }
+        if !work.status.can_transition_to(target) {
+            return Err(StoreError::InvalidWorkTransition {
+                work_id,
+                from: work.status,
+                to: target,
+            });
+        }
+        work.status = target;
+        work.updated_at = transitioned_at.into();
+        work.completed_at = target.is_terminal().then(|| transitioned_at.into());
+        work.validate()?;
+        transaction.execute(
+            "UPDATE work_items
+             SET status = ?2, updated_at = ?3, completed_at = ?4
+             WHERE id = ?1",
+            params![
+                work_id.to_string(),
+                target.to_string(),
+                transitioned_at,
+                work.completed_at,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(work)
     }
 
     pub fn insert_work_dependency(&self, dependency: &WorkDependency) -> Result<(), StoreError> {
@@ -1719,6 +1789,32 @@ fn get_message_delivery(
     )
 }
 
+fn get_work_item(
+    connection: &Connection,
+    work_id: WorkItemId,
+) -> Result<Option<WorkItem>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, conversation_id, title, goal, status, owner_agent_id,
+                is_primary, created_at, updated_at, completed_at
+         FROM work_items WHERE id = ?1",
+        params![work_id.to_string()],
+        records::work_item,
+    )
+}
+
+fn require_work_item(connection: &Connection, work_id: WorkItemId) -> Result<WorkItem, StoreError> {
+    get_work_item(connection, work_id)?.ok_or(StoreError::WorkItemNotFound(work_id))
+}
+
+fn require_work_timestamp(timestamp: &str) -> Result<(), StoreError> {
+    if timestamp.trim().is_empty() {
+        Err(StoreError::InvalidWorkTimestamp)
+    } else {
+        Ok(())
+    }
+}
+
 fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(), StoreError> {
     work_item.validate()?;
     connection.execute(
@@ -1876,6 +1972,31 @@ fn require_active_thread_membership(
         Err(StoreError::ThreadMembershipRequired {
             thread_id,
             agent_id,
+        })
+    }
+}
+
+fn require_active_conversation_membership(
+    connection: &Connection,
+    conversation_id: ConversationId,
+    work_id: WorkItemId,
+    owner_agent_id: AgentId,
+) -> Result<(), StoreError> {
+    let active: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM conversation_members
+            WHERE conversation_id = ?1 AND member_type = 'agent'
+              AND member_id = ?2 AND left_at IS NULL
+        )",
+        params![conversation_id.to_string(), owner_agent_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::WorkOwnerScopeRequired {
+            work_id,
+            owner_agent_id,
         })
     }
 }

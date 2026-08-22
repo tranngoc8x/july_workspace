@@ -54,6 +54,28 @@ string_enum!(WorkStatus {
     Failed => "failed",
     Cancelled => "cancelled",
 });
+
+impl WorkStatus {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    pub const fn can_transition_to(self, target: Self) -> bool {
+        matches!(
+            (self, target),
+            (Self::Open, Self::Working | Self::Blocked | Self::Cancelled)
+                | (
+                    Self::Working,
+                    Self::Blocked | Self::Ready | Self::Failed | Self::Cancelled
+                )
+                | (
+                    Self::Blocked,
+                    Self::Working | Self::Failed | Self::Cancelled
+                )
+                | (Self::Ready, Self::Done)
+        )
+    }
+}
 string_enum!(DependencyType {
     Requires => "requires",
 });

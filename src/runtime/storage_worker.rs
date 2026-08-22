@@ -1,11 +1,12 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState,
+    CollaborationError, CollaborationRuntime, MembershipChange, MembershipState, WorkError,
+    WorkRuntime,
 };
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
     MessageId, PermissionDecision, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, WorkItem, WorkItemId,
+    SessionBindingStatus, WorkItem, WorkItemId, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,8 @@ enum Command {
     ListThreadMembers(ConversationId, Reply<Vec<ConversationMember>>),
     AddThreadMember(ConversationId, AgentId, String, Reply<bool>),
     RemoveThreadMember(ConversationId, AgentId, String, Reply<bool>),
+    AssignWorkOwner(WorkItemId, AgentId, String, Reply<WorkItem>),
+    TransitionWork(WorkItemId, WorkStatus, String, Reply<WorkItem>),
     AdmitThreadSession(
         ConversationId,
         AgentId,
@@ -437,6 +440,21 @@ impl StorageHandle {
             .map_err(|_| CollaborationError::Runtime("storage owner channel closed".into()))?
             .map_err(map_store_error)
     }
+
+    async fn work_request<R>(
+        &self,
+        build: impl FnOnce(Reply<R>) -> Command,
+    ) -> Result<R, WorkError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| WorkError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| WorkError::Runtime("storage owner channel closed".into()))?
+            .map_err(map_work_error)
+    }
 }
 
 impl std::ops::Deref for StorageWorker {
@@ -587,6 +605,30 @@ impl CollaborationRuntime for StorageWorker {
     }
 }
 
+impl WorkRuntime for StorageWorker {
+    async fn assign_work_owner(
+        &mut self,
+        work_id: WorkItemId,
+        owner_agent_id: AgentId,
+        assigned_at: String,
+    ) -> Result<WorkItem, WorkError> {
+        self.work_request(|reply| {
+            Command::AssignWorkOwner(work_id, owner_agent_id, assigned_at, reply)
+        })
+        .await
+    }
+
+    async fn transition_work(
+        &mut self,
+        work_id: WorkItemId,
+        target: WorkStatus,
+        transitioned_at: String,
+    ) -> Result<WorkItem, WorkError> {
+        self.work_request(|reply| Command::TransitionWork(work_id, target, transitioned_at, reply))
+            .await
+    }
+}
+
 impl Drop for StorageWorker {
     fn drop(&mut self) {
         if self.thread.is_some() {
@@ -658,6 +700,12 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::RemoveThreadMember(thread_id, agent_id, changed_at, reply) => {
                 let _ = reply.send(store.remove_thread_member(thread_id, agent_id, &changed_at));
+            }
+            Command::AssignWorkOwner(work_id, owner_agent_id, assigned_at, reply) => {
+                let _ = reply.send(store.assign_work_owner(work_id, owner_agent_id, &assigned_at));
+            }
+            Command::TransitionWork(work_id, target, transitioned_at, reply) => {
+                let _ = reply.send(store.transition_work(work_id, target, &transitioned_at));
             }
             Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply) => {
                 let _ = reply.send(store.admit_thread_session(thread_id, agent_id, &admitted_at));
@@ -816,5 +864,26 @@ fn map_store_error(error: StoreError) -> CollaborationError {
         }
         StoreError::Domain(error) => CollaborationError::InvalidCommand(error.to_string()),
         error => CollaborationError::Runtime(error.to_string()),
+    }
+}
+
+fn map_work_error(error: StoreError) -> WorkError {
+    match error {
+        StoreError::WorkItemNotFound(id) => WorkError::WorkNotFound(id),
+        StoreError::AgentNotFound(id) => WorkError::OwnerNotFound(id),
+        StoreError::AgentInactive(id) => WorkError::OwnerInactive(id),
+        StoreError::WorkOwnerScopeRequired {
+            work_id,
+            owner_agent_id,
+        } => WorkError::OwnerOutOfScope {
+            work_id,
+            owner_agent_id,
+        },
+        StoreError::TerminalWorkOwnerImmutable(id) => WorkError::TerminalOwnershipImmutable(id),
+        StoreError::InvalidWorkTransition { work_id, from, to } => {
+            WorkError::InvalidTransition { work_id, from, to }
+        }
+        StoreError::InvalidWorkTimestamp => WorkError::InvalidTimestamp,
+        error => WorkError::Runtime(error.to_string()),
     }
 }

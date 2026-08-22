@@ -1,4 +1,6 @@
-use crate::domain::{AgentId, ConversationId, DomainError, MessageId, RoomId, WorkItemId};
+use crate::domain::{
+    AgentId, ConversationId, DomainError, MessageId, RoomId, WorkItemId, WorkStatus,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -57,6 +59,23 @@ pub enum StoreError {
     ThreadIdConflict(ConversationId),
     #[error("primary work id {0} already exists")]
     PrimaryWorkIdConflict(WorkItemId),
+    #[error("work {0} does not exist")]
+    WorkItemNotFound(WorkItemId),
+    #[error("agent {owner_agent_id} is not an active member of work {work_id}'s conversation")]
+    WorkOwnerScopeRequired {
+        work_id: WorkItemId,
+        owner_agent_id: AgentId,
+    },
+    #[error("terminal work {0} cannot change owner")]
+    TerminalWorkOwnerImmutable(WorkItemId),
+    #[error("work {work_id} cannot transition from {from} to {to}")]
+    InvalidWorkTransition {
+        work_id: WorkItemId,
+        from: WorkStatus,
+        to: WorkStatus,
+    },
+    #[error("work mutation timestamp must not be blank")]
+    InvalidWorkTimestamp,
     #[error("message sender must be agent {0}")]
     MessageSenderMismatch(AgentId),
     #[error("message {id} already exists with different content")]
