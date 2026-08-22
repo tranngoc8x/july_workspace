@@ -22,6 +22,8 @@ pub enum DomainError {
     DeliveryTimestampStatusMismatch,
     #[error("completed_at must be set exactly when work status is terminal")]
     WorkCompletionTimestampMismatch,
+    #[error("work result cannot supersede itself")]
+    ResultSupersedesItself,
     #[error("permission option was not advertised: {0}")]
     PermissionOptionNotAdvertised(String),
     #[error("invalid {kind}: {value}")]

@@ -6,7 +6,7 @@ use crate::application::{
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
     MessageId, PermissionDecision, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, WorkItem, WorkItemId, WorkStatus,
+    SessionBindingStatus, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,7 @@ enum Command {
     RemoveThreadMember(ConversationId, AgentId, String, Reply<bool>),
     AssignWorkOwner(WorkItemId, AgentId, String, Reply<WorkItem>),
     TransitionWork(WorkItemId, WorkStatus, String, Reply<WorkItem>),
+    CreateWorkResult(WorkResult, Reply<WorkResult>),
     AdmitThreadSession(
         ConversationId,
         AgentId,
@@ -627,6 +628,11 @@ impl WorkRuntime for StorageWorker {
         self.work_request(|reply| Command::TransitionWork(work_id, target, transitioned_at, reply))
             .await
     }
+
+    async fn create_work_result(&mut self, result: WorkResult) -> Result<WorkResult, WorkError> {
+        self.work_request(|reply| Command::CreateWorkResult(result, reply))
+            .await
+    }
 }
 
 impl Drop for StorageWorker {
@@ -706,6 +712,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::TransitionWork(work_id, target, transitioned_at, reply) => {
                 let _ = reply.send(store.transition_work(work_id, target, &transitioned_at));
+            }
+            Command::CreateWorkResult(result, reply) => {
+                let _ = reply.send(store.create_work_result(&result));
             }
             Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply) => {
                 let _ = reply.send(store.admit_thread_session(thread_id, agent_id, &admitted_at));
@@ -884,6 +893,15 @@ fn map_work_error(error: StoreError) -> WorkError {
             WorkError::InvalidTransition { work_id, from, to }
         }
         StoreError::InvalidWorkTimestamp => WorkError::InvalidTimestamp,
+        StoreError::WorkResultConflict(id) => WorkError::ResultConflict(id),
+        StoreError::SupersededWorkResultNotFound(id) => WorkError::SupersededResultNotFound(id),
+        StoreError::CrossWorkResultSupersede {
+            result_id,
+            supersedes_result_id,
+        } => WorkError::CrossWorkSupersede {
+            result_id,
+            supersedes_result_id,
+        },
         error => WorkError::Runtime(error.to_string()),
     }
 }

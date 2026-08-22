@@ -1181,37 +1181,64 @@ impl SqliteStore {
     }
 
     pub fn insert_work_result(&self, result: &WorkResult) -> Result<(), StoreError> {
-        result.validate()?;
-        let outputs = serde_json::to_string(&result.outputs)?;
-        let evidence = serde_json::to_string(&result.evidence)?;
-        self.connection.execute(
-            "INSERT INTO work_results(
-                id, work_id, status, summary, outputs_json, evidence_json,
-                supersedes_result_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                result.id.to_string(),
-                result.work_id.to_string(),
-                result.status,
-                result.summary,
-                outputs,
-                evidence,
-                result.supersedes_result_id.map(|id| id.to_string()),
-                result.created_at,
-            ],
-        )?;
-        Ok(())
+        insert_work_result(&self.connection, result)
     }
 
     pub fn get_work_result(&self, id: ResultId) -> Result<Option<WorkResult>, StoreError> {
-        query_optional(
-            &self.connection,
-            "SELECT id, work_id, status, summary, outputs_json, evidence_json,
-                    supersedes_result_id, created_at
-             FROM work_results WHERE id = ?1",
-            params![id.to_string()],
-            records::work_result,
-        )
+        get_work_result(&self.connection, id)
+    }
+
+    pub fn create_work_result(&mut self, result: &WorkResult) -> Result<WorkResult, StoreError> {
+        result.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = get_work_result(&transaction, result.id)? {
+            if stored == *result {
+                transaction.commit()?;
+                return Ok(stored);
+            }
+            return Err(StoreError::WorkResultConflict(result.id));
+        }
+
+        let mut work = require_work_item(&transaction, result.work_id)?;
+        if let Some(supersedes_result_id) = result.supersedes_result_id {
+            let superseded = get_work_result(&transaction, supersedes_result_id)?.ok_or(
+                StoreError::SupersededWorkResultNotFound(supersedes_result_id),
+            )?;
+            if superseded.work_id != result.work_id {
+                return Err(StoreError::CrossWorkResultSupersede {
+                    result_id: result.id,
+                    supersedes_result_id,
+                });
+            }
+        } else {
+            if !work.status.can_transition_to(WorkStatus::Ready) {
+                return Err(StoreError::InvalidWorkTransition {
+                    work_id: work.id,
+                    from: work.status,
+                    to: WorkStatus::Ready,
+                });
+            }
+            work.status = WorkStatus::Ready;
+            work.updated_at.clone_from(&result.created_at);
+            work.completed_at = None;
+            work.validate()?;
+            transaction.execute(
+                "UPDATE work_items
+                 SET status = ?2, updated_at = ?3, completed_at = NULL
+                 WHERE id = ?1",
+                params![
+                    work.id.to_string(),
+                    WorkStatus::Ready.to_string(),
+                    result.created_at,
+                ],
+            )?;
+        }
+
+        insert_work_result(&transaction, result)?;
+        transaction.commit()?;
+        Ok(result.clone())
     }
 
     pub fn insert_publish(&self, publish: &Publish) -> Result<(), StoreError> {
@@ -1811,6 +1838,20 @@ fn get_work_item(
     )
 }
 
+fn get_work_result(
+    connection: &Connection,
+    result_id: ResultId,
+) -> Result<Option<WorkResult>, StoreError> {
+    query_optional(
+        connection,
+        "SELECT id, work_id, status, summary, outputs_json, evidence_json,
+                supersedes_result_id, created_at
+         FROM work_results WHERE id = ?1",
+        params![result_id.to_string()],
+        records::work_result,
+    )
+}
+
 fn require_work_item(connection: &Connection, work_id: WorkItemId) -> Result<WorkItem, StoreError> {
     get_work_item(connection, work_id)?.ok_or(StoreError::WorkItemNotFound(work_id))
 }
@@ -1841,6 +1882,27 @@ fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(),
             work_item.created_at,
             work_item.updated_at,
             work_item.completed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_work_result(connection: &Connection, result: &WorkResult) -> Result<(), StoreError> {
+    result.validate()?;
+    connection.execute(
+        "INSERT INTO work_results(
+            id, work_id, status, summary, outputs_json, evidence_json,
+            supersedes_result_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            result.id.to_string(),
+            result.work_id.to_string(),
+            result.status,
+            result.summary,
+            serde_json::to_string(&result.outputs)?,
+            serde_json::to_string(&result.evidence)?,
+            result.supersedes_result_id.map(|id| id.to_string()),
+            result.created_at,
         ],
     )?;
     Ok(())

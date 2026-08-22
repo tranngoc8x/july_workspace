@@ -354,7 +354,11 @@ impl WorkResult {
     pub fn validate(&self) -> Result<(), DomainError> {
         require_text(&self.status, "work_result.status")?;
         require_text(&self.summary, "work_result.summary")?;
-        require_text(&self.created_at, "work_result.created_at")
+        require_text(&self.created_at, "work_result.created_at")?;
+        if self.supersedes_result_id == Some(self.id) {
+            return Err(DomainError::ResultSupersedesItself);
+        }
+        Ok(())
     }
 }
 

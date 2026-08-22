@@ -1,4 +1,4 @@
-use crate::domain::{AgentId, WorkItem, WorkItemId, WorkStatus};
+use crate::domain::{AgentId, ResultId, WorkItem, WorkItemId, WorkResult, WorkStatus};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13,6 +13,11 @@ pub struct TransitionWork {
     pub work_id: WorkItemId,
     pub target: WorkStatus,
     pub transitioned_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateWorkResult {
+    pub result: WorkResult,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -38,6 +43,15 @@ pub enum WorkError {
     },
     #[error("work mutation timestamp must not be blank")]
     InvalidTimestamp,
+    #[error("result {0} already exists with different content")]
+    ResultConflict(ResultId),
+    #[error("superseded result {0} does not exist")]
+    SupersededResultNotFound(ResultId),
+    #[error("result {result_id} cannot supersede result {supersedes_result_id} from another work")]
+    CrossWorkSupersede {
+        result_id: ResultId,
+        supersedes_result_id: ResultId,
+    },
     #[error("work runtime failed: {0}")]
     Runtime(String),
 }
@@ -57,6 +71,8 @@ pub trait WorkRuntime {
         target: WorkStatus,
         transitioned_at: String,
     ) -> Result<WorkItem, WorkError>;
+
+    async fn create_work_result(&mut self, result: WorkResult) -> Result<WorkResult, WorkError>;
 }
 
 pub struct WorkService<R> {
@@ -78,5 +94,12 @@ impl<R: WorkRuntime> WorkService<R> {
         self.runtime
             .transition_work(command.work_id, command.target, command.transitioned_at)
             .await
+    }
+
+    pub async fn create_result(
+        &mut self,
+        command: CreateWorkResult,
+    ) -> Result<WorkResult, WorkError> {
+        self.runtime.create_work_result(command.result).await
     }
 }

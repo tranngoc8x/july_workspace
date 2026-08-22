@@ -1,5 +1,5 @@
 use crate::domain::{
-    AgentId, ConversationId, DomainError, MessageId, RoomId, WorkItemId, WorkStatus,
+    AgentId, ConversationId, DomainError, MessageId, ResultId, RoomId, WorkItemId, WorkStatus,
 };
 use thiserror::Error;
 
@@ -76,6 +76,15 @@ pub enum StoreError {
     },
     #[error("work mutation timestamp must not be blank")]
     InvalidWorkTimestamp,
+    #[error("result {0} already exists with different content")]
+    WorkResultConflict(ResultId),
+    #[error("superseded result {0} does not exist")]
+    SupersededWorkResultNotFound(ResultId),
+    #[error("result {result_id} cannot supersede result {supersedes_result_id} from another work")]
+    CrossWorkResultSupersede {
+        result_id: ResultId,
+        supersedes_result_id: ResultId,
+    },
     #[error("message sender must be agent {0}")]
     MessageSenderMismatch(AgentId),
     #[error("message {id} already exists with different content")]
