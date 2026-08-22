@@ -1,6 +1,6 @@
 use crate::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, Room,
-    RoomId, RoomMember, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, MessageId,
+    Room, RoomId, RoomMember, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId,
 };
 use thiserror::Error;
 
@@ -98,6 +98,23 @@ pub struct OpenedThread {
     pub session_binding_id: SessionBindingId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MentionThreadAgent {
+    pub thread_id: ConversationId,
+    pub source_agent_id: AgentId,
+    pub target_agent_id: AgentId,
+    pub message_id: MessageId,
+    pub body: String,
+    pub capsule: String,
+    pub mentioned_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MentionedThreadAgent {
+    pub opened: OpenedThread,
+    pub membership_changed: bool,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CollaborationError {
     #[error("room {0} does not exist")]
@@ -131,6 +148,8 @@ pub enum CollaborationError {
     RoomRemovalBlocked { room_id: RoomId, agent_id: AgentId },
     #[error("invalid collaboration command: {0}")]
     InvalidCommand(String),
+    #[error("thread mentions require a runtime bound to the target agent")]
+    AgentTargetNotBound,
     #[error("a Thread is already open in this runtime")]
     ThreadAlreadyOpen,
     #[error("Thread context is stopped")]
@@ -151,6 +170,11 @@ pub trait ThreadRuntime {
         &mut self,
         command: OpenThreadForAgent,
     ) -> Result<OpenedThread, CollaborationError>;
+
+    async fn mention_thread_agent(
+        &mut self,
+        command: MentionThreadAgent,
+    ) -> Result<MentionedThreadAgent, CollaborationError>;
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError>;
 }

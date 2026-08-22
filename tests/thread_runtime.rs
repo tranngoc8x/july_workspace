@@ -1,5 +1,6 @@
 use july_workspace::application::{
-    CollaborationError, OpenThreadForAgent, OpenedThread, ThreadRuntime,
+    CollaborationError, MentionThreadAgent, MentionedThreadAgent, OpenThreadForAgent, OpenedThread,
+    ThreadRuntime,
 };
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, Room, RoomId, SessionBinding,
@@ -242,6 +243,13 @@ impl ThreadRuntime for TestThreadRuntime {
         command: OpenThreadForAgent,
     ) -> Result<OpenedThread, CollaborationError> {
         self.context.open_thread_for_agent(command).await
+    }
+
+    async fn mention_thread_agent(
+        &mut self,
+        command: MentionThreadAgent,
+    ) -> Result<MentionedThreadAgent, CollaborationError> {
+        self.context.mention_thread_agent(command).await
     }
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {
