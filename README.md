@@ -88,8 +88,9 @@ session lifecycle, Room/Thread membership, atomic Thread creation with primary
 Work, targeted isolated Thread sessions, explicit Agent-to-Agent DM, explicit
 Thread mentions with dynamic member join, and durable per-target offline
 delivery with explicit failed-only retry. Delivery is at-least-once; restart
-reconciliation remains Phase 5.4. The executable remains intentionally limited
-to `july dm <agent>`; no Agent-to-Agent messaging CLI exists yet.
+and cancellation-related `PENDING` reconciliation remain Phase 5.4. The
+executable remains intentionally limited to `july dm <agent>`; no Agent-to-Agent
+messaging CLI exists yet.
 
 Next milestones focus on:
 

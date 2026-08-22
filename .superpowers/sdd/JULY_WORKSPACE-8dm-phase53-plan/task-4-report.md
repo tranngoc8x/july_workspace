@@ -19,6 +19,12 @@
   documented.
 - `git diff --check` passed.
 
+### Follow-up clarification
+
+- Added cancellation-related `PENDING` reconciliation to the planned Phase
+  5.4 scope in the roadmap, test plan, and README status.
+- `git diff --check` passed before the clarification commit.
+
 ## Self-review
 
 Documentation is limited to the requested canonical status/storage/messaging/

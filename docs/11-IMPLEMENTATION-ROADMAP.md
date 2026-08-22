@@ -221,7 +221,8 @@ Status: planned.
 
 Remaining implementation:
 
-- Phase 5.4 restart, isolation, and delivery regression tests.
+- Phase 5.4 restart and cancellation-related `PENDING` reconciliation,
+  isolation, and delivery regression tests.
 
 DoD:
 

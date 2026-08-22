@@ -73,6 +73,7 @@ Current Phase 5.3 coverage:
 
 Planned Phase 5.4 coverage:
 - restart reconciliation for persisted `PENDING` deliveries;
+- cancellation-related `PENDING` reconciliation;
 - restart, isolation, and delivery regression tests;
 - retry after transport failure across the restart boundary.
 
