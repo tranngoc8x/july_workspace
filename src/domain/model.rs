@@ -57,6 +57,12 @@ string_enum!(WorkStatus {
 string_enum!(DependencyType {
     Requires => "requires",
 });
+string_enum!(DependencyStatus {
+    Waiting => "waiting",
+    Satisfied => "satisfied",
+    Failed => "failed",
+    Superseded => "superseded",
+});
 string_enum!(MemoryKind {
     Fact => "fact",
     Decision => "decision",
@@ -290,6 +296,7 @@ pub struct WorkDependency {
     pub upstream_work_id: WorkItemId,
     pub downstream_work_id: WorkItemId,
     pub dependency_type: DependencyType,
+    pub status: DependencyStatus,
     pub created_at: String,
 }
 
@@ -480,6 +487,12 @@ mod tests {
             (WorkStatus::Cancelled, "cancelled"),
         ]);
         assert_enum_roundtrip(&[(DependencyType::Requires, "requires")]);
+        assert_enum_roundtrip(&[
+            (DependencyStatus::Waiting, "waiting"),
+            (DependencyStatus::Satisfied, "satisfied"),
+            (DependencyStatus::Failed, "failed"),
+            (DependencyStatus::Superseded, "superseded"),
+        ]);
         assert_enum_roundtrip(&[
             (MemoryKind::Fact, "fact"),
             (MemoryKind::Decision, "decision"),
@@ -694,6 +707,7 @@ mod tests {
             upstream_work_id: work_id,
             downstream_work_id: WorkItemId::new(),
             dependency_type: DependencyType::Requires,
+            status: DependencyStatus::Waiting,
             created_at: String::new(),
         };
         assert_eq!(
@@ -819,6 +833,7 @@ mod tests {
             upstream_work_id: work_id,
             downstream_work_id: work_id,
             dependency_type: DependencyType::Requires,
+            status: DependencyStatus::Waiting,
             created_at: "2026-08-09T00:00:00Z".into(),
         };
         assert_eq!(dependency.validate(), Err(DomainError::SelfDependency));

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -28,6 +28,10 @@ const MIGRATIONS: [Migration; 4] = [
     Migration {
         version: 4,
         sql: include_str!("migrations/0004_message_deliveries.sql"),
+    },
+    Migration {
+        version: 5,
+        sql: include_str!("migrations/0005_phase6_workflow.sql"),
     },
 ];
 
@@ -1070,12 +1074,13 @@ impl SqliteStore {
         dependency.validate()?;
         self.connection.execute(
             "INSERT INTO work_dependencies(
-                upstream_work_id, downstream_work_id, dependency_type, created_at
-             ) VALUES (?1, ?2, ?3, ?4)",
+                upstream_work_id, downstream_work_id, dependency_type, status, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 dependency.upstream_work_id.to_string(),
                 dependency.downstream_work_id.to_string(),
                 dependency.dependency_type.to_string(),
+                dependency.status.to_string(),
                 dependency.created_at,
             ],
         )?;
@@ -1089,7 +1094,7 @@ impl SqliteStore {
     ) -> Result<Option<WorkDependency>, StoreError> {
         query_optional(
             &self.connection,
-            "SELECT upstream_work_id, downstream_work_id, dependency_type, created_at
+            "SELECT upstream_work_id, downstream_work_id, dependency_type, status, created_at
              FROM work_dependencies
              WHERE upstream_work_id = ?1 AND downstream_work_id = ?2",
             params![upstream_work_id.to_string(), downstream_work_id.to_string()],
@@ -2067,11 +2072,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_four() {
+    fn fresh_database_has_schema_version_five() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -2435,14 +2440,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            4
+            5
         );
     }
 
@@ -2562,7 +2567,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..4]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 4);
         assert_eq!(
@@ -2582,6 +2587,47 @@ mod tests {
                 })
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn migration_five_backfills_and_constrains_dependency_status() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..4]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at
+                 ) VALUES
+                    ('work-upstream', 'conversation-1', 'prerequisite', 'ready', 'now', 'now'),
+                    ('work-downstream', 'conversation-1', 'consumer', 'blocked', 'now', 'now');
+                 INSERT INTO work_dependencies(
+                    upstream_work_id, downstream_work_id, dependency_type, created_at
+                 ) VALUES ('work-upstream', 'work-downstream', 'requires', 'now');",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 5);
+        let status: String = connection
+            .query_row("SELECT status FROM work_dependencies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "waiting");
+        for status in ["waiting", "satisfied", "failed", "superseded"] {
+            connection
+                .execute("UPDATE work_dependencies SET status = ?1", [status])
+                .unwrap();
+        }
+        assert!(
+            connection
+                .execute("UPDATE work_dependencies SET status = 'unknown'", [])
+                .is_err()
         );
     }
 
@@ -2703,15 +2749,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (5);",
+                 INSERT INTO schema_migrations(version) VALUES (6);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 5,
-                supported: 4,
+                found: 6,
+                supported: 5,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

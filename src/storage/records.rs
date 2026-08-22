@@ -159,7 +159,8 @@ pub(super) fn work_dependency(row: &Row<'_>) -> Result<WorkDependency, StoreErro
         upstream_work_id: id(row.get(0)?)?,
         downstream_work_id: id(row.get(1)?)?,
         dependency_type: domain_enum(row.get(2)?)?,
-        created_at: row.get(3)?,
+        status: domain_enum(row.get(3)?)?,
+        created_at: row.get(4)?,
     })
 }
 

@@ -204,3 +204,32 @@ is lazy after commit and transport failure cannot roll back durable creation.
 primary WorkItem per conversation. The aggregate creation operation guarantees
 exactly one for each new Thread. A circular `conversations.primary_work_id`
 foreign key is not introduced.
+
+## ADR-024 — Phase 6 lifecycle and dependency direction are explicit
+Status: Accepted
+
+Work transitions are `OPEN -> WORKING|BLOCKED|CANCELLED`,
+`WORKING -> BLOCKED|READY|FAILED|CANCELLED`, `BLOCKED ->
+WORKING|FAILED|CANCELLED`, and `READY -> DONE`. `DONE`, `FAILED`, and
+`CANCELLED` are terminal. Exact retries are no-ops. `completed_at` is set
+exactly for terminal states. Phase 4 Work remains initially `OPEN` and unowned;
+an explicit assignment may set or replace a non-terminal Work owner only with
+an active Agent who is an active member of that Work's conversation. Terminal
+ownership is immutable.
+
+`READY` means a structured Result is safe for downstream consumption; `DONE`
+means remaining source work is finished. Results are immutable. The first
+Result and `READY` transition are atomic, and a correction is a new Result
+which may supersede only a Result from the same Work. Publish derives the source
+conversation from Result -> Work, transfers the structured Result and source
+reference without Messages, and uses `(result_id, target_conversation_id)` as
+its natural idempotency key.
+
+A dependency edge points from prerequisite to consumer:
+`upstream_work_id -> downstream_work_id`. Its durable state is exactly
+`WAITING`, `SATISFIED`, `FAILED`, or `SUPERSEDED`; new edges start `WAITING`.
+Propagation permits `WAITING -> SATISFIED`, `WAITING -> FAILED`, and
+`SATISFIED -> SUPERSEDED`, with exact retries as no-ops. Work/Result writes and
+their outgoing dependency changes share one SQLite transaction. Phase 6 adds
+no CLI, deliberation, LLM routing, transcript publish, daemon, or background
+retry.

@@ -1,8 +1,9 @@
 use july_workspace::domain::{
     Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationKind, ConversationMember,
-    DependencyType, DomainError, MemberType, Memory, MemoryKind, MemoryScopeType, Message,
-    MessageId, PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room, RoomMember,
-    SessionBinding, SessionBindingStatus, WorkDependency, WorkItem, WorkResult, WorkStatus,
+    DependencyStatus, DependencyType, DomainError, MemberType, Memory, MemoryKind, MemoryScopeType,
+    Message, MessageId, PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room,
+    RoomMember, SessionBinding, SessionBindingStatus, WorkDependency, WorkItem, WorkResult,
+    WorkStatus,
 };
 use july_workspace::storage::{SqliteStore, StoreError};
 use serde_json::{Value, json};
@@ -165,6 +166,7 @@ fn full_graph_round_trips_after_reopen() {
         upstream_work_id: upstream.id,
         downstream_work_id: downstream.id,
         dependency_type: DependencyType::Requires,
+        status: DependencyStatus::Satisfied,
         created_at: CREATED.into(),
     };
     let first_result = WorkResult {
