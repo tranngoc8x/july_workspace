@@ -1,6 +1,6 @@
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, DomainError, MemberType,
-    Message, MessageId, Room, RoomId, WorkItemId,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, DeliveryStatus, DomainError,
+    MemberType, Message, MessageId, Room, RoomId, WorkItemId,
 };
 use july_workspace::storage::{SqliteStore, StoreError};
 use serde_json::json;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 const CREATED: &str = "2026-08-20T10:00:00Z";
 const LEFT: &str = "2026-08-20T11:00:00Z";
 const MENTIONED: &str = "2026-08-20T12:00:00Z";
+const CAPSULE: &str = "Goal: review only this thread";
 
 struct TestDatabase {
     directory: PathBuf,
@@ -148,7 +149,7 @@ fn mention_joins_target_and_persists_source_message() {
     assert_eq!(
         fixture
             .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
             .unwrap(),
         Some(true)
     );
@@ -162,11 +163,19 @@ fn mention_joins_target_and_persists_source_message() {
         fixture.store.get_message(message.id).unwrap(),
         Some(message.clone())
     );
+    let delivery = fixture
+        .store
+        .get_message_delivery(message.id, fixture.target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, DeliveryStatus::Pending);
+    assert_eq!(delivery.capsule.as_deref(), Some(CAPSULE));
+    assert_eq!(delivery.capsule_delivered_at, None);
 
     assert_eq!(
         fixture
             .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
             .unwrap(),
         None
     );
@@ -183,7 +192,7 @@ fn mention_keeps_active_target_membership_and_persists_message() {
     assert_eq!(
         fixture
             .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
             .unwrap(),
         Some(false)
     );
@@ -194,8 +203,15 @@ fn mention_keeps_active_target_membership_and_persists_message() {
     assert_eq!(members[0].joined_at, CREATED);
     assert_eq!(
         fixture.store.get_message(message.id).unwrap(),
-        Some(message)
+        Some(message.clone())
     );
+    let delivery = fixture
+        .store
+        .get_message_delivery(message.id, fixture.target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, DeliveryStatus::Pending);
+    assert_eq!(delivery.capsule, None);
 }
 
 #[test]
@@ -210,7 +226,7 @@ fn mention_rejoins_target_with_next_generation() {
     assert_eq!(
         fixture
             .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id)
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE)
             .unwrap(),
         Some(true)
     );
@@ -226,6 +242,16 @@ fn mention_rejoins_target_with_next_generation() {
         (2, MENTIONED)
     );
     assert_eq!(members[1].left_at, None);
+    assert_eq!(
+        fixture
+            .store
+            .get_message_delivery(message.id, fixture.target.id)
+            .unwrap()
+            .unwrap()
+            .capsule
+            .as_deref(),
+        Some(CAPSULE)
+    );
 }
 
 #[test]
@@ -237,6 +263,7 @@ fn mention_scope_rejections_leave_no_target_membership_or_message() {
             &source_message,
             missing_source.source.id,
             missing_source.target.id,
+            CAPSULE,
         ),
         Err(StoreError::ThreadMembershipRequired { thread_id, agent_id })
             if thread_id == missing_source.thread.id && agent_id == missing_source.source.id
@@ -254,6 +281,7 @@ fn mention_scope_rejections_leave_no_target_membership_or_message() {
             &target_message,
             missing_target_room.source.id,
             missing_target_room.target.id,
+            CAPSULE,
         ),
         Err(StoreError::RoomMembershipRequired { room_id, agent_id })
             if room_id == missing_target_room.room.id && agent_id == missing_target_room.target.id
@@ -275,6 +303,7 @@ fn mention_scope_rejections_leave_no_target_membership_or_message() {
             &sender_message,
             wrong_sender.source.id,
             wrong_sender.target.id,
+            CAPSULE,
         ),
         Err(StoreError::MessageSenderMismatch(id)) if id == wrong_sender.source.id
     ));
@@ -292,6 +321,7 @@ fn mention_scope_rejections_leave_no_target_membership_or_message() {
             &blank_sender,
             invalid_message.source.id,
             invalid_message.target.id,
+            CAPSULE,
         ),
         Err(StoreError::Domain(DomainError::EmptyField(
             "message.sender_id"
@@ -317,7 +347,7 @@ fn message_conflict_rolls_back_target_membership() {
     assert!(matches!(
         fixture
             .store
-            .persist_thread_mention(&message, fixture.source.id, fixture.target.id),
+            .persist_thread_mention(&message, fixture.source.id, fixture.target.id, CAPSULE),
         Err(StoreError::MessageConflict { id }) if id == message.id
     ));
 
@@ -325,5 +355,12 @@ fn message_conflict_rolls_back_target_membership() {
     assert_eq!(
         fixture.store.get_message(message.id).unwrap(),
         Some(existing)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_message_delivery(message.id, fixture.target.id)
+            .unwrap(),
+        None
     );
 }

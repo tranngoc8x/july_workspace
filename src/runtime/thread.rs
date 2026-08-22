@@ -1,10 +1,11 @@
 use super::{RuntimeError, RuntimeSession, WorkspaceHandle};
 use crate::application::{
     CollaborationError, MentionThreadAgent, MentionedThreadAgent, OpenThreadForAgent, OpenedThread,
-    ThreadRuntime,
+    RetryThreadMention, ThreadMentionOutcome, ThreadRuntime,
 };
 use crate::domain::{
-    AgentId, MemberType, Message, PermissionOutcome, SessionBinding, SessionBindingStatus,
+    AgentId, MemberType, Message, MessageDelivery, MessageId, PermissionOutcome, SessionBinding,
+    SessionBindingStatus,
 };
 use crate::transport::{
     AgentConnection, AgentTransport, PermissionRequestId, TransportError, TransportEvent,
@@ -126,6 +127,129 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
             .respond_permission(request_id, outcome, decided_at)
             .await
     }
+
+    async fn persisted_failure(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        attempted_at: String,
+        error: CollaborationError,
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
+        if !self
+            .workspace
+            .storage()
+            .mark_delivery_failed(message_id, target_agent_id, attempted_at)
+            .await?
+        {
+            return Err(CollaborationError::Runtime(
+                "Thread mention delivery is no longer pending".into(),
+            ));
+        }
+        Ok(Some(ThreadMentionOutcome::PersistedFailed(error)))
+    }
+
+    async fn deliver_persisted(
+        &mut self,
+        message: Message,
+        delivery: MessageDelivery,
+        membership_changed: bool,
+        attempted_at: String,
+        revalidate_opened: bool,
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
+        let opened = match self.opened {
+            Some(opened) => {
+                if revalidate_opened
+                    && let Err(error) = self
+                        .workspace
+                        .storage()
+                        .admit_thread_session(
+                            message.conversation_id,
+                            delivery.target_agent_id,
+                            attempted_at.clone(),
+                        )
+                        .await
+                {
+                    return self
+                        .persisted_failure(
+                            message.id,
+                            delivery.target_agent_id,
+                            attempted_at,
+                            error,
+                        )
+                        .await;
+                }
+                opened
+            }
+            None => match self
+                .open(OpenThreadForAgent {
+                    thread_id: message.conversation_id,
+                    agent_id: delivery.target_agent_id,
+                    opened_at: attempted_at.clone(),
+                })
+                .await
+            {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return self
+                        .persisted_failure(
+                            message.id,
+                            delivery.target_agent_id,
+                            attempted_at,
+                            error,
+                        )
+                        .await;
+                }
+            },
+        };
+        if let Some(capsule) = delivery.capsule.as_ref()
+            && delivery.capsule_delivered_at.is_none()
+        {
+            if let Err(error) = self
+                .send_exact(capsule.clone())
+                .await
+                .map_err(runtime_error)
+            {
+                return self
+                    .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                    .await;
+            }
+            if !self
+                .workspace
+                .storage()
+                .mark_delivery_capsule_delivered(
+                    message.id,
+                    delivery.target_agent_id,
+                    attempted_at.clone(),
+                )
+                .await?
+            {
+                return Err(CollaborationError::Runtime(
+                    "Thread mention capsule delivery is no longer pending".into(),
+                ));
+            }
+        }
+        if let Err(error) = self.send_exact(message.body).await.map_err(runtime_error) {
+            return self
+                .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                .await;
+        }
+        if !self
+            .workspace
+            .storage()
+            .mark_delivery_delivered(message.id, delivery.target_agent_id, attempted_at)
+            .await?
+        {
+            return Err(CollaborationError::Runtime(
+                "Thread mention delivery is no longer pending".into(),
+            ));
+        }
+        Ok(Some(ThreadMentionOutcome::Delivered(
+            MentionedThreadAgent {
+                opened,
+                membership_changed,
+            },
+        )))
+    }
 }
 
 impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T> {
@@ -154,7 +278,7 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
     async fn mention_thread_agent(
         &mut self,
         command: MentionThreadAgent,
-    ) -> Result<Option<MentionedThreadAgent>, CollaborationError> {
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
         if self.stopped {
             return Err(CollaborationError::ContextStopped);
         }
@@ -184,50 +308,98 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
             return Err(CollaborationError::ThreadAlreadyOpen);
         }
 
-        let Some(membership_changed) = self
+        let message = Message {
+            id: command.message_id,
+            conversation_id: command.thread_id,
+            sender_type: MemberType::Agent,
+            sender_id: command.source_agent_id.to_string(),
+            body: command.body,
+            reply_to: None,
+            metadata: serde_json::json!({
+                "mention": command.target_agent_id.to_string(),
+            }),
+            created_at: command.mentioned_at.clone(),
+        };
+        let Some((membership_changed, delivery)) = self
             .workspace
             .storage()
             .persist_thread_mention(
-                Message {
-                    id: command.message_id,
-                    conversation_id: command.thread_id,
-                    sender_type: MemberType::Agent,
-                    sender_id: command.source_agent_id.to_string(),
-                    body: command.body.clone(),
-                    reply_to: None,
-                    metadata: serde_json::json!({
-                        "mention": command.target_agent_id.to_string(),
-                    }),
-                    created_at: command.mentioned_at.clone(),
-                },
+                message.clone(),
                 command.source_agent_id,
                 command.target_agent_id,
+                command.capsule,
             )
             .await?
         else {
             return Ok(None);
         };
-        let opened = match self.opened {
-            Some(opened) => opened,
-            None => {
-                self.open(OpenThreadForAgent {
-                    thread_id: command.thread_id,
-                    agent_id: command.target_agent_id,
-                    opened_at: command.mentioned_at,
-                })
-                .await?
-            }
-        };
-        if membership_changed {
-            self.send_exact(command.capsule)
-                .await
-                .map_err(runtime_error)?;
-        }
-        self.send_exact(command.body).await.map_err(runtime_error)?;
-        Ok(Some(MentionedThreadAgent {
-            opened,
+        self.deliver_persisted(
+            message,
+            delivery,
             membership_changed,
-        }))
+            command.mentioned_at,
+            false,
+        )
+        .await
+    }
+
+    async fn retry_thread_mention(
+        &mut self,
+        command: RetryThreadMention,
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
+        if self.stopped {
+            return Err(CollaborationError::ContextStopped);
+        }
+        self.workspace.ensure_running().map_err(runtime_error)?;
+        let expected_agent_id = self
+            .expected_agent_id
+            .ok_or(CollaborationError::AgentTargetNotBound)?;
+        if expected_agent_id != command.target_agent_id {
+            return Err(CollaborationError::AgentNotFound(
+                command.target_agent_id.to_string(),
+            ));
+        }
+        if self
+            .opened
+            .is_some_and(|opened| opened.agent_id != command.target_agent_id)
+        {
+            return Err(CollaborationError::ThreadAlreadyOpen);
+        }
+        let Some((message, delivery)) = self
+            .workspace
+            .storage()
+            .claim_thread_mention_retry(
+                command.message_id,
+                command.target_agent_id,
+                command.retried_at.clone(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if self
+            .opened
+            .is_some_and(|opened| opened.thread_id != message.conversation_id)
+            || (self.opened.is_none() && self.session.is_some())
+        {
+            return self
+                .persisted_failure(
+                    message.id,
+                    delivery.target_agent_id,
+                    command.retried_at,
+                    CollaborationError::ThreadAlreadyOpen,
+                )
+                .await;
+        }
+        let membership_changed = delivery.capsule.is_some();
+        self.deliver_persisted(
+            message,
+            delivery,
+            membership_changed,
+            command.retried_at,
+            true,
+        )
+        .await
     }
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {

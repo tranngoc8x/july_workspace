@@ -109,10 +109,23 @@ pub struct MentionThreadAgent {
     pub mentioned_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetryThreadMention {
+    pub message_id: MessageId,
+    pub target_agent_id: AgentId,
+    pub retried_at: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MentionedThreadAgent {
     pub opened: OpenedThread,
     pub membership_changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ThreadMentionOutcome {
+    Delivered(MentionedThreadAgent),
+    PersistedFailed(CollaborationError),
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -174,7 +187,12 @@ pub trait ThreadRuntime {
     async fn mention_thread_agent(
         &mut self,
         command: MentionThreadAgent,
-    ) -> Result<Option<MentionedThreadAgent>, CollaborationError>;
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError>;
+
+    async fn retry_thread_mention(
+        &mut self,
+        command: RetryThreadMention,
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError>;
 
     async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError>;
 }

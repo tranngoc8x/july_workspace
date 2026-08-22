@@ -427,6 +427,7 @@ impl SqliteStore {
         message: &Message,
         source_agent_id: AgentId,
         target_agent_id: AgentId,
+        capsule: &str,
     ) -> Result<Option<bool>, StoreError> {
         let transaction = self
             .connection
@@ -480,6 +481,18 @@ impl SqliteStore {
                 },
             )?;
         }
+        let delivery = MessageDelivery {
+            message_id: message.id,
+            target_agent_id,
+            status: DeliveryStatus::Pending,
+            capsule: (!active).then(|| capsule.to_owned()),
+            capsule_delivered_at: None,
+            created_at: message.created_at.clone(),
+            updated_at: message.created_at.clone(),
+            delivered_at: None,
+        };
+        delivery.validate()?;
+        insert_message_delivery(&transaction, &delivery)?;
         transaction.commit()?;
         Ok(Some(!active))
     }

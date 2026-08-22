@@ -1,9 +1,10 @@
 use july_workspace::application::{
-    CollaborationError, MentionThreadAgent, OpenThreadForAgent, ThreadRuntime,
+    CollaborationError, MentionThreadAgent, MentionedThreadAgent, OpenThreadForAgent,
+    RetryThreadMention, ThreadMentionOutcome, ThreadRuntime,
 };
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, MemberType, Message, MessageId,
-    Room, RoomId, WorkItemId,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, DeliveryStatus, MemberType,
+    Message, MessageDelivery, MessageId, Room, RoomId, WorkItemId,
 };
 use july_workspace::runtime::{StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
@@ -277,6 +278,29 @@ fn mention_command(
     }
 }
 
+fn retry_command(message_id: MessageId, target_agent_id: AgentId) -> RetryThreadMention {
+    RetryThreadMention {
+        message_id,
+        target_agent_id,
+        retried_at: LATER.into(),
+    }
+}
+
+fn delivered(outcome: Option<ThreadMentionOutcome>) -> MentionedThreadAgent {
+    match outcome {
+        Some(ThreadMentionOutcome::Delivered(mentioned)) => mentioned,
+        other => panic!("expected delivered mention, got {other:?}"),
+    }
+}
+
+fn delivery(database: &TestDatabase, fixture: &Fixture, message_id: MessageId) -> MessageDelivery {
+    SqliteStore::open(database.path())
+        .unwrap()
+        .get_message_delivery(message_id, fixture.target.id)
+        .unwrap()
+        .unwrap()
+}
+
 fn target_members(database: &TestDatabase, fixture: &Fixture, thread_id: ConversationId) -> usize {
     SqliteStore::open(database.path())
         .unwrap()
@@ -327,11 +351,12 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
         CAPSULE,
         MENTIONED,
     );
-    let first = mentions
-        .mention_thread_agent(first_command.clone())
-        .await
-        .unwrap()
-        .unwrap();
+    let first = delivered(
+        mentions
+            .mention_thread_agent(first_command.clone())
+            .await
+            .unwrap(),
+    );
 
     assert!(first.membership_changed);
     assert_eq!(first.opened.thread_id, fixture.mention_thread.id);
@@ -377,19 +402,20 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
 
     let second_id = MessageId::new();
     let second_body = "Second exact body";
-    let second = mentions
-        .mention_thread_agent(mention_command(
-            &fixture,
-            second_id,
-            fixture.mention_thread.id,
-            fixture.target.id,
-            second_body,
-            "unused repeat capsule",
-            LATER,
-        ))
-        .await
-        .unwrap()
-        .unwrap();
+    let second = delivered(
+        mentions
+            .mention_thread_agent(mention_command(
+                &fixture,
+                second_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                second_body,
+                "unused repeat capsule",
+                LATER,
+            ))
+            .await
+            .unwrap(),
+    );
 
     assert!(!second.membership_changed);
     assert_eq!(second.opened, first.opened);
@@ -431,6 +457,22 @@ async fn mention_joins_target_then_reuses_its_shared_owner_and_session_without_t
         store.list_messages(fixture.source_owner_thread.id).unwrap(),
         vec![fixture.unrelated_message.clone()]
     );
+    let first_delivery = store
+        .get_message_delivery(first_id, fixture.target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_delivery.status, DeliveryStatus::Delivered);
+    assert_eq!(first_delivery.capsule.as_deref(), Some(CAPSULE));
+    assert_eq!(
+        first_delivery.capsule_delivered_at.as_deref(),
+        Some(MENTIONED)
+    );
+    let second_delivery = store
+        .get_message_delivery(second_id, fixture.target.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_delivery.status, DeliveryStatus::Delivered);
+    assert_eq!(second_delivery.capsule, None);
     drop(store);
 
     let wrong_context_id = MessageId::new();
@@ -622,19 +664,24 @@ async fn missing_target_owner_preserves_the_join_and_message() {
     let mut mentions = workspace.thread(fixture.target.id).unwrap();
     let message_id = MessageId::new();
 
+    let command = mention_command(
+        &fixture,
+        message_id,
+        fixture.mention_thread.id,
+        fixture.target.id,
+        BODY,
+        CAPSULE,
+        MENTIONED,
+    );
+    let outcome = mentions
+        .mention_thread_agent(command.clone())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(
-        mentions
-            .mention_thread_agent(mention_command(
-                &fixture,
-                message_id,
-                fixture.mention_thread.id,
-                fixture.target.id,
-                BODY,
-                CAPSULE,
-                MENTIONED,
-            ))
-            .await,
-        Err(CollaborationError::Runtime(message)) if message.contains("no runtime owner")
+        outcome,
+        ThreadMentionOutcome::PersistedFailed(CollaborationError::Runtime(message))
+            if message.contains("no runtime owner")
     ));
 
     assert_eq!(
@@ -649,6 +696,15 @@ async fn missing_target_owner_preserves_the_join_and_message() {
             .unwrap()
             .body,
         BODY
+    );
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(mentions.mention_thread_agent(command).await.unwrap(), None);
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Failed
     );
     workspace.shutdown(LATER.into()).await.unwrap();
 }
@@ -678,20 +734,20 @@ async fn open_or_send_failure_preserves_the_join_and_message() {
         let mut mentions = workspace.thread(fixture.target.id).unwrap();
         let message_id = MessageId::new();
 
-        assert!(
-            mentions
-                .mention_thread_agent(mention_command(
-                    &fixture,
-                    message_id,
-                    fixture.mention_thread.id,
-                    fixture.target.id,
-                    BODY,
-                    CAPSULE,
-                    MENTIONED,
-                ))
-                .await
-                .is_err()
-        );
+        let outcome = mentions
+            .mention_thread_agent(mention_command(
+                &fixture,
+                message_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, ThreadMentionOutcome::PersistedFailed(_)));
 
         assert_eq!(
             target_members(&database, &fixture, fixture.mention_thread.id),
@@ -705,6 +761,12 @@ async fn open_or_send_failure_preserves_the_join_and_message() {
                 .unwrap()
                 .body,
             BODY
+        );
+        let delivery = delivery(&database, &fixture, message_id);
+        assert_eq!(delivery.status, DeliveryStatus::Failed);
+        assert_eq!(
+            delivery.capsule_delivered_at.as_deref(),
+            (failure == "body").then_some(MENTIONED)
         );
         {
             let observed = observed.lock().unwrap();
@@ -728,4 +790,195 @@ async fn open_or_send_failure_preserves_the_join_and_message() {
         target_owner.shutdown(LATER.into()).await.unwrap();
         workspace.shutdown(LATER.into()).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn body_failure_retry_delivers_original_body_without_duplicate_capsule() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let (mut transport, observed) = FakeTransport::new("target");
+    transport.send_fails_at = Some(2);
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+
+    assert!(matches!(
+        mentions
+            .mention_thread_agent(mention_command(
+                &fixture,
+                message_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await
+            .unwrap(),
+        Some(ThreadMentionOutcome::PersistedFailed(_))
+    ));
+    let retried = delivered(
+        mentions
+            .retry_thread_mention(retry_command(message_id, fixture.target.id))
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(retried.opened.thread_id, fixture.mention_thread.id);
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![CAPSULE, BODY, BODY]
+    );
+    let delivery = delivery(&database, &fixture, message_id);
+    assert_eq!(delivery.status, DeliveryStatus::Delivered);
+    assert_eq!(delivery.capsule_delivered_at.as_deref(), Some(MENTIONED));
+    assert_eq!(delivery.delivered_at.as_deref(), Some(LATER));
+
+    mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_retry_revalidates_membership_without_rejoining() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let mut workspace =
+        WorkspaceRuntime::<FakeTransport>::new(StorageWorker::open(database.path()).unwrap())
+            .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+    assert!(matches!(
+        mentions
+            .mention_thread_agent(mention_command(
+                &fixture,
+                message_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await
+            .unwrap(),
+        Some(ThreadMentionOutcome::PersistedFailed(_))
+    ));
+    SqliteStore::open(database.path())
+        .unwrap()
+        .remove_thread_member(fixture.mention_thread.id, fixture.target.id, LATER)
+        .unwrap();
+
+    assert_eq!(
+        mentions
+            .retry_thread_mention(retry_command(message_id, fixture.target.id))
+            .await
+            .unwrap(),
+        Some(ThreadMentionOutcome::PersistedFailed(
+            CollaborationError::ThreadMembershipRequired {
+                thread_id: fixture.mention_thread.id,
+                agent_id: fixture.target.id,
+            }
+        ))
+    );
+    assert_eq!(
+        target_members(&database, &fixture, fixture.mention_thread.id),
+        0
+    );
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Failed
+    );
+
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_claims_once_and_delivered_retry_is_a_transport_noop() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let mut workspace =
+        WorkspaceRuntime::<FakeTransport>::new(StorageWorker::open(database.path()).unwrap())
+            .unwrap();
+    let mut initial = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+    assert!(matches!(
+        initial
+            .mention_thread_agent(mention_command(
+                &fixture,
+                message_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await
+            .unwrap(),
+        Some(ThreadMentionOutcome::PersistedFailed(_))
+    ));
+
+    let (transport, observed) = FakeTransport::new("target");
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let mut retry_a = workspace.thread(fixture.target.id).unwrap();
+    let mut retry_b = workspace.thread(fixture.target.id).unwrap();
+    let command = retry_command(message_id, fixture.target.id);
+    let (a, b) = tokio::join!(
+        retry_a.retry_thread_mention(command.clone()),
+        retry_b.retry_thread_mention(command.clone())
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes.iter().filter(|outcome| outcome.is_none()).count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Some(ThreadMentionOutcome::Delivered(_))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![CAPSULE, BODY]
+    );
+    assert_eq!(initial.retry_thread_mention(command).await.unwrap(), None);
+    assert_eq!(observed.lock().unwrap().messages.len(), 2);
+    assert_eq!(
+        delivery(&database, &fixture, message_id).status,
+        DeliveryStatus::Delivered
+    );
+
+    retry_a.shutdown(LATER.into()).await.unwrap();
+    retry_b.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
 }

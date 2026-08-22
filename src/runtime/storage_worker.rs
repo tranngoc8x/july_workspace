@@ -3,9 +3,9 @@ use crate::application::{
     CollaborationError, CollaborationRuntime, MembershipChange, MembershipState,
 };
 use crate::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, PermissionDecision,
-    Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkItem,
-    WorkItemId,
+    Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
+    MessageId, PermissionDecision, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
+    SessionBindingStatus, WorkItem, WorkItemId,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -51,7 +51,22 @@ enum Command {
     ),
     GetOrCreateAgentDm(AgentId, AgentId, String, Reply<Conversation>),
     InsertMessage(Message, oneshot::Sender<Result<(), StoreError>>),
-    PersistThreadMention(Message, AgentId, AgentId, Reply<Option<bool>>),
+    PersistThreadMention(
+        Message,
+        AgentId,
+        AgentId,
+        String,
+        Reply<Option<(bool, MessageDelivery)>>,
+    ),
+    MarkDeliveryCapsuleDelivered(MessageId, AgentId, String, Reply<bool>),
+    MarkDeliveryDelivered(MessageId, AgentId, String, Reply<bool>),
+    MarkDeliveryFailed(MessageId, AgentId, String, Reply<bool>),
+    ClaimThreadMentionRetry(
+        MessageId,
+        AgentId,
+        String,
+        Reply<Option<(Message, MessageDelivery)>>,
+    ),
     ListMessages(
         ConversationId,
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
@@ -212,9 +227,58 @@ impl StorageHandle {
         message: Message,
         source_agent_id: AgentId,
         target_agent_id: AgentId,
-    ) -> Result<Option<bool>, CollaborationError> {
+        capsule: String,
+    ) -> Result<Option<(bool, MessageDelivery)>, CollaborationError> {
         self.collaboration_request(|reply| {
-            Command::PersistThreadMention(message, source_agent_id, target_agent_id, reply)
+            Command::PersistThreadMention(message, source_agent_id, target_agent_id, capsule, reply)
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_delivery_capsule_delivered(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        delivered_at: String,
+    ) -> Result<bool, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::MarkDeliveryCapsuleDelivered(message_id, target_agent_id, delivered_at, reply)
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_delivery_delivered(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        delivered_at: String,
+    ) -> Result<bool, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::MarkDeliveryDelivered(message_id, target_agent_id, delivered_at, reply)
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_delivery_failed(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        failed_at: String,
+    ) -> Result<bool, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::MarkDeliveryFailed(message_id, target_agent_id, failed_at, reply)
+        })
+        .await
+    }
+
+    pub(crate) async fn claim_thread_mention_retry(
+        &self,
+        message_id: MessageId,
+        target_agent_id: AgentId,
+        claimed_at: String,
+    ) -> Result<Option<(Message, MessageDelivery)>, CollaborationError> {
+        self.collaboration_request(|reply| {
+            Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply)
         })
         .await
     }
@@ -560,12 +624,68 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::InsertMessage(message, reply) => {
                 let _ = reply.send(store.insert_message(&message));
             }
-            Command::PersistThreadMention(message, source_agent_id, target_agent_id, reply) => {
-                let _ = reply.send(store.persist_thread_mention(
-                    &message,
-                    source_agent_id,
+            Command::PersistThreadMention(
+                message,
+                source_agent_id,
+                target_agent_id,
+                capsule,
+                reply,
+            ) => {
+                let result = (|| {
+                    let Some(changed) = store.persist_thread_mention(
+                        &message,
+                        source_agent_id,
+                        target_agent_id,
+                        &capsule,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let delivery = store
+                        .get_message_delivery(message.id, target_agent_id)?
+                        .ok_or(StoreError::InvalidStoredValue("message_delivery"))?;
+                    Ok(Some((changed, delivery)))
+                })();
+                let _ = reply.send(result);
+            }
+            Command::MarkDeliveryCapsuleDelivered(
+                message_id,
+                target_agent_id,
+                delivered_at,
+                reply,
+            ) => {
+                let _ = reply.send(store.mark_delivery_capsule_delivered(
+                    message_id,
                     target_agent_id,
+                    &delivered_at,
                 ));
+            }
+            Command::MarkDeliveryDelivered(message_id, target_agent_id, delivered_at, reply) => {
+                let _ = reply.send(store.mark_delivery_delivered(
+                    message_id,
+                    target_agent_id,
+                    &delivered_at,
+                ));
+            }
+            Command::MarkDeliveryFailed(message_id, target_agent_id, failed_at, reply) => {
+                let _ =
+                    reply.send(store.mark_delivery_failed(message_id, target_agent_id, &failed_at));
+            }
+            Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply) => {
+                let result =
+                    (|| {
+                        if !store.claim_failed_delivery(message_id, target_agent_id, &claimed_at)? {
+                            return Ok(None);
+                        }
+                        let message = store.get_message(message_id)?.ok_or(
+                            StoreError::InvalidStoredValue("message_delivery.message_id"),
+                        )?;
+                        let delivery = store
+                            .get_message_delivery(message_id, target_agent_id)?
+                            .ok_or(StoreError::InvalidStoredValue("message_delivery"))?;
+                        Ok(Some((message, delivery)))
+                    })();
+                let _ = reply.send(result);
             }
             Command::ListMessages(conversation_id, reply) => {
                 let _ = reply.send(store.list_messages(conversation_id));
