@@ -71,11 +71,15 @@ Current Phase 5.3 coverage:
 - target-only routing, exact replay suppression, and at-least-once crash-window
   semantics.
 
-Planned Phase 5.4 coverage:
-- restart reconciliation for persisted `PENDING` deliveries;
-- cancellation-related `PENDING` reconciliation;
-- restart, isolation, and delivery regression tests;
-- retry after transport failure across the restart boundary.
+Current Phase 5.4 coverage:
+- startup reconciliation transitions persisted `PENDING` deliveries to `FAILED`
+  before storage-worker readiness, without transport send or automatic retry;
+- cancellation/process-loss DM and Thread delivery reopen real runtime and
+  storage before explicit failed-only retry;
+- restart retry reuses the exact stored target/body, preserves target-only and
+  sibling-context isolation, and keeps successful Thread capsule progress
+  without resending that capsule;
+- at-least-once crash-window semantics; exactly-once delivery is not asserted.
 
 ## 4. Publish
 

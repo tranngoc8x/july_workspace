@@ -150,6 +150,11 @@ message body and exact target. Thread retry revalidates active Agent, Room, and
 Thread membership without implicitly rejoining; a persisted Thread capsule is
 tracked separately so a successful capsule is not resent.
 
+At Phase 5.4 startup, pre-existing `pending` rows are reconciled to `failed`
+before the storage worker is ready. Reconciliation sends nothing: only an
+explicit retry after restart may claim the row, retaining its stored target,
+body, and capsule progress.
+
 ### work_items
 
 ```sql
@@ -489,7 +494,7 @@ migrate with `is_primary = 0`; July does not infer historical primary
 ownership. The aggregate Phase 4 create operation is responsible for inserting
 one primary WorkItem for every new Thread.
 
-Phase 5.3 message delivery is at-least-once. A crash after transport accepts a
+Phase 5.4 message delivery is at-least-once. A crash after transport accepts a
 message but before SQLite records `delivered` can cause an explicit retry to
 send the same exact body again. Exactly-once delivery is not promised.
 

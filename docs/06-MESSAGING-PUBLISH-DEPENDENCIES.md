@@ -58,11 +58,18 @@ rejoins. A capsule is persisted only when the initial mention joins or rejoins
 the target, and capsule delivery is tracked separately so a successful capsule
 is not resent.
 
+Phase 5.4 startup reconciliation transitions pre-existing `PENDING` deliveries
+to `FAILED` before the storage worker becomes ready. It does not send them or
+schedule automatic retry: a caller must explicitly retry after restart. The
+stored target/body and any successful Thread capsule progress are preserved.
+Restart and cancellation/process-loss coverage proves this independently for DM
+and Thread delivery, including isolation from sibling target context.
+
 Delivery is at-least-once. If the process crashes after transport acceptance
 but before the `DELIVERED` transition, a later explicit retry can deliver the
 same body again. July makes no exactly-once promise and does not add a daemon,
 automatic backoff, CLI, semantic routing, or a new public messaging syntax in
-Phase 5.3.
+Phase 5.4.
 
 ## Result
 

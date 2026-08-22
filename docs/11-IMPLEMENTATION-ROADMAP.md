@@ -217,18 +217,17 @@ routing, or new public syntax.
 
 ### Phase 5.4 — Restart, isolation, and delivery regression tests
 
-Status: planned.
+Status: implemented and verified. Startup reconciliation transitions persisted
+`PENDING` deliveries to `FAILED` before the storage worker becomes ready; it
+does not send or automatically retry them. Explicit failed-only retry after
+restart reuses the stored target/body. Thread retries preserve successful
+capsule progress and do not resend that capsule. DM and Thread process-loss
+tests also prove target/body and sibling-context isolation.
 
-Remaining implementation:
-
-- Phase 5.4 restart and cancellation-related `PENDING` reconciliation,
-  isolation, and delivery regression tests.
-
-DoD:
-
-- explicit routing is deterministic;
-- no semantic coordinator for explicit recipient;
-- target receives only relevant context/capsule.
+Delivery remains at-least-once: a crash after transport acceptance before the
+`DELIVERED` write can duplicate the exact body on a later explicit retry.
+Exactly-once delivery, a daemon, automatic retry/backoff, and messaging CLI
+remain out of scope for this phase.
 
 ---
 
