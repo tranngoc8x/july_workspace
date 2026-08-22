@@ -199,6 +199,13 @@ fn work_validation_requires_completed_at_exactly_for_terminal_status() {
         work.validate(),
         Err(DomainError::WorkCompletionTimestampMismatch)
     );
+
+    work.status = WorkStatus::Done;
+    work.completed_at = Some("  ".into());
+    assert_eq!(
+        work.validate(),
+        Err(DomainError::EmptyField("work_item.completed_at"))
+    );
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -32,6 +32,10 @@ const MIGRATIONS: [Migration; 5] = [
     Migration {
         version: 5,
         sql: include_str!("migrations/0005_phase6_workflow.sql"),
+    },
+    Migration {
+        version: 6,
+        sql: include_str!("migrations/0006_work_completion_invariant.sql"),
     },
 ];
 
@@ -2135,6 +2139,7 @@ fn current_schema_version(connection: &Connection) -> Result<i64, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::{MIGRATIONS, Migration, SqliteStore, apply_migrations};
+    use crate::domain::{ConversationId, DomainError, WorkItemId};
     use crate::storage::StoreError;
     use rusqlite::{Connection, params};
     use std::env;
@@ -2193,11 +2198,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_five() {
+    fn fresh_database_has_schema_version_six() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -2561,14 +2566,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -2733,7 +2738,7 @@ mod tests {
             )
             .unwrap();
 
-        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..5]).unwrap();
 
         assert_eq!(super::current_schema_version(&connection).unwrap(), 5);
         let status: String = connection
@@ -2750,6 +2755,128 @@ mod tests {
                 .execute("UPDATE work_dependencies SET status = 'unknown'", [])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn migration_six_repairs_legacy_work_completion_and_guards_raw_writes() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..5]).unwrap();
+        seed_conversation(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at, completed_at
+                 ) VALUES
+                    ('terminal-null', 'conversation-1', 'terminal null', 'done',
+                     'created', 'terminal-null-updated', NULL),
+                    ('terminal-blank', 'conversation-1', 'terminal blank', 'failed',
+                     'created', 'terminal-blank-updated', '  '),
+                    ('nonterminal-set', 'conversation-1', 'nonterminal set', 'working',
+                     'created', 'nonterminal-updated', 'legacy-completed'),
+                    ('valid-terminal', 'conversation-1', 'valid terminal', 'cancelled',
+                     'created', 'valid-terminal-updated', 'valid-completed'),
+                    ('valid-open', 'conversation-1', 'valid open', 'open',
+                     'created', 'valid-open-updated', NULL);",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 6);
+        for (id, expected) in [
+            ("terminal-null", Some("terminal-null-updated")),
+            ("terminal-blank", Some("terminal-blank-updated")),
+            ("nonterminal-set", None),
+            ("valid-terminal", Some("valid-completed")),
+            ("valid-open", None),
+        ] {
+            let completed_at: Option<String> = connection
+                .query_row(
+                    "SELECT completed_at FROM work_items WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(completed_at.as_deref(), expected, "wrong repair for {id}");
+        }
+
+        for (id, status, completed_at) in [
+            ("raw-terminal-null", "done", None),
+            ("raw-terminal-blank", "failed", Some("  ")),
+            ("raw-nonterminal-set", "working", Some("completed")),
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO work_items(
+                            id, conversation_id, title, status,
+                            created_at, updated_at, completed_at
+                         ) VALUES (?1, 'conversation-1', 'raw', ?2, 'created', 'updated', ?3)",
+                        params![id, status, completed_at],
+                    )
+                    .is_err(),
+                "accepted invalid raw insert: {id}"
+            );
+        }
+        assert!(
+            connection
+                .execute(
+                    "UPDATE work_items
+                     SET status = 'done', completed_at = NULL
+                     WHERE id = 'valid-open'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE work_items
+                     SET status = 'working'
+                     WHERE id = 'valid-terminal'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn work_hydration_rejects_invalid_completion_state() {
+        let database = TestDatabase::new();
+        let mut connection = Connection::open(database.path()).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..5]).unwrap();
+        let conversation_id = ConversationId::new();
+        let work_id = WorkItemId::new();
+        connection
+            .execute(
+                "INSERT INTO conversations(id, type, status, created_at, updated_at)
+                 VALUES (?1, 'dm', 'open', 'created', 'updated')",
+                [conversation_id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO work_items(
+                    id, conversation_id, title, status, created_at, updated_at, completed_at
+                 ) VALUES (?1, ?2, 'invalid', 'done', 'created', 'updated', NULL)",
+                params![work_id.to_string(), conversation_id.to_string()],
+            )
+            .unwrap();
+        let store = SqliteStore { connection };
+
+        assert!(matches!(
+            store.get_work_item(work_id),
+            Err(StoreError::Domain(
+                DomainError::WorkCompletionTimestampMismatch
+            ))
+        ));
     }
 
     #[test]
@@ -2870,15 +2997,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (6);",
+                 INSERT INTO schema_migrations(version) VALUES (7);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 6,
-                supported: 5,
+                found: 7,
+                supported: 6,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

@@ -140,7 +140,7 @@ pub(super) fn message_delivery(row: &Row<'_>) -> Result<MessageDelivery, StoreEr
 }
 
 pub(super) fn work_item(row: &Row<'_>) -> Result<WorkItem, StoreError> {
-    Ok(WorkItem {
+    let work_item = WorkItem {
         id: id(row.get(0)?)?,
         conversation_id: id(row.get(1)?)?,
         title: row.get(2)?,
@@ -151,7 +151,9 @@ pub(super) fn work_item(row: &Row<'_>) -> Result<WorkItem, StoreError> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
         completed_at: row.get(9)?,
-    })
+    };
+    work_item.validate()?;
+    Ok(work_item)
 }
 
 pub(super) fn work_dependency(row: &Row<'_>) -> Result<WorkDependency, StoreError> {
