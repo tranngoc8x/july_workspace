@@ -911,6 +911,23 @@ impl SqliteStore {
         )? == 1)
     }
 
+    pub(crate) fn reconcile_pending_deliveries(
+        &mut self,
+        failed_at: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE message_deliveries
+             SET status = 'failed', updated_at = ?1
+             WHERE status = 'pending'",
+            params![failed_at],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn claim_failed_delivery(
         &self,
         message_id: MessageId,

@@ -1,13 +1,12 @@
 use super::{
     AgentDirectMessageRuntime, AgentThreadRuntime, RuntimeError, SessionManager, StorageHandle,
-    StorageWorker,
+    StorageWorker, timestamp,
 };
 use crate::domain::{Agent, AgentId, PermissionOutcome, SessionBinding, SessionBindingId};
 use crate::transport::{
     AgentConnection, AgentTransport, PermissionRequestId, PermissionResponse, SendMessage,
     SessionRef, TransportEvent,
 };
-use chrono::{SecondsFormat, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{
@@ -657,8 +656,4 @@ fn event_session(event: &TransportEvent) -> Option<&SessionRef> {
         TransportEvent::PermissionRequested(request) => Some(&request.session),
         TransportEvent::TransportDisconnected { .. } => None,
     }
-}
-
-fn timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
