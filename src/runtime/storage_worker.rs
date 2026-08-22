@@ -5,10 +5,10 @@ use crate::application::{
     PublishedResult, WorkError, WorkRuntime,
 };
 use crate::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationMember, Message, MessageDelivery,
-    MessageId, PermissionDecision, Publish, PublishId, ResultId, Room, RoomId, RoomMember,
-    SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem, WorkItemId,
-    WorkResult, WorkStatus,
+    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Message,
+    MessageDelivery, MessageId, PermissionDecision, Publish, PublishId, ResultId, Room, RoomId,
+    RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem,
+    WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -103,6 +103,12 @@ enum Command {
     ListMessages(
         ConversationId,
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
+    ),
+    InsertCheckpoint(Checkpoint, oneshot::Sender<Result<(), StoreError>>),
+    GetLatestCheckpoint(
+        ConversationId,
+        AgentId,
+        oneshot::Sender<Result<Option<Checkpoint>, StoreError>>,
     ),
     InsertBinding(SessionBinding, oneshot::Sender<Result<(), StoreError>>),
     GetCurrentBinding(
@@ -358,6 +364,20 @@ impl StorageHandle {
         conversation_id: ConversationId,
     ) -> Result<Vec<Message>, RuntimeError> {
         self.request(|reply| Command::ListMessages(conversation_id, reply))
+            .await
+    }
+
+    pub async fn insert_checkpoint(&self, checkpoint: Checkpoint) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::InsertCheckpoint(checkpoint, reply))
+            .await
+    }
+
+    pub async fn get_latest_checkpoint(
+        &self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+    ) -> Result<Option<Checkpoint>, RuntimeError> {
+        self.request(|reply| Command::GetLatestCheckpoint(conversation_id, agent_id, reply))
             .await
     }
 
@@ -935,6 +955,12 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::ListMessages(conversation_id, reply) => {
                 let _ = reply.send(store.list_messages(conversation_id));
+            }
+            Command::InsertCheckpoint(checkpoint, reply) => {
+                let _ = reply.send(store.insert_checkpoint(&checkpoint));
+            }
+            Command::GetLatestCheckpoint(conversation_id, agent_id, reply) => {
+                let _ = reply.send(store.get_latest_checkpoint(conversation_id, agent_id));
             }
             Command::InsertBinding(binding, reply) => {
                 let _ = reply.send(store.insert_session_binding(&binding));

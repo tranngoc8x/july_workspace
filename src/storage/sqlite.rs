@@ -1695,6 +1695,24 @@ impl SqliteStore {
         )
     }
 
+    pub fn get_latest_checkpoint(
+        &self,
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+    ) -> Result<Option<Checkpoint>, StoreError> {
+        query_optional(
+            &self.connection,
+            "SELECT id, conversation_id, agent_id, goal, current_state, decisions_json,
+                    open_items_json, references_json, last_message_id, created_at
+             FROM checkpoints
+             WHERE conversation_id = ?1 AND agent_id = ?2
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+            params![conversation_id.to_string(), agent_id.to_string()],
+            records::checkpoint,
+        )
+    }
+
     pub fn insert_memory(&self, memory: &Memory) -> Result<(), StoreError> {
         memory.validate()?;
         let evidence = serde_json::to_string(&memory.evidence)?;
