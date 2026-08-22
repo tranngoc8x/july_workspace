@@ -10,6 +10,7 @@ use ulid::Ulid;
 
 const CREATED: &str = "2026-08-22T10:00:00Z";
 const LATER: &str = "2026-08-22T11:00:00Z";
+const SHARED_SCOPE_ID: &str = "durable-scope";
 
 struct TestDatabase {
     directory: PathBuf,
@@ -84,34 +85,34 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
     let first = memory(
         "00000000000000000000000001",
         MemoryScopeType::Project,
-        "cashpoint",
+        SHARED_SCOPE_ID,
         MemoryKind::Fact,
         Some(source.id),
         None,
         CREATED,
     );
-    let corrected = memory(
+    let same_time_second = memory(
         "00000000000000000000000002",
         MemoryScopeType::Project,
-        "cashpoint",
+        SHARED_SCOPE_ID,
         MemoryKind::Fact,
         Some(source.id),
-        Some(first.id),
+        None,
         CREATED,
     );
-    let project_decision = memory(
+    let superseding_decision = memory(
         "00000000000000000000000003",
         MemoryScopeType::Project,
-        "cashpoint",
+        SHARED_SCOPE_ID,
         MemoryKind::Decision,
-        None,
-        None,
+        Some(source.id),
+        Some(first.id),
         LATER,
     );
     let room_constraint = memory(
         "00000000000000000000000004",
         MemoryScopeType::Room,
-        "room-42",
+        SHARED_SCOPE_ID,
         MemoryKind::Constraint,
         None,
         None,
@@ -120,7 +121,7 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
     let agent_result = memory(
         "00000000000000000000000005",
         MemoryScopeType::Agent,
-        "agent-codex",
+        SHARED_SCOPE_ID,
         MemoryKind::Result,
         None,
         None,
@@ -129,9 +130,9 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
 
     let mut worker = StorageWorker::open(database.path()).unwrap();
     for memory in [
+        same_time_second.clone(),
         first.clone(),
-        corrected.clone(),
-        project_decision.clone(),
+        superseding_decision.clone(),
         room_constraint.clone(),
         agent_result.clone(),
     ] {
@@ -139,32 +140,36 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
     }
     assert_eq!(
         worker
-            .list_memories(MemoryScopeType::Project, "cashpoint".into(), None)
+            .list_memories(MemoryScopeType::Project, SHARED_SCOPE_ID.into(), None)
             .await
             .unwrap(),
-        vec![first.clone(), corrected.clone(), project_decision]
+        vec![
+            first.clone(),
+            same_time_second.clone(),
+            superseding_decision.clone()
+        ]
     );
     assert_eq!(
         worker
             .list_memories(
                 MemoryScopeType::Project,
-                "cashpoint".into(),
+                SHARED_SCOPE_ID.into(),
                 Some(MemoryKind::Fact),
             )
             .await
             .unwrap(),
-        vec![first.clone(), corrected.clone()]
+        vec![first.clone(), same_time_second.clone()]
     );
     assert_eq!(
         worker
-            .list_memories(MemoryScopeType::Room, "room-42".into(), None)
+            .list_memories(MemoryScopeType::Room, SHARED_SCOPE_ID.into(), None)
             .await
             .unwrap(),
         vec![room_constraint]
     );
     assert_eq!(
         worker
-            .list_memories(MemoryScopeType::Agent, "agent-codex".into(), None)
+            .list_memories(MemoryScopeType::Agent, SHARED_SCOPE_ID.into(), None)
             .await
             .unwrap(),
         vec![agent_result]
@@ -174,14 +179,10 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
     let mut restarted = StorageWorker::open(database.path()).unwrap();
     assert_eq!(
         restarted
-            .list_memories(
-                MemoryScopeType::Project,
-                "cashpoint".into(),
-                Some(MemoryKind::Fact),
-            )
+            .list_memories(MemoryScopeType::Project, SHARED_SCOPE_ID.into(), None,)
             .await
             .unwrap(),
-        vec![first, corrected]
+        vec![first, same_time_second, superseding_decision]
     );
     restarted.shutdown().await.unwrap();
 }
