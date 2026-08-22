@@ -1,10 +1,10 @@
 use super::{StoreError, records};
 use crate::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
-    ConversationMember, DeliveryStatus, MemberType, Memory, MemoryId, Message, MessageDelivery,
-    MessageId, PermissionDecision, PermissionOutcome, Publish, PublishId, ResultId, Room, RoomId,
-    RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem,
-    WorkItemId, WorkResult, WorkStatus,
+    ConversationMember, DeliveryStatus, MemberType, Memory, MemoryId, MemoryKind, MemoryScopeType,
+    Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome, Publish, PublishId,
+    ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
+    WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -1743,6 +1743,28 @@ impl SqliteStore {
                     evidence_json, supersedes_memory_id, created_at
              FROM memories WHERE id = ?1",
             params![id.to_string()],
+            records::memory,
+        )
+    }
+
+    pub fn list_memories(
+        &self,
+        scope_type: MemoryScopeType,
+        scope_id: &str,
+        kind: Option<MemoryKind>,
+    ) -> Result<Vec<Memory>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, scope_type, scope_id, kind, content, source_conversation_id,
+                    evidence_json, supersedes_memory_id, created_at
+             FROM memories
+             WHERE scope_type = ?1 AND scope_id = ?2 AND (?3 IS NULL OR kind = ?3)
+             ORDER BY created_at ASC, id ASC",
+            params![
+                scope_type.to_string(),
+                scope_id,
+                kind.map(|kind| kind.to_string()),
+            ],
             records::memory,
         )
     }

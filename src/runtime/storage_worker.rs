@@ -5,10 +5,10 @@ use crate::application::{
     PublishedResult, WorkError, WorkRuntime,
 };
 use crate::domain::{
-    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Message,
-    MessageDelivery, MessageId, PermissionDecision, Publish, PublishId, ResultId, Room, RoomId,
-    RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus, WorkDependency, WorkItem,
-    WorkItemId, WorkResult, WorkStatus,
+    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Memory,
+    MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, Publish,
+    PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
+    SessionBindingStatus, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -109,6 +109,13 @@ enum Command {
         ConversationId,
         AgentId,
         oneshot::Sender<Result<Option<Checkpoint>, StoreError>>,
+    ),
+    PromoteMemory(Memory, Reply<()>),
+    ListMemories(
+        MemoryScopeType,
+        String,
+        Option<MemoryKind>,
+        Reply<Vec<Memory>>,
     ),
     InsertBinding(SessionBinding, oneshot::Sender<Result<(), StoreError>>),
     GetCurrentBinding(
@@ -378,6 +385,21 @@ impl StorageHandle {
         agent_id: AgentId,
     ) -> Result<Option<Checkpoint>, RuntimeError> {
         self.request(|reply| Command::GetLatestCheckpoint(conversation_id, agent_id, reply))
+            .await
+    }
+
+    pub async fn promote_memory(&self, memory: Memory) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::PromoteMemory(memory, reply))
+            .await
+    }
+
+    pub async fn list_memories(
+        &self,
+        scope_type: MemoryScopeType,
+        scope_id: String,
+        kind: Option<MemoryKind>,
+    ) -> Result<Vec<Memory>, RuntimeError> {
+        self.request(|reply| Command::ListMemories(scope_type, scope_id, kind, reply))
             .await
     }
 
@@ -961,6 +983,12 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::GetLatestCheckpoint(conversation_id, agent_id, reply) => {
                 let _ = reply.send(store.get_latest_checkpoint(conversation_id, agent_id));
+            }
+            Command::PromoteMemory(memory, reply) => {
+                let _ = reply.send(store.insert_memory(&memory));
+            }
+            Command::ListMemories(scope_type, scope_id, kind, reply) => {
+                let _ = reply.send(store.list_memories(scope_type, &scope_id, kind));
             }
             Command::InsertBinding(binding, reply) => {
                 let _ = reply.send(store.insert_session_binding(&binding));
