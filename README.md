@@ -82,8 +82,8 @@ July is designed to sit around coding agents such as Codex, Claude Code, and oth
 
 ## Current Status
 
-July Workspace is currently under active development. Core roadmap Phases 0-4
-plus Phases 5.1-5.4 are implemented and tested: durable agent/DM state, ACP
+July Workspace is currently under active development. Core roadmap Phases 0-5
+are implemented and tested: durable agent/DM state, ACP
 session lifecycle, Room/Thread membership, atomic Thread creation with primary
 Work, targeted isolated Thread sessions, explicit Agent-to-Agent DM, explicit
 Thread mentions with dynamic member join, and durable per-target offline
@@ -95,8 +95,7 @@ no Agent-to-Agent messaging CLI exists yet.
 
 Next milestones focus on:
 
-- cross-agent collaboration
-- structured Results
+- structured Results and publishing
 - dependencies between agents
 - session recovery
 - developer-friendly CLI workflows
