@@ -1,7 +1,8 @@
 use crate::application::{
-    AddRoomMember, AgentRef, CollaborationError, CollaborationService, CreateRoom, CreateThread,
-    DirectMessageError, DirectMessageEvent, DirectMessageFailureKind, DirectMessageRuntime,
-    DirectMessageService, MembershipChange, MembershipState, RemoveRoomMember, RoomRef,
+    AddRoomMember, AddThreadMember, AgentRef, CollaborationError, CollaborationService, CreateRoom,
+    CreateThread, DirectMessageError, DirectMessageEvent, DirectMessageFailureKind,
+    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState,
+    RemoveRoomMember, RemoveThreadMember, RoomRef,
 };
 use crate::domain::{
     AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, RoomId, WorkItemId,
@@ -168,8 +169,18 @@ enum ThreadOperation {
         title: String,
         room: RoomRef,
         goal: Option<String>,
+        members: Vec<AgentRef>,
     },
     List(RoomRef),
+    Members(ConversationId),
+    AddMember {
+        thread_id: ConversationId,
+        agent: AgentRef,
+    },
+    RemoveMember {
+        thread_id: ConversationId,
+        agent: AgentRef,
+    },
 }
 
 fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
@@ -189,15 +200,31 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
 fn parse_thread(args: Vec<String>, json: bool) -> Result<Command, CliError> {
     let operation = match args.as_slice() {
         [_, command, title, rest @ ..] if command == "create" => {
-            let (room, goal) = parse_thread_create(rest)?;
+            let (room, goal, members) = parse_thread_create(rest)?;
             ThreadOperation::Create {
                 title: positional(title)?,
                 room,
                 goal,
+                members,
             }
         }
         [_, command, rest @ ..] if command == "list" => {
             ThreadOperation::List(parse_thread_room(rest)?)
+        }
+        [_, command, thread] if command == "members" => {
+            ThreadOperation::Members(thread_id(thread)?)
+        }
+        [_, member, action, thread, agent] if member == "member" && action == "add" => {
+            ThreadOperation::AddMember {
+                thread_id: thread_id(thread)?,
+                agent: agent_ref(agent)?,
+            }
+        }
+        [_, member, action, thread, agent] if member == "member" && action == "remove" => {
+            ThreadOperation::RemoveMember {
+                thread_id: thread_id(thread)?,
+                agent: agent_ref(agent)?,
+            }
         }
         _ if matches!(
             args.get(1).map(String::as_str),
@@ -218,9 +245,12 @@ fn parse_thread_room(args: &[String]) -> Result<RoomRef, CliError> {
     }
 }
 
-fn parse_thread_create(args: &[String]) -> Result<(RoomRef, Option<String>), CliError> {
+fn parse_thread_create(
+    args: &[String],
+) -> Result<(RoomRef, Option<String>, Vec<AgentRef>), CliError> {
     let mut room = None;
     let mut goal = None;
+    let mut members = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let Some(value) = args.get(index + 1) else {
@@ -229,11 +259,13 @@ fn parse_thread_create(args: &[String]) -> Result<(RoomRef, Option<String>), Cli
         match args[index].as_str() {
             "--room" if room.is_none() => room = Some(room_ref(value)?),
             "--goal" if goal.is_none() && !value.starts_with("--") => goal = Some(value.clone()),
+            "--member" => members.push(agent_ref(value)?),
             _ => return Err(CliError::Usage),
         }
         index += 2;
     }
-    room.map(|room| (room, goal)).ok_or(CliError::Usage)
+    room.map(|room| (room, goal, members))
+        .ok_or(CliError::Usage)
 }
 
 fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
@@ -318,6 +350,13 @@ fn agent_ref(value: &str) -> Result<AgentRef, CliError> {
         return Ok(AgentRef::Id(id));
     }
     Ok(AgentRef::Name(value.into()))
+}
+
+fn thread_id(value: &str) -> Result<ConversationId, CliError> {
+    let id = ConversationId::from_str(value).map_err(|_| CliError::Usage)?;
+    (id.to_string() == value)
+        .then_some(id)
+        .ok_or(CliError::Usage)
 }
 
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
@@ -503,7 +542,12 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
     let mut service = CollaborationService::new(worker);
     let output = async {
         let output = match operation {
-            ThreadOperation::Create { title, room, goal } => {
+            ThreadOperation::Create {
+                title,
+                room,
+                goal,
+                members,
+            } => {
                 let thread = service
                     .create_thread(CreateThread {
                         thread_id: ConversationId::new(),
@@ -512,7 +556,7 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
                         title,
                         goal,
                         user_id: LOCAL_USER_ID.into(),
-                        initial_agents: Vec::new(),
+                        initial_agents: members,
                         created_at: timestamp(),
                     })
                     .await?;
@@ -528,6 +572,30 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
                     Some(format!("{}\t{}", thread.thread_id, thread.primary_work_id))
                 }
             }
+            ThreadOperation::Members(thread_id) => {
+                let members = service.list_thread_members(thread_id).await?;
+                Some(render_thread_members(members, json_output))
+            }
+            ThreadOperation::AddMember { thread_id, agent } => Some(render_membership_change(
+                service
+                    .add_thread_member(AddThreadMember {
+                        thread_id,
+                        agent,
+                        changed_at: timestamp(),
+                    })
+                    .await?,
+                json_output,
+            )),
+            ThreadOperation::RemoveMember { thread_id, agent } => Some(render_membership_change(
+                service
+                    .remove_thread_member(RemoveThreadMember {
+                        thread_id,
+                        agent,
+                        changed_at: timestamp(),
+                    })
+                    .await?,
+                json_output,
+            )),
             ThreadOperation::List(room) => {
                 let threads = service.list_threads(room).await?;
                 if json_output {
@@ -587,6 +655,52 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
             operation: Box::new(operation),
             shutdown: shutdown.to_string(),
         }),
+    }
+}
+
+fn render_thread_members(
+    members: Vec<crate::domain::ConversationMember>,
+    json_output: bool,
+) -> String {
+    if json_output {
+        json!(
+            members
+                .into_iter()
+                .map(|member| json!({
+                    "thread_id": member.conversation_id.to_string(),
+                    "member_type": match member.member_type {
+                        MemberType::User => "user",
+                        MemberType::Agent => "agent",
+                    },
+                    "member_id": member.member_id,
+                    "generation": member.generation,
+                    "joined_at": member.joined_at,
+                    "left_at": member.left_at,
+                    "state": membership_state(member.left_at.is_none()),
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string()
+    } else {
+        members
+            .into_iter()
+            .map(|member| {
+                let state = membership_state(member.left_at.is_none());
+                let member_type = match member.member_type {
+                    MemberType::User => "user",
+                    MemberType::Agent => "agent",
+                };
+                format!(
+                    "{}\t{member_type}\t{}\t{}\t{}\t{}\t{state}",
+                    member.conversation_id,
+                    member.member_id,
+                    member.generation,
+                    member.joined_at,
+                    member.left_at.unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
