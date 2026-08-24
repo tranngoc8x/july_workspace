@@ -45,6 +45,11 @@ pub enum CliError {
     Disconnected(String),
     #[error("agent event stream closed")]
     EventStreamClosed,
+    #[error("{operation}; storage shutdown failed: {shutdown}")]
+    RoomOperationAndShutdown {
+        operation: Box<CliError>,
+        shutdown: String,
+    },
     #[error("{0}")]
     Json(String),
 }
@@ -53,6 +58,15 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let mut args = args.into_iter();
     let _program = args.next();
     let args: Vec<OsString> = args.collect();
+    if args.len() == 2 && args[0] == "dm" {
+        let agent_name = args
+            .into_iter()
+            .nth(1)
+            .expect("checked argument count")
+            .into_string()
+            .map_err(|_| CliError::InvalidAgentName)?;
+        return run_dm(agent_name).await;
+    }
     let json_requested = args.iter().any(|arg| arg == "--json");
     let args: Vec<String> = args
         .into_iter()
@@ -73,7 +87,16 @@ impl CliError {
         if !json_requested || matches!(&self, Self::Json(_)) {
             return self;
         }
-        let code = match &self {
+        Self::Json(
+            json!({ "error": {
+            "code": self.error_code(), "message": self.to_string()
+        } })
+            .to_string(),
+        )
+    }
+
+    fn error_code(&self) -> &'static str {
+        match self {
             Self::Usage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
             Self::Io(_) => "io_error",
@@ -93,9 +116,9 @@ impl CliError {
             | Self::TurnFailed(_)
             | Self::Disconnected(_)
             | Self::EventStreamClosed => "runtime_error",
+            Self::RoomOperationAndShutdown { operation, .. } => operation.error_code(),
             Self::Json(_) => unreachable!(),
-        };
-        Self::Json(json!({ "code": code, "message": self.to_string() }).to_string())
+        }
     }
 }
 
@@ -144,22 +167,14 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
 }
 
 fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
-    let mut found = false;
-    args.retain(|arg| {
-        if arg == "--json" {
-            if found {
-                return true;
-            }
-            found = true;
-            false
-        } else {
-            true
-        }
-    });
-    if args.iter().filter(|arg| arg.as_str() == "--json").count() > 0 {
+    let count = args.iter().filter(|arg| arg.as_str() == "--json").count();
+    if count > 1 {
         return Err(CliError::Usage);
     }
-    Ok(found)
+    if count == 1 {
+        args.retain(|arg| arg != "--json");
+    }
+    Ok(count == 1)
 }
 
 fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
@@ -212,23 +227,27 @@ fn parse_description(args: &[String]) -> Result<Option<String>, CliError> {
 }
 
 fn room_ref(value: &str) -> Result<RoomRef, CliError> {
-    if value.len() != 26 {
-        return Ok(RoomRef::Name(value.into()));
+    if value.starts_with("--") {
+        return Err(CliError::Usage);
     }
-    let id = RoomId::from_str(value).map_err(|_| CliError::Usage)?;
-    (id.to_string() == value)
-        .then_some(RoomRef::Id(id))
-        .ok_or(CliError::Usage)
+    if let Ok(id) = RoomId::from_str(value)
+        && id.to_string() == value
+    {
+        return Ok(RoomRef::Id(id));
+    }
+    Ok(RoomRef::Name(value.into()))
 }
 
 fn agent_ref(value: &str) -> Result<AgentRef, CliError> {
-    if value.len() != 26 {
-        return Ok(AgentRef::Name(value.into()));
+    if value.starts_with("--") {
+        return Err(CliError::Usage);
     }
-    let id = AgentId::from_str(value).map_err(|_| CliError::Usage)?;
-    (id.to_string() == value)
-        .then_some(AgentRef::Id(id))
-        .ok_or(CliError::Usage)
+    if let Ok(id) = AgentId::from_str(value)
+        && id.to_string() == value
+    {
+        return Ok(AgentRef::Id(id));
+    }
+    Ok(AgentRef::Name(value.into()))
 }
 
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
@@ -275,7 +294,8 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
     let worker =
         StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
     let mut service = CollaborationService::new(worker);
-    match operation {
+    let output = async {
+        let output = match operation {
         RoomOperation::Create { name, description } => {
             let room_id = service
                 .create_room(CreateRoom {
@@ -286,9 +306,9 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                 })
                 .await?;
             if json_output {
-                println!("{}", json!({ "room_id": room_id.to_string() }));
+                Some(json!({ "room_id": room_id.to_string() }).to_string())
             } else {
-                println!("{room_id}");
+                Some(room_id.to_string())
             }
         }
         RoomOperation::List => {
@@ -304,17 +324,22 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                         })
                     })
                     .collect();
-                println!("{}", json!(rooms));
+                Some(json!(rooms).to_string())
             } else {
-                for room in rooms {
-                    println!(
-                        "{}\t{}\t{}\t{}",
-                        room.id,
-                        room.name,
-                        room.description.unwrap_or_default(),
-                        room.status
-                    );
-                }
+                let output = rooms
+                    .into_iter()
+                    .map(|room| {
+                        format!(
+                            "{}\t{}\t{}\t{}",
+                            room.id,
+                            room.name,
+                            room.description.unwrap_or_default(),
+                            room.status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!output.is_empty()).then_some(output)
             }
         }
         RoomOperation::Members(room) => {
@@ -329,20 +354,25 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                         "state": membership_state(member.left_at.is_none()),
                     }))
                     .collect();
-                println!("{}", json!(members));
+                Some(json!(members).to_string())
             } else {
-                for member in members {
-                    let state = membership_state(member.left_at.is_none());
-                    println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
-                        member.room_id,
-                        member.agent_id,
-                        member.role.unwrap_or_default(),
-                        member.generation,
-                        member.joined_at,
-                        member.left_at.unwrap_or_default(),
-                    );
-                }
+                let output = members
+                    .into_iter()
+                    .map(|member| {
+                        let state = membership_state(member.left_at.is_none());
+                        format!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
+                            member.room_id,
+                            member.agent_id,
+                            member.role.unwrap_or_default(),
+                            member.generation,
+                            member.joined_at,
+                            member.left_at.unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!output.is_empty()).then_some(output)
             }
         }
         RoomOperation::AddMember { room, agent } => {
@@ -354,7 +384,7 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                     changed_at: timestamp(),
                 })
                 .await?;
-            print_membership_change(change, json_output);
+            Some(render_membership_change(change, json_output))
         }
         RoomOperation::RemoveMember { room, agent } => {
             let change = service
@@ -364,21 +394,41 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                     changed_at: timestamp(),
                 })
                 .await?;
-            print_membership_change(change, json_output);
+            Some(render_membership_change(change, json_output))
         }
+        };
+        Ok::<_, CliError>(output)
     }
-    Ok(())
+    .await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (output, shutdown) {
+        (Ok(Some(output)), Ok(())) => {
+            println!("{output}");
+            Ok(())
+        }
+        (Ok(None), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::RoomOperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
 }
 
-fn print_membership_change(change: MembershipChange, json_output: bool) {
+fn render_membership_change(change: MembershipChange, json_output: bool) -> String {
     let state = match change.state {
         MembershipState::Active => "active",
         MembershipState::Left => "left",
     };
     if json_output {
-        println!("{}", json!({ "state": state, "changed": change.changed }));
+        json!({ "state": state, "changed": change.changed }).to_string()
     } else {
-        println!("{state}\t{}", change.changed);
+        format!("{state}\t{}", change.changed)
     }
 }
 

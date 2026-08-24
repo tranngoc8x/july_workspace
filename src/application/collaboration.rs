@@ -268,6 +268,10 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
         Self { runtime }
     }
 
+    pub fn into_runtime(self) -> R {
+        self.runtime
+    }
+
     pub async fn create_room(&mut self, command: CreateRoom) -> Result<RoomId, CollaborationError> {
         let room = Room {
             id: command.room_id,

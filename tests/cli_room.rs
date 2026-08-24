@@ -50,6 +50,16 @@ impl TestWorkspace {
             .unwrap()
     }
 
+    #[cfg(unix)]
+    fn run_os(&self, args: impl IntoIterator<Item = OsString>) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_july"))
+            .args(args)
+            .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
+            .current_dir(&self.root)
+            .output()
+            .unwrap()
+    }
+
     fn rooms(&self) -> i64 {
         Connection::open(&self.database)
             .unwrap()
@@ -80,10 +90,10 @@ fn json_stdout(output: &Output) -> Value {
 fn json_error(output: &Output, code: &str) {
     assert!(!output.status.success());
     assert!(stdout(output).is_empty());
-    assert_eq!(
-        serde_json::from_str::<Value>(&stderr(output)).unwrap()["code"],
-        code
-    );
+    assert!(stderr(output).ends_with('\n'));
+    let value: Value = serde_json::from_str(&stderr(output)).unwrap();
+    assert_eq!(value["error"]["code"], code);
+    assert!(value["error"]["message"].is_string());
 }
 
 #[test]
@@ -168,6 +178,33 @@ fn room_rejects_exact_reference_misses_and_malformed_grammar_without_mutation() 
 }
 
 #[test]
+fn room_rejects_flag_references_before_opening_storage() {
+    for args in [
+        ["room", "members", "--unknown"].as_slice(),
+        ["room", "member", "add", "Payments", "--unknown"].as_slice(),
+    ] {
+        let workspace = TestWorkspace::new();
+        let output = workspace.run(args);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("usage: july dm <agent>"));
+        assert!(!workspace.database.exists());
+    }
+}
+
+#[test]
+fn room_and_agent_names_with_typed_id_length_remain_names() {
+    let workspace = TestWorkspace::new();
+    let name = "iiiiiiiiiiiiiiiiiiiiiiiiii";
+    assert_eq!(name.len(), 26);
+    workspace.seed_agent(name);
+    let created = workspace.run(&["room", "create", name]);
+    assert!(created.status.success(), "stderr: {}", stderr(&created));
+
+    let added = workspace.run(&["room", "member", "add", name, name]);
+    assert_eq!(stdout(&added), "active\ttrue\n");
+}
+
+#[test]
 fn room_json_success_errors_and_flag_placement_are_framed() {
     let workspace = TestWorkspace::new();
     let agent = workspace.seed_agent("Codex");
@@ -228,14 +265,20 @@ fn room_json_success_errors_and_flag_placement_are_framed() {
 #[test]
 fn room_rejects_invalid_utf8_before_mutation() {
     let workspace = TestWorkspace::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_july"))
-        .args([OsString::from("room"), OsString::from_vec(vec![0xFF])])
-        .env("JULY_WORKSPACE_DB", workspace.database.file_name().unwrap())
-        .current_dir(&workspace.root)
-        .output()
-        .unwrap();
+    let output = workspace.run_os([OsString::from("room"), OsString::from_vec(vec![0xFF])]);
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("valid UTF-8"));
+    assert!(!workspace.database.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn dm_retains_its_invalid_utf8_diagnostic() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run_os([OsString::from("dm"), OsString::from_vec(vec![0xFF])]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "agent name must be valid UTF-8\n");
     assert!(!workspace.database.exists());
 }
