@@ -123,7 +123,7 @@ raw-write guards, conservative reconciliation of invalid legacy references,
 and rejection of cross-Work Result references. Phase 6 does not notify through
 Message/transport or automatically change downstream Work status.
 
-Phase 6.5 deliberation, Phase 7 recovery, Phase 8 CLI, external A2A protocol
+Phase 6.5 deliberation, Phase 8 CLI, external A2A protocol
 integration, semantic routing, and transcript transfer are outside this test
 slice.
 
@@ -176,14 +176,31 @@ have produced a durable rollout.
 
 ## 7. Recovery
 
-Delete remote session intentionally.
+Current Phase 7 coverage:
 
-Expected:
-- new session created;
-- recovery capsule assembled;
-- recent messages bounded;
-- work continues;
-- full transcript not replayed.
+- `tests/checkpoint_storage.rs` proves explicit durable creation, exact
+  Conversation/Agent isolation, deterministic latest lookup, restart survival,
+  same-Conversation anchor validation, and invalid/orphan rejection;
+- `tests/memory_promotion.rs` proves explicit typed/scoped promotion with
+  required real source Conversation, self/cross-scope supersession rejection,
+  stable scoped/kind queries, and no automatic promotion from a Message or
+  Result;
+- `tests/recovery_capsule.rs` proves deterministic JSON, relevant project/Room
+  memory only, latest checkpoint anchoring, compact Result/reference links, and
+  newest-20 post-anchor Messages with included count/truncation metadata in
+  chronological order without source or full transcript leakage;
+- `tests/session_recovery_storage.rs` proves atomic generation replacement,
+  rollback, exact retry, restart survival, and bounded attachment/delivery
+  progress;
+- `tests/direct_message.rs` and `tests/thread_runtime.rs` prove missing and
+  provider-lost replacement through the shared per-Agent owner, same-binding
+  pending Thread retry, normal resume without replay, stale-generation
+  isolation, and terminal `Closed` behavior.
+
+Recovery delivery is intentionally asserted as at-least-once, including the
+transport-accepted/storage-marker-failed window. Exactly-once transport,
+background retry/daemon behavior, semantic memory/vector search, full
+transcript replay, and mandatory live-provider smoke are not asserted.
 
 ## 8. SQLite crash safety
 

@@ -125,7 +125,8 @@ Session binding lifecycle states are `Active`, `Disconnected`, `Lost` and
 `Closed`. Resume is attempted only when the agent advertises the required
 capability and the binding is the current generation. Resume does not replay a
 transcript. If the remote session no longer exists, the binding becomes
-`Lost`; creating replacement generation `N+1` remains Phase 7 work.
+`Lost`; Phase 7 creates a durable replacement generation `N+1` from bounded
+recovery state. Normal resume still invents or replays no context.
 
 `Active` and `Disconnected` are current states; `Lost` and `Closed` are
 historical states. Phase 2 adds migration `0002` for typed binding lifecycle
@@ -233,3 +234,26 @@ Propagation permits `WAITING -> SATISFIED`, `WAITING -> FAILED`, and
 their outgoing dependency changes share one SQLite transaction. Phase 6 adds
 no CLI, deliberation, LLM routing, transcript publish, daemon, or background
 retry.
+
+## ADR-025 — Session recovery is bounded, durable, and at-least-once
+Status: Accepted
+
+Checkpoint creation and typed/scoped Memory promotion are explicit. Checkpoint
+message anchors must belong to the same Conversation. Promotion requires a real
+source Conversation and rejects self/cross-scope supersession; Messages,
+hypotheses, and Results never promote themselves. A deterministic recovery
+capsule contains current project and relevant Room memory, the latest exact
+Conversation/Agent checkpoint, compact published Result/reference links, and
+at most the newest 20 post-anchor Messages in chronological order with included
+count/truncation metadata. It never contains a full transcript by default.
+
+Replacement atomically transitions source generation `N` to `Lost`, inserts
+disconnected generation `N+1`, and stores its pending capsule. DM and Thread
+reuse the shared per-Agent transport owner to attach and deliver it; normal
+resume sends no replay, and `Closed` remains terminal. A capsule accepted by
+transport before its delivery marker commits may be resent unchanged, so the
+contract is at-least-once rather than exactly-once. An unattached pending Thread
+recovery reuses its existing `N+1` binding and capsule.
+
+Phase 7 introduces no semantic/vector memory, background recovery daemon, or
+mandatory live-provider smoke.

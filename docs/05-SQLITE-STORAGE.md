@@ -246,6 +246,10 @@ CREATE TABLE checkpoints (
 );
 ```
 
+Checkpoint creation is explicit. Latest lookup is scoped by Conversation and
+Agent and uses deterministic newest-first ordering. A message anchor must
+belong to that same Conversation.
+
 ### memories
 
 ```sql
@@ -261,6 +265,29 @@ CREATE TABLE memories (
   created_at TEXT NOT NULL
 );
 ```
+
+Memory promotion is an explicit typed/scoped insert requiring an existing
+source Conversation, with optional evidence/supersession. Self-supersession or
+superseding Memory from another scope is rejected. Messages and Results never
+promote themselves.
+
+### session_recoveries
+
+Phase 7 stores the capsule for each replacement generation separately from the
+binding:
+
+```sql
+CREATE TABLE session_recoveries (
+  session_binding_id TEXT PRIMARY KEY NOT NULL REFERENCES session_bindings(id),
+  source_binding_id TEXT NOT NULL UNIQUE REFERENCES session_bindings(id),
+  capsule TEXT NOT NULL,
+  capsule_delivered_at TEXT,
+  created_at TEXT NOT NULL
+);
+```
+
+The executable migration adds non-blank and self-reference checks and permits
+only the one-way `capsule_delivered_at: NULL -> timestamp` progress update.
 
 ## Indexes
 
@@ -303,15 +330,12 @@ Session bindings, ACP calls, capsules, Messages, Results, Publishes and
 Dependencies never participate in the Thread creation transaction. Session
 startup is lazy after commit.
 
-The following operation groups remain requirements for the phases that add
-their lifecycle behavior.
-
-Must be atomic:
+The following operation groups are atomic:
 - work completion + result creation;
 - result publish;
 - dependency update;
-- session generation replacement;
-- memory promotion.
+- session generation replacement plus its pending recovery capsule;
+- each explicit memory promotion.
 
 ## FTS5
 
@@ -521,6 +545,19 @@ atomically.
 Phase 5.4 message delivery is at-least-once. A crash after transport accepts a
 message but before SQLite records `delivered` can cause an explicit retry to
 send the same exact body again. Exactly-once delivery is not promised.
+
+### Phase 7 migration `0011`
+
+`0011_session_recovery.sql` adds `session_recoveries`. Beginning replacement is
+one `BEGIN IMMEDIATE` transaction: source generation `N` becomes `Lost`, one
+disconnected generation `N+1` is inserted, and its deterministic capsule is
+stored pending delivery. Exact begin retries reuse the same replacement;
+conflicting or stale sources fail without partial state. `Closed` is terminal.
+
+Remote attachment and capsule-delivery progress are bounded idempotent steps.
+If transport accepts a capsule before SQLite records delivery, retry sends the
+same stored capsule again. Recovery is therefore at-least-once, not
+exactly-once; no background retry worker is introduced.
 
 ## No dual source of truth
 

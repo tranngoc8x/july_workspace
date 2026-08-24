@@ -266,7 +266,7 @@ Verified DoD:
 
 Phase 6 adds no CLI, external A2A protocol integration, semantic routing,
 transcript transfer, background dependency reconciliation/retry, or automatic
-downstream Work status change. Phase 6.5, Phase 7, and Phase 8 remain future
+downstream Work status change. Phase 6.5 and Phase 8 remain future
 roadmap phases.
 
 ---
@@ -316,22 +316,42 @@ DoD:
 
 ---
 
-## Phase 7 — Memory + Session Recovery
+## Phase 7 — Memory + Session Recovery — Implemented
 
-Implement:
+Status: implemented and verified.
 
-- checkpoint creation;
-- memory promotion;
-- recovery capsule;
-- replacement session generation;
-- bounded recent-message replay.
+Implemented evidence:
 
-DoD:
+- explicit checkpoint creation, same-Conversation anchor validation, and
+  deterministic latest lookup scoped by Conversation/Agent —
+  `tests/checkpoint_storage.rs`;
+- explicit typed/scoped memory promotion requiring a real source Conversation,
+  rejecting self/cross-scope supersession, and never auto-promoting Messages or
+  Results — `tests/memory_promotion.rs`;
+- deterministic `JULY_RECOVERY_V1` JSON capsule containing project memory,
+  relevant Room memory, latest checkpoint, compact Result/reference links, and
+  at most the newest 20 post-anchor Messages in chronological order plus their
+  included count/truncation metadata —
+  `tests/recovery_capsule.rs`;
+- atomic generation `N -> N+1` replacement with a durable pending capsule —
+  `tests/session_recovery_storage.rs`;
+- DM and Thread replacement through the shared per-Agent owner, normal resume
+  without replay, pending-capsule retry on the same unattached `N+1` binding,
+  stale-generation isolation, and terminal `Closed` handling —
+  `tests/direct_message.rs` and
+  `tests/thread_runtime.rs`.
 
-- remote session can be intentionally deleted;
-- replacement session continues work from durable state;
-- full transcript replay is unnecessary;
-- unverified hypotheses are not promoted automatically.
+Verified DoD:
+
+- missing/provider-lost remote sessions create and continue through replacement
+  generation `N+1` from durable scoped state;
+- full transcript replay is not used;
+- unverified hypotheses are never promoted automatically.
+
+Recovery capsule delivery is at-least-once across ambiguous transport/storage
+failure. Phase 7 adds no semantic memory/vector database, background retry
+daemon, exactly-once transport claim, broader CLI, or mandatory live-provider
+smoke; live smoke remains opt-in.
 
 ---
 
