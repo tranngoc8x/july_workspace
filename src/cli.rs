@@ -1,11 +1,12 @@
 use crate::application::{
     AddRoomMember, AddThreadMember, AgentRef, CollaborationError, CollaborationService, CreateRoom,
     CreateThread, DirectMessageError, DirectMessageEvent, DirectMessageFailureKind,
-    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState,
-    RemoveRoomMember, RemoveThreadMember, RoomRef,
+    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState, PublishError,
+    PublishResult, PublishService, RemoveRoomMember, RemoveThreadMember, RoomRef,
 };
 use crate::domain::{
-    AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, RoomId, WorkItemId,
+    AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, PublishId, ResultId,
+    RoomId, WorkItemId,
 };
 use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct_message};
 use chrono::{SecondsFormat, Utc};
@@ -40,6 +41,8 @@ pub enum CliError {
     DirectMessage(#[from] DirectMessageError),
     #[error(transparent)]
     Collaboration(#[from] CollaborationError),
+    #[error(transparent)]
+    Publish(#[from] PublishError),
     #[error("runtime error: {0}")]
     Runtime(String),
     #[error("agent turn failed: {0}")]
@@ -76,6 +79,11 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
+        Command::Publish {
+            result_id,
+            target_conversation_id,
+            ..
+        } => run_publish(result_id, target_conversation_id, json).await,
     };
     result.map_err(|error| error.json_if_requested(json))
 }
@@ -116,6 +124,15 @@ impl CliError {
                 CollaborationError::InvalidCommand(_) => "invalid_command",
                 _ => "runtime_error",
             },
+            Self::Publish(error) => match error {
+                PublishError::ResultNotFound(_) => "result_not_found",
+                PublishError::WorkNotFound(_) => "work_not_found",
+                PublishError::SourceNotFound(_) => "source_not_found",
+                PublishError::TargetNotFound(_) => "target_not_found",
+                PublishError::PublishIdConflict(_) => "publish_id_conflict",
+                PublishError::InvalidTimestamp => "invalid_timestamp",
+                PublishError::Runtime(_) => "runtime_error",
+            },
             Self::MissingHome
             | Self::TurnFailed(_)
             | Self::Disconnected(_)
@@ -136,13 +153,20 @@ enum Command {
         operation: ThreadOperation,
         json: bool,
     },
+    Publish {
+        result_id: ResultId,
+        target_conversation_id: ConversationId,
+        json: bool,
+    },
 }
 
 impl Command {
     fn json(&self) -> bool {
         matches!(
             self,
-            Self::Room { json: true, .. } | Self::Thread { json: true, .. }
+            Self::Room { json: true, .. }
+                | Self::Thread { json: true, .. }
+                | Self::Publish { json: true, .. }
         )
     }
 }
@@ -192,8 +216,20 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         },
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
+        Some("publish") => parse_publish(args, json),
         Some(_) => Err(CliError::InvalidCommand),
         None => Err(CliError::Usage),
+    }
+}
+
+fn parse_publish(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+    match args.as_slice() {
+        [_, result, flag, target] if flag == "--to" => Ok(Command::Publish {
+            result_id: result_id(result)?,
+            target_conversation_id: thread_id(target)?,
+            json,
+        }),
+        _ => Err(CliError::Usage),
     }
 }
 
@@ -359,6 +395,13 @@ fn thread_id(value: &str) -> Result<ConversationId, CliError> {
         .ok_or(CliError::Usage)
 }
 
+fn result_id(value: &str) -> Result<ResultId, CliError> {
+    let id = ResultId::from_str(value).map_err(|_| CliError::Usage)?;
+    (id.to_string() == value)
+        .then_some(id)
+        .ok_or(CliError::Usage)
+}
+
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
@@ -390,6 +433,70 @@ async fn run_dm(agent_name: String) -> Result<(), CliError> {
     context_shutdown?;
     workspace_shutdown.map_err(DirectMessageBootstrapError::from)?;
     Ok(())
+}
+
+async fn run_publish(
+    result_id: ResultId,
+    target_conversation_id: ConversationId,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = PublishService::new(worker);
+    let output = async {
+        let published = service
+            .publish(PublishResult {
+                publish_id: PublishId::new(),
+                result_id,
+                target_conversation_id,
+                published_at: timestamp(),
+            })
+            .await?;
+        Ok::<_, CliError>(if json_output {
+            json!({
+                "publish_id": published.publish_id.to_string(),
+                "result_id": published.result.id.to_string(),
+                "source_conversation_id": published.source_conversation_id.to_string(),
+                "target_conversation_id": published.target_conversation_id.to_string(),
+                "published_at": published.published_at,
+            })
+            .to_string()
+        } else {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                published.publish_id,
+                published.result.id,
+                published.source_conversation_id,
+                published.target_conversation_id,
+                published.published_at,
+            )
+        })
+    }
+    .await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (output, shutdown) {
+        (Ok(output), Ok(())) => {
+            println!("{output}");
+            Ok(())
+        }
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
 }
 
 async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), CliError> {
