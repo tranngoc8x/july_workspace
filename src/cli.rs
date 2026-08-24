@@ -76,6 +76,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let command = parse_command(args).map_err(|error| error.json_if_requested(json_requested))?;
     let json = command.json();
     let result = match command {
+        Command::Repl => run_repl().await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
@@ -144,6 +145,7 @@ impl CliError {
 }
 
 enum Command {
+    Repl,
     Dm(String),
     Room {
         operation: RoomOperation,
@@ -219,7 +221,8 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("publish") => parse_publish(args, json),
         Some(command) if command.starts_with("--") => Err(CliError::Usage),
         Some(_) => Err(CliError::InvalidCommand),
-        None => Err(CliError::Usage),
+        None if json => Err(CliError::Usage),
+        None => Ok(Command::Repl),
     }
 }
 
@@ -401,6 +404,64 @@ fn result_id(value: &str) -> Result<ResultId, CliError> {
     (id.to_string() == value)
         .then_some(id)
         .ok_or(CliError::Usage)
+}
+
+async fn run_repl() -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    let interaction = interact_repl(&mut service).await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn interact_repl<R: crate::application::CollaborationRuntime>(
+    _service: &mut CollaborationService<R>,
+) -> Result<(), CliError> {
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            result = &mut interrupted => {
+                result?;
+                return Ok(());
+            }
+        };
+        let Some(line) = line else {
+            return Ok(());
+        };
+        match line.as_str() {
+            "/quit" => return Ok(()),
+            "/status" => println!("root"),
+            "/back" => eprintln!("already at root"),
+            "/members" => eprintln!("members unavailable at root"),
+            _ if line.trim().is_empty() => {}
+            _ => eprintln!("{}", CliError::InvalidCommand),
+        }
+    }
 }
 
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
