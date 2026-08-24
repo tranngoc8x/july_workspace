@@ -302,3 +302,52 @@ fn thread_json_flags_are_framed_and_duplicate_or_invalid_utf8_arguments_do_not_o
         assert!(!invalid.database.exists());
     }
 }
+
+#[test]
+fn thread_json_errors_preserve_membership_and_open_state_codes() {
+    let workspace = TestWorkspace::new();
+    let codex = workspace.seed_agent("Codex");
+    workspace.seed_agent("Reviewer");
+    let room_id = stdout(&workspace.run(&["room", "create", "Payments"]))
+        .trim()
+        .to_owned();
+
+    let missing_room_membership = workspace.run(&[
+        "thread",
+        "create",
+        "Settlement",
+        "--room",
+        &room_id,
+        "--member",
+        "Codex",
+        "--json",
+    ]);
+    json_error(&missing_room_membership, "room_membership_required");
+
+    for agent in ["Codex", "Reviewer"] {
+        assert_eq!(
+            stdout(&workspace.run(&["room", "member", "add", &room_id, agent])),
+            "active\ttrue\n"
+        );
+    }
+    let created = json_stdout(&workspace.run(&[
+        "thread",
+        "create",
+        "Settlement",
+        "--room",
+        &room_id,
+        "--member",
+        &codex.id.to_string(),
+        "--json",
+    ]));
+    let thread_id = created["thread_id"].as_str().unwrap();
+    Connection::open(&workspace.database)
+        .unwrap()
+        .execute(
+            "UPDATE conversations SET status = 'closed' WHERE id = ?1",
+            [thread_id],
+        )
+        .unwrap();
+    let closed = workspace.run(&["--json", "thread", "member", "add", thread_id, "Reviewer"]);
+    json_error(&closed, "thread_not_open");
+}
