@@ -95,6 +95,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let json = command.json();
     let result = match command {
         Command::Repl => run_repl().await,
+        Command::Version { json } => run_version(json),
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
@@ -167,6 +168,9 @@ impl CliError {
 
 enum Command {
     Repl,
+    Version {
+        json: bool,
+    },
     Dm(String),
     ThreadOpen {
         thread_id: ConversationId,
@@ -346,7 +350,8 @@ impl Command {
     fn json(&self) -> bool {
         matches!(
             self,
-            Self::Room { json: true, .. }
+            Self::Version { json: true }
+                | Self::Room { json: true, .. }
                 | Self::Thread { json: true, .. }
                 | Self::Publish { json: true, .. }
         )
@@ -399,6 +404,7 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
         Some("publish") => parse_publish(args, json),
+        Some("--version") | Some("-V") if args.len() == 1 => Ok(Command::Version { json }),
         Some(command) if command.starts_with("--") => Err(CliError::Usage),
         Some(_) => Err(CliError::InvalidCommand),
         None if json => Err(CliError::Usage),
@@ -1678,6 +1684,16 @@ fn render_membership_change(change: MembershipChange, json_output: bool) -> Stri
 
 fn membership_state(active: bool) -> &'static str {
     if active { "active" } else { "left" }
+}
+
+fn run_version(json: bool) -> Result<(), CliError> {
+    let version = env!("CARGO_PKG_VERSION");
+    if json {
+        println!("{}", json!({ "name": "july", "version": version }));
+    } else {
+        println!("july {version}");
+    }
+    Ok(())
 }
 
 fn database_path() -> Result<PathBuf, CliError> {
