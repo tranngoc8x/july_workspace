@@ -32,8 +32,12 @@ impl TestWorkspace {
     }
 
     fn seed_agent(&self, name: &str) -> Agent {
+        self.seed_agent_with_id(AgentId::new(), name)
+    }
+
+    fn seed_agent_with_id(&self, id: AgentId, name: &str) -> Agent {
         let agent = Agent {
-            id: AgentId::new(),
+            id,
             name: name.into(),
             project_root: self.root.to_string_lossy().into_owned(),
             transport_type: "acp".into(),
@@ -171,8 +175,10 @@ fn thread_create_and_list_render_durable_ids_for_humans_and_json() {
 #[test]
 fn thread_membership_preserves_user_and_agent_history_with_idempotent_changes() {
     let workspace = TestWorkspace::new();
-    let codex = workspace.seed_agent("Codex");
-    let reviewer = workspace.seed_agent("Reviewer");
+    let codex =
+        workspace.seed_agent_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap(), "Codex");
+    let reviewer =
+        workspace.seed_agent_with_id("01ARZ3NDEKTSV4RRFFQ69G5FAW".parse().unwrap(), "Reviewer");
     let room_id = stdout(&workspace.run(&["room", "create", "Payments"]))
         .trim()
         .to_owned();
