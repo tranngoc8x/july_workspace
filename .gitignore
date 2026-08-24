@@ -5,4 +5,5 @@
 .beads-credential-key
 .beads/proxieddb/
 /target
+/dist
 .worktrees/

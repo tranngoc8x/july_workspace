@@ -410,6 +410,14 @@ for non-interactive commands. Live-provider smoke remains opt-in.
 
 ## Phase 9 — Packaging / Release
 
+Status: complete. `july --version` (and `--version --json`) reports the package
+version; `scripts/release.sh` builds the macOS targets and emits tarballs with
+`SHA256SUMS`; `scripts/install.sh` / `scripts/uninstall.sh` install and remove
+the binary while keeping `~/.july` unless `--purge` is confirmed interactively.
+`tests/cli_bootstrap.rs` proves a fresh machine gets its database created and
+migrated by the first command, and `tests/cli_version.rs` covers version output.
+Homebrew packaging stays deferred until the release cadence is stable.
+
 Implement:
 
 - release build;

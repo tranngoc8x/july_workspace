@@ -202,6 +202,43 @@ Operational commands should support:
 
 for testing/automation.
 
+## Packaging and release
+
+July ships as one release binary; no Python or other runtime is required.
+
+```bash
+july --version           # july <version>
+july --version --json    # {"name":"july","version":"<version>"}
+```
+
+Build signed-off artifacts for the macOS development targets:
+
+```bash
+scripts/release.sh                       # aarch64 + x86_64 apple-darwin
+scripts/release.sh aarch64-apple-darwin  # single target
+```
+
+The script writes `dist/july-<version>-<target>.tar.gz` plus `dist/SHA256SUMS`,
+and smoke-runs `--version` for the host target.
+
+Install and uninstall:
+
+```bash
+scripts/install.sh [--prefix DIR]              # default prefix ~/.local
+scripts/uninstall.sh [--prefix DIR] [--purge]
+```
+
+Uninstall removes only the binary. Workspace data in `~/.july` is kept unless
+`--purge` is passed, which additionally requires an interactive confirmation.
+`JULY_PREFIX` and `JULY_DATA_DIR` override the defaults.
+
+The first command run against a fresh machine creates `~/.july`, creates
+`workspace.db`, and applies all pending SQLite migrations; later runs only
+check the schema version. `JULY_WORKSPACE_DB` overrides the database path.
+A database newer than the binary is rejected instead of downgraded.
+
+Homebrew packaging stays deferred until the release cadence is stable.
+
 ## Optional integrations
 
 Later:

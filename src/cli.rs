@@ -1701,7 +1701,9 @@ fn database_path() -> Result<PathBuf, CliError> {
         return Ok(path.into());
     }
     let home = std::env::var_os("HOME").ok_or(CliError::MissingHome)?;
-    Ok(PathBuf::from(home).join(".july/workspace.db"))
+    let directory = PathBuf::from(home).join(".july");
+    std::fs::create_dir_all(&directory)?;
+    Ok(directory.join("workspace.db"))
 }
 
 async fn interact<C: ChatContext>(service: &mut C, agent_name: &str) -> Result<(), CliError> {
