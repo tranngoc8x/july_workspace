@@ -253,6 +253,18 @@ fn publish_rejects_invalid_grammar_and_ids_before_creating_storage() {
         assert!(stderr(&output).contains("usage: july dm <agent>"));
         assert!(!workspace.database.exists());
     }
+
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&[
+        "--unknown",
+        "publish",
+        &result_id,
+        "--to",
+        &target_id,
+        "--json",
+    ]);
+    json_error(&output, "usage");
+    assert!(!workspace.database.exists());
 }
 
 #[cfg(unix)]

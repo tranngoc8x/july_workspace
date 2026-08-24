@@ -217,6 +217,7 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
         Some("publish") => parse_publish(args, json),
+        Some(command) if command.starts_with("--") => Err(CliError::Usage),
         Some(_) => Err(CliError::InvalidCommand),
         None => Err(CliError::Usage),
     }
