@@ -12,11 +12,13 @@ use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::fmt;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
+use tokio::sync::mpsc;
 
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
@@ -76,6 +78,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let command = parse_command(args).map_err(|error| error.json_if_requested(json_requested))?;
     let json = command.json();
     let result = match command {
+        Command::Repl => run_repl().await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
@@ -144,6 +147,7 @@ impl CliError {
 }
 
 enum Command {
+    Repl,
     Dm(String),
     Room {
         operation: RoomOperation,
@@ -158,6 +162,11 @@ enum Command {
         target_conversation_id: ConversationId,
         json: bool,
     },
+}
+
+enum ReplContext {
+    Root,
+    Room(RoomId),
 }
 
 impl Command {
@@ -219,7 +228,8 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("publish") => parse_publish(args, json),
         Some(command) if command.starts_with("--") => Err(CliError::Usage),
         Some(_) => Err(CliError::InvalidCommand),
-        None => Err(CliError::Usage),
+        None if json => Err(CliError::Usage),
+        None => Ok(Command::Repl),
     }
 }
 
@@ -403,6 +413,156 @@ fn result_id(value: &str) -> Result<ResultId, CliError> {
         .ok_or(CliError::Usage)
 }
 
+async fn run_repl() -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    let interaction = interact_repl(&mut service).await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn interact_repl<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+) -> Result<(), CliError> {
+    let mut input = repl_input();
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
+    let mut contexts = vec![ReplContext::Root];
+    loop {
+        repl_stdout(format_args!("> "))?;
+        let line = tokio::select! {
+            line = input.recv() => match line {
+                Some(line) => line?,
+                None => return Ok(()),
+            },
+            result = &mut interrupted => {
+                result?;
+                return Ok(());
+            }
+        };
+        let Some(line) = line else {
+            return Ok(());
+        };
+        match line.as_str() {
+            "/quit" => return Ok(()),
+            "/status" => print_repl_status(service, contexts.last().unwrap()).await?,
+            "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
+            "/back" => {
+                contexts.pop();
+                print_repl_status(service, contexts.last().unwrap()).await?;
+            }
+            "/members" => match contexts.last().unwrap() {
+                ReplContext::Root => repl_stderr(format_args!("members unavailable at root\n"))?,
+                ReplContext::Room(room_id) => {
+                    match service.list_room_members(RoomRef::Id(*room_id)).await {
+                        Ok(members) => {
+                            let output = render_room_members(
+                                members
+                                    .into_iter()
+                                    .filter(|member| member.left_at.is_none())
+                                    .collect(),
+                                false,
+                            );
+                            if !output.is_empty() {
+                                repl_stdout(format_args!("{output}\n"))?;
+                            }
+                        }
+                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    }
+                }
+            },
+            _ if line.trim().is_empty() => {}
+            _ if let Some(reference) = line.strip_prefix("/room ")
+                && !reference.is_empty() =>
+            {
+                match room_ref(reference) {
+                    Ok(reference) => match service.resolve_room(reference).await {
+                        Ok(room) => {
+                            repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
+                            contexts.push(ReplContext::Room(room.id));
+                        }
+                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    },
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
+            _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
+        }
+    }
+}
+
+fn repl_input() -> mpsc::UnboundedReceiver<io::Result<Option<String>>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        loop {
+            let mut line = String::new();
+            let input = match stdin.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    line = line.trim_end_matches(['\n', '\r']).into();
+                    Ok(Some(line))
+                }
+                Err(error) => Err(error),
+            };
+            let done = matches!(&input, Ok(None) | Err(_));
+            if sender.send(input).is_err() || done {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+async fn print_repl_status<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    context: &ReplContext,
+) -> Result<(), CliError> {
+    match context {
+        ReplContext::Root => repl_stdout(format_args!("root\n"))?,
+        ReplContext::Room(room_id) => match service.resolve_room(RoomRef::Id(*room_id)).await {
+            Ok(room) => repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?,
+            Err(error) => repl_stderr(format_args!("{error}\n"))?,
+        },
+    }
+    Ok(())
+}
+
+fn repl_stdout(args: fmt::Arguments<'_>) -> Result<(), CliError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_fmt(args)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn repl_stderr(args: fmt::Arguments<'_>) -> Result<(), CliError> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_fmt(args)?;
+    stderr.flush()?;
+    Ok(())
+}
+
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
@@ -513,106 +673,78 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
     let mut service = CollaborationService::new(worker);
     let output = async {
         let output = match operation {
-        RoomOperation::Create { name, description } => {
-            let room_id = service
-                .create_room(CreateRoom {
-                    room_id: RoomId::new(),
-                    name,
-                    description,
-                    created_at: timestamp(),
-                })
-                .await?;
-            if json_output {
-                Some(json!({ "room_id": room_id.to_string() }).to_string())
-            } else {
-                Some(room_id.to_string())
+            RoomOperation::Create { name, description } => {
+                let room_id = service
+                    .create_room(CreateRoom {
+                        room_id: RoomId::new(),
+                        name,
+                        description,
+                        created_at: timestamp(),
+                    })
+                    .await?;
+                if json_output {
+                    Some(json!({ "room_id": room_id.to_string() }).to_string())
+                } else {
+                    Some(room_id.to_string())
+                }
             }
-        }
-        RoomOperation::List => {
-            let rooms = service.list_rooms().await?;
-            if json_output {
-                let rooms: Vec<_> = rooms
-                    .into_iter()
-                    .map(|room| {
-                        json!({
-                            "room_id": room.id.to_string(), "name": room.name,
-                            "description": room.description, "status": room.status,
-                            "created_at": room.created_at, "updated_at": room.updated_at,
+            RoomOperation::List => {
+                let rooms = service.list_rooms().await?;
+                if json_output {
+                    let rooms: Vec<_> = rooms
+                        .into_iter()
+                        .map(|room| {
+                            json!({
+                                "room_id": room.id.to_string(), "name": room.name,
+                                "description": room.description, "status": room.status,
+                                "created_at": room.created_at, "updated_at": room.updated_at,
+                            })
                         })
-                    })
-                    .collect();
-                Some(json!(rooms).to_string())
-            } else {
-                let output = rooms
-                    .into_iter()
-                    .map(|room| {
-                        format!(
-                            "{}\t{}\t{}\t{}",
-                            room.id,
-                            room.name,
-                            room.description.unwrap_or_default(),
-                            room.status
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                        .collect();
+                    Some(json!(rooms).to_string())
+                } else {
+                    let output = rooms
+                        .into_iter()
+                        .map(|room| {
+                            format!(
+                                "{}\t{}\t{}\t{}",
+                                room.id,
+                                room.name,
+                                room.description.unwrap_or_default(),
+                                room.status
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!output.is_empty()).then_some(output)
+                }
+            }
+            RoomOperation::Members(room) => {
+                let members = service.list_room_members(room).await?;
+                let output = render_room_members(members, json_output);
                 (!output.is_empty()).then_some(output)
             }
-        }
-        RoomOperation::Members(room) => {
-            let members = service.list_room_members(room).await?;
-            if json_output {
-                let members: Vec<_> = members
-                    .into_iter()
-                    .map(|member| json!({
-                        "room_id": member.room_id.to_string(), "agent_id": member.agent_id.to_string(),
-                        "role": member.role, "generation": member.generation,
-                        "joined_at": member.joined_at, "left_at": member.left_at,
-                        "state": membership_state(member.left_at.is_none()),
-                    }))
-                    .collect();
-                Some(json!(members).to_string())
-            } else {
-                let output = members
-                    .into_iter()
-                    .map(|member| {
-                        let state = membership_state(member.left_at.is_none());
-                        format!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
-                            member.room_id,
-                            member.agent_id,
-                            member.role.unwrap_or_default(),
-                            member.generation,
-                            member.joined_at,
-                            member.left_at.unwrap_or_default(),
-                        )
+            RoomOperation::AddMember { room, agent } => {
+                let change = service
+                    .add_room_member(AddRoomMember {
+                        room,
+                        agent,
+                        role: None,
+                        changed_at: timestamp(),
                     })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (!output.is_empty()).then_some(output)
+                    .await?;
+                Some(render_membership_change(change, json_output))
             }
-        }
-        RoomOperation::AddMember { room, agent } => {
-            let change = service
-                .add_room_member(AddRoomMember {
-                    room,
-                    agent,
-                    role: None,
-                    changed_at: timestamp(),
-                })
-                .await?;
-            Some(render_membership_change(change, json_output))
-        }
-        RoomOperation::RemoveMember { room, agent } => {
-            let change = service
-                .remove_room_member(RemoveRoomMember {
-                    room,
-                    agent,
-                    changed_at: timestamp(),
-                })
-                .await?;
-            Some(render_membership_change(change, json_output))
-        }
+            RoomOperation::RemoveMember { room, agent } => {
+                let change = service
+                    .remove_room_member(RemoveRoomMember {
+                        room,
+                        agent,
+                        changed_at: timestamp(),
+                    })
+                    .await?;
+                Some(render_membership_change(change, json_output))
+            }
         };
         Ok::<_, CliError>(output)
     }
@@ -763,6 +895,40 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
             operation: Box::new(operation),
             shutdown: shutdown.to_string(),
         }),
+    }
+}
+
+fn render_room_members(members: Vec<crate::domain::RoomMember>, json_output: bool) -> String {
+    if json_output {
+        json!(
+            members
+                .into_iter()
+                .map(|member| json!({
+                    "room_id": member.room_id.to_string(), "agent_id": member.agent_id.to_string(),
+                    "role": member.role, "generation": member.generation,
+                    "joined_at": member.joined_at, "left_at": member.left_at,
+                    "state": membership_state(member.left_at.is_none()),
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string()
+    } else {
+        members
+            .into_iter()
+            .map(|member| {
+                let state = membership_state(member.left_at.is_none());
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
+                    member.room_id,
+                    member.agent_id,
+                    member.role.unwrap_or_default(),
+                    member.generation,
+                    member.joined_at,
+                    member.left_at.unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
