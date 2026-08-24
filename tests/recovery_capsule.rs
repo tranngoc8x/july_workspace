@@ -143,6 +143,8 @@ async fn no_checkpoint_emits_newest_twenty_chronologically_with_stable_id_ties()
     assert_eq!(RECENT_MESSAGE_LIMIT, 20);
     assert_eq!(capsule.recent_message_count, 20);
     assert!(capsule.messages_truncated);
+    assert_eq!(document["recent_messages_meta"]["included_count"], 20);
+    assert_eq!(document["recent_messages_meta"]["truncated"], true);
     assert_eq!(bodies.first(), Some(&"message-06"));
     assert_eq!(bodies.last(), Some(&"message-25"));
 }
@@ -192,6 +194,9 @@ async fn checkpoint_anchor_emits_only_strictly_later_messages() {
 
     assert_eq!(capsule.recent_message_count, 2);
     assert!(!capsule.messages_truncated);
+    let document = parse(&capsule.content);
+    assert_eq!(document["recent_messages_meta"]["included_count"], 2);
+    assert_eq!(document["recent_messages_meta"]["truncated"], false);
     assert_eq!(messages[0]["body"], "after-same-time");
     assert_eq!(messages[1]["body"], "after-later-time");
     assert_ne!(messages[0]["id"], anchor.id.to_string());

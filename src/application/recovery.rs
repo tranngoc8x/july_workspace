@@ -158,6 +158,13 @@ pub(crate) fn format_recovery_capsule(
         ),
     );
     document.insert(
+        "recent_messages_meta".into(),
+        json!({
+            "included_count": recent_message_count,
+            "truncated": input.messages_truncated,
+        }),
+    );
+    document.insert(
         "recent_messages".into(),
         Value::Array(
             input
