@@ -235,7 +235,7 @@ their outgoing dependency changes share one SQLite transaction. Phase 6 adds
 no CLI, deliberation, LLM routing, transcript publish, daemon, or background
 retry.
 
-## ADR-025 — Session recovery is bounded, durable, and at-least-once
+## ADR-025 — Session recovery uses bounded recent-message replay
 Status: Accepted
 
 Checkpoint creation and typed/scoped Memory promotion are explicit. Checkpoint

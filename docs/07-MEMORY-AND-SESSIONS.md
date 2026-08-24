@@ -3,7 +3,8 @@
 ## Phase 7 implementation status
 
 Phase 7 is implemented for DM and Thread sessions. Recovery is explicit,
-durable, bounded, and handled by the existing shared per-Agent runtime owner.
+durable, uses bounded recent-message replay, and is handled by the existing
+shared per-Agent runtime owner.
 
 ## Core principle
 
