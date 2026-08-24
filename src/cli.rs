@@ -511,7 +511,6 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             "/back" => {
                 let previous = contexts.last().unwrap().clone();
                 if let Err(error) = close_repl_dm(live_dm).await {
-                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
@@ -553,7 +552,6 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Ok(reference) => match service.resolve_room(reference).await {
                         Ok(room) => {
                             if let Err(error) = close_repl_dm(live_dm).await {
-                                restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                                 repl_stderr(format_args!("{error}\n"))?;
                                 continue;
                             }
@@ -589,15 +587,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     registered.insert(agent.id);
                 }
                 if let Err(error) = close_repl_dm(live_dm).await {
-                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
                 match open_repl_dm(workspace, &agent).await {
                     Ok((context, dm)) => {
-                        repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                         contexts.push(context);
                         *live_dm = Some(dm);
+                        repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                     }
                     Err(error) => {
                         restore_repl_dm(service, workspace, &contexts, live_dm).await?;
@@ -651,10 +648,20 @@ async fn close_repl_dm(live_dm: &mut Option<ReplDirectMessage>) -> Result<(), Cl
 }
 
 fn is_known_repl_command(line: &str) -> bool {
-    matches!(
-        line.split_whitespace().next(),
-        Some("/dm" | "/room" | "/thread" | "/back" | "/members" | "/status" | "/publish" | "/quit")
-    )
+    line.starts_with('/')
+        && matches!(
+            line.split_whitespace().next(),
+            Some(
+                "/dm"
+                    | "/room"
+                    | "/thread"
+                    | "/back"
+                    | "/members"
+                    | "/status"
+                    | "/publish"
+                    | "/quit"
+            )
+        )
 }
 
 async fn restore_repl_dm<R: crate::application::CollaborationRuntime>(
