@@ -459,52 +459,66 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
 ) -> Result<(), CliError> {
+    let mut live_dm = None;
+    let interaction = interact_repl_loop(service, workspace, &mut live_dm).await;
+    let shutdown = close_repl_dm(&mut live_dm).await;
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    live_dm: &mut Option<ReplDirectMessage>,
+) -> Result<(), CliError> {
     let mut input = repl_input();
-    let interrupted = tokio::signal::ctrl_c();
-    tokio::pin!(interrupted);
     let mut contexts = vec![ReplContext::Root];
     let mut registered = HashSet::new();
-    let mut live_dm = None;
     loop {
         repl_stdout(format_args!("> "))?;
         let line = tokio::select! {
             line = input.recv() => match line {
                 Some(line) => line?,
                 None => {
-                    close_repl_dm(&mut live_dm).await?;
+                    close_repl_dm(live_dm).await?;
                     return Ok(());
                 }
             },
-            result = &mut interrupted => {
+            result = tokio::signal::ctrl_c() => {
                 result?;
-                close_repl_dm(&mut live_dm).await?;
+                close_repl_dm(live_dm).await?;
                 return Ok(());
             }
         };
         let Some(line) = line else {
-            close_repl_dm(&mut live_dm).await?;
+            close_repl_dm(live_dm).await?;
             return Ok(());
         };
         match line.as_str() {
             "/quit" => {
-                close_repl_dm(&mut live_dm).await?;
+                close_repl_dm(live_dm).await?;
                 return Ok(());
             }
             "/status" => print_repl_status(service, workspace, contexts.last().unwrap()).await?,
             "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
             "/back" => {
                 let previous = contexts.last().unwrap().clone();
-                if let Err(error) = close_repl_dm(&mut live_dm).await {
-                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                if let Err(error) = close_repl_dm(live_dm).await {
+                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
                 contexts.pop();
-                if let Err(error) =
-                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await
-                {
+                if let Err(error) = restore_repl_dm(service, workspace, &contexts, live_dm).await {
                     contexts.push(previous);
-                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
@@ -538,9 +552,8 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                 match room_ref(reference) {
                     Ok(reference) => match service.resolve_room(reference).await {
                         Ok(room) => {
-                            if let Err(error) = close_repl_dm(&mut live_dm).await {
-                                restore_repl_dm(service, workspace, &contexts, &mut live_dm)
-                                    .await?;
+                            if let Err(error) = close_repl_dm(live_dm).await {
+                                restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                                 repl_stderr(format_args!("{error}\n"))?;
                                 continue;
                             }
@@ -575,8 +588,8 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                     }
                     registered.insert(agent.id);
                 }
-                if let Err(error) = close_repl_dm(&mut live_dm).await {
-                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                if let Err(error) = close_repl_dm(live_dm).await {
+                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
@@ -584,13 +597,16 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                     Ok((context, dm)) => {
                         repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                         contexts.push(context);
-                        live_dm = Some(dm);
+                        *live_dm = Some(dm);
                     }
                     Err(error) => {
-                        restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                        restore_repl_dm(service, workspace, &contexts, live_dm).await?;
                         repl_stderr(format_args!("{error}\n"))?;
                     }
                 }
+            }
+            _ if is_known_repl_command(&line) => {
+                repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?
             }
             _ if matches!(contexts.last(), Some(ReplContext::Dm { .. })) => {
                 let dm = live_dm.as_mut().expect("active DM has a live service");
@@ -627,10 +643,18 @@ async fn open_repl_dm(
 }
 
 async fn close_repl_dm(live_dm: &mut Option<ReplDirectMessage>) -> Result<(), CliError> {
-    if let Some(mut dm) = live_dm.take() {
+    if let Some(dm) = live_dm.as_mut() {
         dm.shutdown(timestamp()).await?;
     }
+    *live_dm = None;
     Ok(())
+}
+
+fn is_known_repl_command(line: &str) -> bool {
+    matches!(
+        line.split_whitespace().next(),
+        Some("/dm" | "/room" | "/thread" | "/back" | "/members" | "/status" | "/publish" | "/quit")
+    )
 }
 
 async fn restore_repl_dm<R: crate::application::CollaborationRuntime>(

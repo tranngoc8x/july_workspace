@@ -711,13 +711,13 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
         if self.stopped {
             return Ok(());
         }
-        self.stopped = true;
-        self.active = None;
-        if let Some(mut session) = self.session.take() {
-            session.detach(stopped_at).await.map_err(runtime_error)
-        } else {
-            Ok(())
+        if let Some(session) = self.session.as_mut() {
+            session.detach(stopped_at).await.map_err(runtime_error)?;
         }
+        self.session = None;
+        self.active = None;
+        self.stopped = true;
+        Ok(())
     }
 }
 

@@ -102,7 +102,7 @@ fn cli_runs_one_dm_turn_and_persists_transport_neutral_state() {
     let workspace = TestWorkspace::new();
     workspace.seed_agent("acp", workspace.fixture_config());
 
-    let output = workspace.run("hello\n1\n/quit\n", &["dm", "codex"]);
+    let output = workspace.run("hello\n1\n/status\n1\n/quit\n", &["dm", "codex"]);
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -121,12 +121,18 @@ fn cli_runs_one_dm_turn_and_persists_transport_neutral_state() {
     let conversation_id: ConversationId = conversation.parse().unwrap();
     let store = SqliteStore::open(&workspace.database).unwrap();
     let messages = store.list_messages(conversation_id).unwrap();
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 4);
     assert_eq!(messages[0].body, "hello");
     assert_eq!(messages[0].metadata["july"]["channel"], "dm");
     assert_eq!(messages[0].metadata["july"]["direction"], "outbound");
-    assert_eq!(messages[1].body, "fixture reply");
-    assert_eq!(messages[1].metadata["july"]["direction"], "inbound");
+    assert!(messages.iter().any(|message| message.body == "/status"));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.body == "fixture reply")
+            .count(),
+        2
+    );
 
     let agent = store.get_agent_by_name("codex").unwrap().unwrap();
     let binding = store

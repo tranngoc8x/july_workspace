@@ -333,6 +333,27 @@ fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
     assert_eq!(conversations, 1);
 }
 
+#[test]
+fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output =
+        workspace.repl("/dm codex\n/dm\n/dm \n/room \n/status extra\n/unknown exact\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(stderr(&output).matches("invalid command\n").count(), 4);
+    let connection = Connection::open(&workspace.database).unwrap();
+    let messages: Vec<String> = connection
+        .prepare("SELECT body FROM messages ORDER BY created_at, id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(messages, ["/unknown exact", "fixture reply"]);
+}
+
 #[cfg(unix)]
 #[test]
 fn repl_sigint_exits_while_stdin_remains_open() {
@@ -363,6 +384,7 @@ fn repl_broken_stdout_exits_without_a_panic() {
     let mut child = workspace.spawn_repl();
     read_prompt(&mut child);
     drop(child.stdout.take());
+    std::thread::sleep(Duration::from_millis(10));
     child
         .stdin
         .as_mut()

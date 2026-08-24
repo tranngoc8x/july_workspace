@@ -1421,6 +1421,7 @@ struct FailingPersistencePort {
     events: VecDeque<DirectMessageRuntimeEvent>,
     observed: Arc<Mutex<PersistenceObserved>>,
     fail_next_persist: bool,
+    fail_next_shutdown: bool,
 }
 
 impl DirectMessageRuntime for FailingPersistencePort {
@@ -1471,6 +1472,10 @@ impl DirectMessageRuntime for FailingPersistencePort {
 
     async fn shutdown(&mut self, _stopped_at: String) -> Result<(), DirectMessageError> {
         self.observed.lock().unwrap().shutdowns += 1;
+        if self.fail_next_shutdown {
+            self.fail_next_shutdown = false;
+            return Err(DirectMessageError::Runtime("fixture detach failure".into()));
+        }
         Ok(())
     }
 }
@@ -1511,6 +1516,7 @@ async fn completed_message_persistence_retries_before_reading_another_event() {
         ]),
         observed: observed.clone(),
         fail_next_persist: true,
+        fail_next_shutdown: false,
     };
     let mut service = DirectMessageService::new(port);
     service
@@ -1556,6 +1562,7 @@ async fn shutdown_retries_pending_completion_before_stopping_runtime() {
         ]),
         observed: observed.clone(),
         fail_next_persist: true,
+        fail_next_shutdown: false,
     };
     let mut service = DirectMessageService::new(port);
     service
@@ -1577,6 +1584,38 @@ async fn shutdown_retries_pending_completion_before_stopping_runtime() {
     assert_eq!(observed.persisted[0].body, "answer");
     assert_eq!(observed.persisted[0].sender_id, agent_id.to_string());
     assert_eq!(observed.persisted[0].created_at, NOW);
+}
+
+#[tokio::test]
+async fn shutdown_failure_keeps_the_same_dm_usable_for_retry() {
+    let agent_id = AgentId::new();
+    let observed = Arc::new(Mutex::new(PersistenceObserved::default()));
+    let port = FailingPersistencePort {
+        opened: Some(OpenedDirectMessage {
+            conversation_id: ConversationId::new(),
+            agent_id,
+            agent_name: "codex".into(),
+            messages: vec![],
+        }),
+        observed,
+        fail_next_shutdown: true,
+        ..Default::default()
+    };
+    let mut service = DirectMessageService::new(port);
+    service
+        .open("tony".into(), "codex".into(), NOW.into())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.shutdown(LATER.into()).await,
+        Err(DirectMessageError::Runtime("fixture detach failure".into()))
+    );
+    service
+        .send_message("retry".into(), LATER.into())
+        .await
+        .unwrap();
+    service.shutdown(LATER.into()).await.unwrap();
 }
 
 #[tokio::test]
