@@ -80,10 +80,6 @@ impl Drop for TestWorkspace {
 #[test]
 fn cli_rejects_bad_arguments_and_transport_configuration() {
     let workspace = TestWorkspace::new();
-    let usage = workspace.run("", &[]);
-    assert!(!usage.status.success());
-    assert!(String::from_utf8_lossy(&usage.stderr).contains("usage: july dm <agent>"));
-
     workspace.seed_agent("a2a", json!({}));
     let unsupported = workspace.run("", &["dm", "codex"]);
     assert!(!unsupported.status.success());

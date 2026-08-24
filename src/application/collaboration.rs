@@ -386,7 +386,7 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
             .await
     }
 
-    async fn resolve_room(&mut self, reference: RoomRef) -> Result<Room, CollaborationError> {
+    pub async fn resolve_room(&mut self, reference: RoomRef) -> Result<Room, CollaborationError> {
         let (found, display) = match reference {
             RoomRef::Id(id) => (self.runtime.get_room(id).await?, id.to_string()),
             RoomRef::Name(name) => (self.runtime.get_room_by_name(name.clone()).await?, name),
