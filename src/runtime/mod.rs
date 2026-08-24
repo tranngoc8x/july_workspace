@@ -9,6 +9,7 @@ mod storage_worker;
 mod thread;
 mod workspace;
 
+pub(crate) use direct_message::register_acp_agent;
 pub use direct_message::{
     AgentDirectMessageRuntime, DirectMessageBootstrapError, open_acp_direct_message,
 };

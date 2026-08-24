@@ -638,7 +638,7 @@ impl std::ops::Deref for StorageWorker {
     }
 }
 
-impl CollaborationRuntime for StorageWorker {
+impl CollaborationRuntime for StorageHandle {
     async fn create_room(&mut self, room: Room) -> Result<(), CollaborationError> {
         self.collaboration_request(|reply| Command::CreateRoom(room, reply))
             .await
@@ -775,6 +775,119 @@ impl CollaborationRuntime for StorageWorker {
             state: MembershipState::Left,
             changed,
         })
+    }
+}
+
+impl CollaborationRuntime for StorageWorker {
+    async fn create_room(&mut self, room: Room) -> Result<(), CollaborationError> {
+        self.handle.create_room(room).await
+    }
+
+    async fn get_room(&mut self, room_id: RoomId) -> Result<Option<Room>, CollaborationError> {
+        self.handle.get_room(room_id).await
+    }
+
+    async fn get_room_by_name(&mut self, name: String) -> Result<Option<Room>, CollaborationError> {
+        self.handle.get_room_by_name(name).await
+    }
+
+    async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
+        self.handle.list_rooms().await
+    }
+
+    async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError> {
+        self.handle
+            .get_agent(agent_id)
+            .await
+            .map_err(|error| CollaborationError::Runtime(error.to_string()))
+    }
+
+    async fn get_agent_by_name(
+        &mut self,
+        name: String,
+    ) -> Result<Option<Agent>, CollaborationError> {
+        self.handle
+            .get_agent_by_name(name)
+            .await
+            .map_err(|error| CollaborationError::Runtime(error.to_string()))
+    }
+
+    async fn list_room_members(
+        &mut self,
+        room_id: RoomId,
+    ) -> Result<Vec<RoomMember>, CollaborationError> {
+        self.handle.list_room_members(room_id).await
+    }
+
+    async fn add_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        role: Option<String>,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        self.handle
+            .add_room_member(room_id, agent_id, role, changed_at)
+            .await
+    }
+
+    async fn remove_room_member(
+        &mut self,
+        room_id: RoomId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        self.handle
+            .remove_room_member(room_id, agent_id, changed_at)
+            .await
+    }
+
+    async fn create_thread(
+        &mut self,
+        thread: Conversation,
+        primary_work_id: WorkItemId,
+        user_id: String,
+        initial_agents: Vec<AgentId>,
+    ) -> Result<WorkItem, CollaborationError> {
+        self.handle
+            .create_thread(thread, primary_work_id, user_id, initial_agents)
+            .await
+    }
+
+    async fn list_threads(
+        &mut self,
+        room_id: RoomId,
+    ) -> Result<Vec<Conversation>, CollaborationError> {
+        self.handle.list_threads(room_id).await
+    }
+
+    async fn list_thread_members(
+        &mut self,
+        thread_id: ConversationId,
+    ) -> Result<Vec<ConversationMember>, CollaborationError> {
+        self.handle.list_thread_members(thread_id).await
+    }
+
+    async fn add_thread_member(
+        &mut self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        self.handle
+            .add_thread_member(thread_id, agent_id, changed_at)
+            .await
+    }
+
+    async fn remove_thread_member(
+        &mut self,
+        thread_id: ConversationId,
+        agent_id: AgentId,
+        changed_at: String,
+    ) -> Result<MembershipChange, CollaborationError> {
+        self.handle
+            .remove_thread_member(thread_id, agent_id, changed_at)
+            .await
     }
 }
 

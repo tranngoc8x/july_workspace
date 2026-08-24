@@ -350,6 +350,34 @@ pub fn open_acp_direct_message(
     Ok((workspace, runtime))
 }
 
+pub(crate) async fn register_acp_agent(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    agent: &Agent,
+) -> Result<(), DirectMessageBootstrapError> {
+    if agent.status != "active" {
+        return Err(DirectMessageBootstrapError::AgentInactive {
+            agent: agent.name.clone(),
+        });
+    }
+    if agent.transport_type != "acp" {
+        return Err(DirectMessageBootstrapError::UnsupportedTransport {
+            agent: agent.name.clone(),
+            transport: agent.transport_type.clone(),
+        });
+    }
+    let config = parse_acp_config(&agent.transport_config)?;
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: agent.id,
+                project_root: PathBuf::from(&agent.project_root),
+            },
+            AcpTransport::new(config),
+        )
+        .await?;
+    Ok(())
+}
+
 fn parse_acp_config(value: &Value) -> Result<AcpAgentConfig, DirectMessageBootstrapError> {
     const FIELDS: [&str; 6] = [
         "executable",
