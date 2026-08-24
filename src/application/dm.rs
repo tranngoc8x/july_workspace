@@ -382,15 +382,12 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
     }
 
     pub async fn shutdown(&mut self, stopped_at: String) -> Result<(), DirectMessageError> {
-        let persistence = if self.pending_completion.is_some() {
-            self.persist_completion().await.map(|_| ())
-        } else {
-            Ok(())
-        };
+        if self.pending_completion.is_some() {
+            self.persist_completion().await?;
+        }
+        self.runtime.shutdown(stopped_at).await?;
         self.active = None;
-        let shutdown = self.runtime.shutdown(stopped_at).await;
-        persistence?;
-        shutdown
+        Ok(())
     }
 
     async fn persist_completion(&mut self) -> Result<DirectMessageEvent, DirectMessageError> {

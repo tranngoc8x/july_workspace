@@ -394,7 +394,10 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
         found.ok_or(CollaborationError::RoomNotFound(display))
     }
 
-    async fn resolve_agent(&mut self, reference: AgentRef) -> Result<Agent, CollaborationError> {
+    pub async fn resolve_agent(
+        &mut self,
+        reference: AgentRef,
+    ) -> Result<Agent, CollaborationError> {
         let (found, display) = match reference {
             AgentRef::Id(id) => (self.runtime.get_agent(id).await?, id.to_string()),
             AgentRef::Name(name) => (self.runtime.get_agent_by_name(name.clone()).await?, name),

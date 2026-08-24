@@ -249,6 +249,18 @@ impl<T: AgentTransport + Send + 'static> WorkspaceRuntime<T> {
         ))
     }
 
+    pub(crate) fn storage(&self) -> StorageHandle {
+        self.handle.storage.clone()
+    }
+
+    pub(crate) async fn register_agent(
+        &self,
+        connection: AgentConnection,
+        transport: T,
+    ) -> Result<(), RuntimeError> {
+        self.handle.register_agent(connection, transport).await
+    }
+
     pub fn thread(&self, agent_id: AgentId) -> Result<AgentThreadRuntime<T>, RuntimeError> {
         self.handle.ensure_running()?;
         Ok(AgentThreadRuntime::from_workspace(
