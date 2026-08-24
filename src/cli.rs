@@ -58,14 +58,8 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let mut args = args.into_iter();
     let _program = args.next();
     let args: Vec<OsString> = args.collect();
-    if args.len() == 2 && args[0] == "dm" {
-        let agent_name = args
-            .into_iter()
-            .nth(1)
-            .expect("checked argument count")
-            .into_string()
-            .map_err(|_| CliError::InvalidAgentName)?;
-        return run_dm(agent_name).await;
+    if args.len() == 2 && args[0] == "dm" && args[1].to_str().is_none() {
+        return Err(CliError::InvalidAgentName);
     }
     let json_requested = args.iter().any(|arg| arg == "--json");
     let args: Vec<String> = args
@@ -157,7 +151,7 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
     let json = remove_json(&mut args)?;
     match args.first().map(String::as_str) {
         Some("dm") => match args.as_slice() {
-            [_, agent] if !json => Ok(Command::Dm(agent.clone())),
+            [_, agent] if !json => Ok(Command::Dm(positional(agent)?)),
             _ => Err(CliError::Usage),
         },
         Some("room") => parse_room(args, json),

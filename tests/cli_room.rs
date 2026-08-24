@@ -282,3 +282,18 @@ fn dm_retains_its_invalid_utf8_diagnostic() {
     assert_eq!(stderr(&output), "agent name must be valid UTF-8\n");
     assert!(!workspace.database.exists());
 }
+
+#[test]
+fn dm_flags_fail_before_bootstrap() {
+    let json = TestWorkspace::new();
+    let output = json.run(&["dm", "--json"]);
+    json_error(&output, "usage");
+    assert!(!json.database.exists());
+
+    let unknown = TestWorkspace::new();
+    let output = unknown.run(&["dm", "--unknown"]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "usage: july dm <agent>\n");
+    assert!(!unknown.database.exists());
+}
