@@ -1,13 +1,16 @@
 use crate::application::{
+    AddRoomMember, AgentRef, CollaborationError, CollaborationService, CreateRoom,
     DirectMessageError, DirectMessageEvent, DirectMessageFailureKind, DirectMessageRuntime,
-    DirectMessageService,
+    DirectMessageService, MembershipChange, MembershipState, RemoveRoomMember, RoomRef,
 };
-use crate::domain::{MemberType, PermissionOption, PermissionOutcome};
-use crate::runtime::{DirectMessageBootstrapError, open_acp_direct_message};
+use crate::domain::{AgentId, MemberType, PermissionOption, PermissionOutcome, RoomId};
+use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct_message};
 use chrono::{SecondsFormat, Utc};
+use serde_json::json;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::str::FromStr;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 
@@ -22,22 +25,213 @@ pub enum CliError {
     MissingHome,
     #[error("agent name must be valid UTF-8")]
     InvalidAgentName,
+    #[error("command arguments must be valid UTF-8")]
+    InvalidUtf8,
+    #[error("invalid command")]
+    InvalidCommand,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     Bootstrap(#[from] DirectMessageBootstrapError),
     #[error(transparent)]
     DirectMessage(#[from] DirectMessageError),
+    #[error(transparent)]
+    Collaboration(#[from] CollaborationError),
+    #[error("runtime error: {0}")]
+    Runtime(String),
     #[error("agent turn failed: {0}")]
     TurnFailed(&'static str),
     #[error("agent transport disconnected: {0}")]
     Disconnected(String),
     #[error("agent event stream closed")]
     EventStreamClosed,
+    #[error("{0}")]
+    Json(String),
 }
 
 pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
-    let agent_name = parse_agent(args)?;
+    let mut args = args.into_iter();
+    let _program = args.next();
+    let args: Vec<OsString> = args.collect();
+    let json_requested = args.iter().any(|arg| arg == "--json");
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|arg| arg.into_string().map_err(|_| CliError::InvalidUtf8))
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.json_if_requested(json_requested))?;
+    let command = parse_command(args).map_err(|error| error.json_if_requested(json_requested))?;
+    let json = command.json();
+    let result = match command {
+        Command::Dm(agent_name) => run_dm(agent_name).await,
+        Command::Room { operation, .. } => run_room(operation, json).await,
+    };
+    result.map_err(|error| error.json_if_requested(json))
+}
+
+impl CliError {
+    fn json_if_requested(self, json_requested: bool) -> Self {
+        if !json_requested || matches!(&self, Self::Json(_)) {
+            return self;
+        }
+        let code = match &self {
+            Self::Usage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
+            Self::InvalidCommand => "invalid_command",
+            Self::Io(_) => "io_error",
+            Self::Runtime(_) | Self::Bootstrap(_) | Self::DirectMessage(_) => "runtime_error",
+            Self::Collaboration(error) => match error {
+                CollaborationError::RoomNotFound(_) => "room_not_found",
+                CollaborationError::AgentNotFound(_) => "agent_not_found",
+                CollaborationError::RoomIdConflict(_) => "room_id_conflict",
+                CollaborationError::RoomNameConflict(_) => "room_name_conflict",
+                CollaborationError::RoomInactive(_) => "room_inactive",
+                CollaborationError::AgentInactive(_) => "agent_inactive",
+                CollaborationError::RoomRemovalBlocked { .. } => "room_removal_blocked",
+                CollaborationError::InvalidCommand(_) => "invalid_command",
+                _ => "runtime_error",
+            },
+            Self::MissingHome
+            | Self::TurnFailed(_)
+            | Self::Disconnected(_)
+            | Self::EventStreamClosed => "runtime_error",
+            Self::Json(_) => unreachable!(),
+        };
+        Self::Json(json!({ "code": code, "message": self.to_string() }).to_string())
+    }
+}
+
+enum Command {
+    Dm(String),
+    Room {
+        operation: RoomOperation,
+        json: bool,
+    },
+}
+
+impl Command {
+    fn json(&self) -> bool {
+        matches!(self, Self::Room { json: true, .. })
+    }
+}
+
+enum RoomOperation {
+    Create {
+        name: String,
+        description: Option<String>,
+    },
+    List,
+    Members(RoomRef),
+    AddMember {
+        room: RoomRef,
+        agent: AgentRef,
+    },
+    RemoveMember {
+        room: RoomRef,
+        agent: AgentRef,
+    },
+}
+
+fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
+    let json = remove_json(&mut args)?;
+    match args.first().map(String::as_str) {
+        Some("dm") => match args.as_slice() {
+            [_, agent] if !json => Ok(Command::Dm(agent.clone())),
+            _ => Err(CliError::Usage),
+        },
+        Some("room") => parse_room(args, json),
+        Some(_) => Err(CliError::InvalidCommand),
+        None => Err(CliError::Usage),
+    }
+}
+
+fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
+    let mut found = false;
+    args.retain(|arg| {
+        if arg == "--json" {
+            if found {
+                return true;
+            }
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    if args.iter().filter(|arg| arg.as_str() == "--json").count() > 0 {
+        return Err(CliError::Usage);
+    }
+    Ok(found)
+}
+
+fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+    let operation = match args.as_slice() {
+        [_, command] if command == "list" => RoomOperation::List,
+        [_, command, room] if command == "members" => RoomOperation::Members(room_ref(room)?),
+        [_, command, name, rest @ ..] if command == "create" => RoomOperation::Create {
+            name: positional(name)?,
+            description: parse_description(rest)?,
+        },
+        [_, member, action, room, agent] if member == "member" && action == "add" => {
+            RoomOperation::AddMember {
+                room: room_ref(room)?,
+                agent: agent_ref(agent)?,
+            }
+        }
+        [_, member, action, room, agent] if member == "member" && action == "remove" => {
+            RoomOperation::RemoveMember {
+                room: room_ref(room)?,
+                agent: agent_ref(agent)?,
+            }
+        }
+        _ if matches!(
+            args.get(1).map(String::as_str),
+            Some("create" | "list" | "members" | "member")
+        ) =>
+        {
+            return Err(CliError::Usage);
+        }
+        _ => return Err(CliError::InvalidCommand),
+    };
+    Ok(Command::Room { operation, json })
+}
+
+fn positional(value: &str) -> Result<String, CliError> {
+    if value.starts_with("--") {
+        return Err(CliError::Usage);
+    }
+    Ok(value.into())
+}
+
+fn parse_description(args: &[String]) -> Result<Option<String>, CliError> {
+    match args {
+        [] => Ok(None),
+        [flag, description] if flag == "--description" && !description.starts_with("--") => {
+            Ok(Some(description.clone()))
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn room_ref(value: &str) -> Result<RoomRef, CliError> {
+    if value.len() != 26 {
+        return Ok(RoomRef::Name(value.into()));
+    }
+    let id = RoomId::from_str(value).map_err(|_| CliError::Usage)?;
+    (id.to_string() == value)
+        .then_some(RoomRef::Id(id))
+        .ok_or(CliError::Usage)
+}
+
+fn agent_ref(value: &str) -> Result<AgentRef, CliError> {
+    if value.len() != 26 {
+        return Ok(AgentRef::Name(value.into()));
+    }
+    let id = AgentId::from_str(value).map_err(|_| CliError::Usage)?;
+    (id.to_string() == value)
+        .then_some(AgentRef::Id(id))
+        .ok_or(CliError::Usage)
+}
+
+async fn run_dm(agent_name: String) -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
         .parent()
@@ -70,15 +264,126 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     Ok(())
 }
 
-fn parse_agent(args: impl IntoIterator<Item = OsString>) -> Result<String, CliError> {
-    let mut args = args.into_iter();
-    let _program = args.next();
-    match (args.next(), args.next(), args.next()) {
-        (Some(command), Some(agent), None) if command == "dm" => {
-            agent.into_string().map_err(|_| CliError::InvalidAgentName)
-        }
-        _ => Err(CliError::Usage),
+async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
     }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    match operation {
+        RoomOperation::Create { name, description } => {
+            let room_id = service
+                .create_room(CreateRoom {
+                    room_id: RoomId::new(),
+                    name,
+                    description,
+                    created_at: timestamp(),
+                })
+                .await?;
+            if json_output {
+                println!("{}", json!({ "room_id": room_id.to_string() }));
+            } else {
+                println!("{room_id}");
+            }
+        }
+        RoomOperation::List => {
+            let rooms = service.list_rooms().await?;
+            if json_output {
+                let rooms: Vec<_> = rooms
+                    .into_iter()
+                    .map(|room| {
+                        json!({
+                            "room_id": room.id.to_string(), "name": room.name,
+                            "description": room.description, "status": room.status,
+                            "created_at": room.created_at, "updated_at": room.updated_at,
+                        })
+                    })
+                    .collect();
+                println!("{}", json!(rooms));
+            } else {
+                for room in rooms {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        room.id,
+                        room.name,
+                        room.description.unwrap_or_default(),
+                        room.status
+                    );
+                }
+            }
+        }
+        RoomOperation::Members(room) => {
+            let members = service.list_room_members(room).await?;
+            if json_output {
+                let members: Vec<_> = members
+                    .into_iter()
+                    .map(|member| json!({
+                        "room_id": member.room_id.to_string(), "agent_id": member.agent_id.to_string(),
+                        "role": member.role, "generation": member.generation,
+                        "joined_at": member.joined_at, "left_at": member.left_at,
+                        "state": membership_state(member.left_at.is_none()),
+                    }))
+                    .collect();
+                println!("{}", json!(members));
+            } else {
+                for member in members {
+                    let state = membership_state(member.left_at.is_none());
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
+                        member.room_id,
+                        member.agent_id,
+                        member.role.unwrap_or_default(),
+                        member.generation,
+                        member.joined_at,
+                        member.left_at.unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        RoomOperation::AddMember { room, agent } => {
+            let change = service
+                .add_room_member(AddRoomMember {
+                    room,
+                    agent,
+                    role: None,
+                    changed_at: timestamp(),
+                })
+                .await?;
+            print_membership_change(change, json_output);
+        }
+        RoomOperation::RemoveMember { room, agent } => {
+            let change = service
+                .remove_room_member(RemoveRoomMember {
+                    room,
+                    agent,
+                    changed_at: timestamp(),
+                })
+                .await?;
+            print_membership_change(change, json_output);
+        }
+    }
+    Ok(())
+}
+
+fn print_membership_change(change: MembershipChange, json_output: bool) {
+    let state = match change.state {
+        MembershipState::Active => "active",
+        MembershipState::Left => "left",
+    };
+    if json_output {
+        println!("{}", json!({ "state": state, "changed": change.changed }));
+    } else {
+        println!("{state}\t{}", change.changed);
+    }
+}
+
+fn membership_state(active: bool) -> &'static str {
+    if active { "active" } else { "left" }
 }
 
 fn database_path() -> Result<PathBuf, CliError> {
