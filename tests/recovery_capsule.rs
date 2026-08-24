@@ -227,12 +227,20 @@ async fn missing_and_wrong_conversation_checkpoint_anchors_never_fall_back() {
                 decisions: vec![],
                 open_items: vec![],
                 references: vec![],
-                last_message_id: Some(wrong_anchor.id),
+                last_message_id: None,
                 created_at: LATER.into(),
             })
             .unwrap();
         (conversation, wrong_anchor, checkpoint_id)
     };
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection
+        .execute(
+            "UPDATE checkpoints SET last_message_id = ?1 WHERE id = ?2",
+            [wrong_anchor.id.to_string(), checkpoint_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
     let mut service = RecoveryService::new(StorageWorker::open(database.path()).unwrap());
     assert_eq!(
         service.build(command(conversation.id, target.id)).await,
