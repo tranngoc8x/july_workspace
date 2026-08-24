@@ -5,6 +5,7 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 struct TestWorkspace {
@@ -157,6 +158,44 @@ fn read_prompt(child: &mut Child) {
 }
 
 #[cfg(unix)]
+struct ChildOutput {
+    bytes: Receiver<u8>,
+}
+
+#[cfg(unix)]
+impl ChildOutput {
+    fn take(child: &mut Child) -> Self {
+        let stdout = child.stdout.take().unwrap();
+        let (sender, bytes) = mpsc::channel();
+        std::thread::spawn(move || {
+            for byte in std::io::BufReader::new(stdout).bytes() {
+                let Ok(byte) = byte else {
+                    return;
+                };
+                if sender.send(byte).is_err() {
+                    return;
+                }
+            }
+        });
+        Self { bytes }
+    }
+
+    fn read_until(&self, needle: &[u8]) -> String {
+        let mut output = Vec::new();
+        loop {
+            let byte = self
+                .bytes
+                .recv_timeout(Duration::from_secs(2))
+                .expect("REPL did not produce expected output");
+            output.push(byte);
+            if output.ends_with(needle) {
+                return String::from_utf8(output).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -243,20 +282,24 @@ fn repl_room_stack_restores_context_and_lists_only_active_members() {
 #[test]
 fn repl_switches_agents_without_merging_dm_history_or_bindings() {
     let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
     let codex = workspace.seed_acp_agent("codex", &[]);
     let claude = workspace.seed_acp_agent("claude", &["--claude", "--claude-mode"]);
 
-    let output = workspace
-        .repl("/dm codex\none\n1\n/back\n/dm claude\ntwo\n1\n/back\n/dm codex\n/status\n/quit\n");
+    let output = workspace.repl(
+        "/room Operations\n/dm codex\none\n1\n/dm claude\ntwo\n1\n/back\n/status\nsecond\n1\n/back\n/status\n/quit\n",
+    );
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stdout(&output).contains("dm\t"));
-    assert!(stdout(&output).contains("codex"));
+    let stderr_output = stderr(&output);
+    let output = stdout(&output);
+    assert!(output.contains("dm\t"));
+    assert!(output.contains("codex"));
     assert!(
-        stdout(&output).contains("claude"),
+        output.contains("claude"),
         "stdout: {}; stderr: {}",
-        stdout(&output),
-        stderr(&output)
+        output,
+        stderr_output
     );
 
     let connection = Connection::open(&workspace.database).unwrap();
@@ -285,7 +328,10 @@ fn repl_switches_agents_without_merging_dm_history_or_bindings() {
             .collect::<Result<_, _>>()
             .unwrap();
         if agent_id == codex.id.to_string() {
-            assert_eq!(messages, ["one", "fixture reply"]);
+            assert_eq!(
+                messages,
+                ["one", "fixture reply", "second", "fixture reply"]
+            );
         } else {
             assert_eq!(agent_id, claude.id.to_string());
             assert_eq!(messages, ["two", "fixture reply"]);
@@ -297,7 +343,15 @@ fn repl_switches_agents_without_merging_dm_history_or_bindings() {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(bindings >= 1);
+        assert_eq!(bindings, 1);
+        let generation: i64 = connection
+            .query_row(
+                "SELECT generation FROM session_bindings WHERE conversation_id = ? AND agent_id = ?",
+                [&conversation_id, &agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 1);
         let status: String = connection
             .query_row(
                 "SELECT status FROM session_bindings WHERE conversation_id = ? AND agent_id = ? ORDER BY last_used_at DESC, id DESC LIMIT 1",
@@ -307,6 +361,18 @@ fn repl_switches_agents_without_merging_dm_history_or_bindings() {
             .unwrap();
         assert_eq!(status, "disconnected");
     }
+    let dm_status = output
+        .lines()
+        .find(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            fields.len() == 5 && fields[0].ends_with("dm") && fields[2] == "codex"
+        })
+        .unwrap_or_else(|| panic!("missing Codex DM status in stdout: {output}"));
+    let fields: Vec<_> = dm_status.split('\t').collect();
+    assert_eq!(fields.len(), 5);
+    assert!(!fields[3].is_empty());
+    assert_eq!(fields[4], "active");
+    assert!(output.contains(&format!("room\t{}\tOperations\n", room.id)));
 }
 
 #[test]
@@ -338,8 +404,9 @@ fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() 
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &[]);
 
-    let output =
-        workspace.repl("/dm codex\n/dm\n/dm \n/room \n/status extra\n/unknown exact\n1\n/quit\n");
+    let output = workspace.repl(
+        "/dm codex\n/dm\n/dm \n/room \n/status extra\n /status\n1\n/unknown exact\n1\n/quit\n",
+    );
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stderr(&output).matches("invalid command\n").count(), 4);
@@ -351,7 +418,71 @@ fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() 
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(messages, ["/unknown exact", "fixture reply"]);
+    assert_eq!(messages.len(), 4);
+    assert!(messages.iter().any(|message| message == " /status"));
+    assert!(messages.iter().any(|message| message == "/unknown exact"));
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| message.as_str() == "fixture reply")
+            .count(),
+        2
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn repl_sigint_during_dm_permission_returns_to_prompt_and_disconnects_on_exit() {
+    let workspace = TestWorkspace::new();
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let mut child = workspace.spawn_repl();
+    let output = ChildOutput::take(&mut child);
+    assert!(output.read_until(b"> ").ends_with("> "));
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/dm codex\nhello\n")
+        .unwrap();
+    assert!(output.read_until(b"permission> ").ends_with("permission> "));
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(output.read_until(b"> ").ends_with("> "));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/status\n/quit\n")
+        .unwrap();
+    let status = output.read_until(b"active\n");
+    assert!(status.contains("dm\t"));
+    let fields: Vec<_> = status.trim_end().split('\t').collect();
+    assert_eq!(fields.len(), 5);
+    assert!(!fields[3].is_empty());
+    assert_eq!(fields[4], "active");
+
+    let status = wait_for_exit(&mut child, Duration::from_secs(2));
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(status.is_some(), "REPL did not exit after /quit");
+    assert!(status.unwrap().success());
+    let connection = Connection::open(&workspace.database).unwrap();
+    let binding: String = connection
+        .query_row(
+            "SELECT status FROM session_bindings WHERE agent_id = ? ORDER BY last_used_at DESC, id DESC LIMIT 1",
+            [codex.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding, "disconnected");
 }
 
 #[cfg(unix)]

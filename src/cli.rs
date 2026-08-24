@@ -63,6 +63,11 @@ pub enum CliError {
         operation: Box<CliError>,
         shutdown: String,
     },
+    #[error("{operation}; context restore failed: {restore}")]
+    OperationAndRestore {
+        operation: Box<CliError>,
+        restore: String,
+    },
     #[error("{0}")]
     Json(String),
 }
@@ -145,7 +150,8 @@ impl CliError {
             | Self::TurnFailed(_)
             | Self::Disconnected(_)
             | Self::EventStreamClosed => "runtime_error",
-            Self::OperationAndShutdown { operation, .. } => operation.error_code(),
+            Self::OperationAndShutdown { operation, .. }
+            | Self::OperationAndRestore { operation, .. } => operation.error_code(),
             Self::Json(_) => unreachable!(),
         }
     }
@@ -517,7 +523,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 contexts.pop();
                 if let Err(error) = restore_repl_dm(service, workspace, &contexts, live_dm).await {
                     contexts.push(previous);
-                    restore_repl_dm(service, workspace, &contexts, live_dm).await?;
+                    if let Err(restore) =
+                        restore_repl_dm(service, workspace, &contexts, live_dm).await
+                    {
+                        return Err(CliError::OperationAndRestore {
+                            operation: Box::new(error),
+                            restore: restore.to_string(),
+                        });
+                    }
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
@@ -597,7 +610,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                     }
                     Err(error) => {
-                        restore_repl_dm(service, workspace, &contexts, live_dm).await?;
+                        if let Err(restore) =
+                            restore_repl_dm(service, workspace, &contexts, live_dm).await
+                        {
+                            return Err(CliError::OperationAndRestore {
+                                operation: Box::new(error),
+                                restore: restore.to_string(),
+                            });
+                        }
                         repl_stderr(format_args!("{error}\n"))?;
                     }
                 }
@@ -1386,4 +1406,23 @@ fn turn_failed(failure: DirectMessageFailureKind) -> CliError {
 
 fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliError;
+
+    #[test]
+    fn operation_and_restore_preserves_the_operation_error_code() {
+        let error = CliError::OperationAndRestore {
+            operation: Box::new(CliError::InvalidCommand),
+            restore: "restore failed".into(),
+        };
+
+        assert_eq!(error.error_code(), "invalid_command");
+        assert_eq!(
+            error.to_string(),
+            "invalid command; context restore failed: restore failed"
+        );
+    }
 }
