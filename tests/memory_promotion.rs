@@ -114,7 +114,7 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
         MemoryScopeType::Room,
         SHARED_SCOPE_ID,
         MemoryKind::Constraint,
-        None,
+        Some(source.id),
         None,
         CREATED,
     );
@@ -123,7 +123,7 @@ async fn explicit_promotion_lists_exact_scope_and_kind_in_stable_order_after_res
         MemoryScopeType::Agent,
         SHARED_SCOPE_ID,
         MemoryKind::Result,
-        None,
+        Some(source.id),
         None,
         CREATED,
     );
@@ -283,14 +283,66 @@ async fn invalid_or_orphaned_promotion_leaves_no_partial_memory() {
         Some(MemoryId::new()),
         CREATED,
     );
+    let missing_source = memory(
+        "00000000000000000000000009",
+        MemoryScopeType::Project,
+        "cashpoint",
+        MemoryKind::Fact,
+        None,
+        None,
+        CREATED,
+    );
+    let self_supersession = memory(
+        "0000000000000000000000000A",
+        MemoryScopeType::Project,
+        "cashpoint",
+        MemoryKind::Fact,
+        Some(source.id),
+        Some(MemoryId::from_str("0000000000000000000000000A").unwrap()),
+        CREATED,
+    );
+
+    let predecessor = memory(
+        "0000000000000000000000000B",
+        MemoryScopeType::Project,
+        "cashpoint",
+        MemoryKind::Fact,
+        Some(source.id),
+        None,
+        CREATED,
+    );
+    let cross_scope_supersession = memory(
+        "0000000000000000000000000C",
+        MemoryScopeType::Room,
+        "cashpoint",
+        MemoryKind::Decision,
+        Some(source.id),
+        Some(predecessor.id),
+        LATER,
+    );
 
     let mut worker = StorageWorker::open(database.path()).unwrap();
-    for memory in [blank_scope, missing_provenance, missing_supersession] {
+    worker.promote_memory(predecessor.clone()).await.unwrap();
+    for memory in [
+        blank_scope,
+        missing_provenance,
+        missing_supersession,
+        missing_source,
+        self_supersession,
+        cross_scope_supersession,
+    ] {
         assert!(worker.promote_memory(memory).await.is_err());
     }
-    assert!(
+    assert_eq!(
         worker
             .list_memories(MemoryScopeType::Project, "cashpoint".into(), None)
+            .await
+            .unwrap(),
+        vec![predecessor]
+    );
+    assert!(
+        worker
+            .list_memories(MemoryScopeType::Room, "cashpoint".into(), None)
             .await
             .unwrap()
             .is_empty()

@@ -194,9 +194,22 @@ async fn storage_worker_rejects_invalid_or_orphaned_checkpoints_without_persisti
     let database = TestDatabase::new();
     let valid_agent = agent("codex");
     let valid_conversation = conversation();
+    let other_conversation = conversation();
+    let other_message = Message {
+        id: MessageId::new(),
+        conversation_id: other_conversation.id,
+        sender_type: MemberType::User,
+        sender_id: "tony".into(),
+        body: "belongs to another conversation".into(),
+        reply_to: None,
+        metadata: json!({}),
+        created_at: CREATED.into(),
+    };
     let store = SqliteStore::open(database.path()).unwrap();
     store.insert_agent(&valid_agent).unwrap();
     store.insert_conversation(&valid_conversation).unwrap();
+    store.insert_conversation(&other_conversation).unwrap();
+    store.insert_message(&other_message).unwrap();
     drop(store);
 
     let invalid = Checkpoint {
@@ -225,6 +238,13 @@ async fn storage_worker_rejects_invalid_or_orphaned_checkpoints_without_persisti
         None,
         CREATED,
     );
+    let cross_conversation_anchor = checkpoint(
+        "00000000000000000000000008",
+        valid_conversation.id,
+        valid_agent.id,
+        Some(other_message.id),
+        CREATED,
+    );
 
     let mut worker = StorageWorker::open(database.path()).unwrap();
     assert!(worker.insert_checkpoint(invalid).await.is_err());
@@ -235,6 +255,12 @@ async fn storage_worker_rejects_invalid_or_orphaned_checkpoints_without_persisti
             .is_err()
     );
     assert!(worker.insert_checkpoint(missing_agent).await.is_err());
+    assert!(
+        worker
+            .insert_checkpoint(cross_conversation_anchor)
+            .await
+            .is_err()
+    );
     assert_eq!(
         worker
             .get_latest_checkpoint(valid_conversation.id, valid_agent.id)

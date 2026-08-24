@@ -893,6 +893,64 @@ async fn missing_or_provider_lost_remote_recovers_once_with_scoped_capsule() {
 }
 
 #[tokio::test]
+async fn pending_unattached_recovery_retries_same_binding_and_capsule() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database, true, true);
+    let source = SessionBinding {
+        id: SessionBindingId::new(),
+        conversation_id: fixture.thread.id,
+        agent_id: fixture.agent.id,
+        transport_type: "acp".into(),
+        remote_session_id: Some("lost-remote".into()),
+        generation: 1,
+        status: SessionBindingStatus::Lost,
+        created_at: NOW.into(),
+        last_used_at: NOW.into(),
+    };
+    let replacement_id = SessionBindingId::new();
+    let stored_capsule = "stored recovery capsule";
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    store.insert_session_binding(&source).unwrap();
+    let (pending, _) = store
+        .begin_session_replacement(source.id, replacement_id, stored_capsule, LATER)
+        .unwrap();
+    drop(store);
+
+    let (transport, observed) = FakeTransport::new("replacement-remote");
+    let mut runtime = runtime(&database, transport);
+    let opened = runtime
+        .open_thread_for_agent(command(&fixture, LATER))
+        .await
+        .unwrap();
+
+    assert_eq!(opened.session_binding_id, pending.id);
+    let store = SqliteStore::open(database.path()).unwrap();
+    let latest = store
+        .get_latest_session_binding(fixture.thread.id, fixture.agent.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.id, pending.id);
+    assert_eq!(latest.generation, 2);
+    assert_eq!(latest.status, SessionBindingStatus::Active);
+    assert!(
+        store
+            .get_session_recovery(pending.id)
+            .unwrap()
+            .unwrap()
+            .capsule_delivered_at
+            .is_some()
+    );
+    {
+        let observed = observed.lock().unwrap();
+        assert_eq!(observed.creates.len(), 1);
+        assert_eq!(observed.messages.len(), 1);
+        assert_eq!(observed.messages[0].content, stored_capsule);
+        assert_eq!(observed.messages[0].session.binding_id, pending.id);
+    }
+    runtime.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
 async fn closed_binding_is_not_replaced() {
     let database = TestDatabase::new();
     let fixture = seed(&database, true, true);

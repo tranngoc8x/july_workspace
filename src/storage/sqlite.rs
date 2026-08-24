@@ -416,6 +416,8 @@ impl SqliteStore {
                 SessionBindingStatus::Active | SessionBindingStatus::Disconnected
             )
             && binding.remote_session_id.is_none()
+            && session_recovery_by_id(&transaction, binding.id)?
+                .is_none_or(|recovery| recovery.capsule_delivered_at.is_some())
         {
             transaction.execute(
                 "UPDATE session_bindings SET status = 'lost', last_used_at = ?1 WHERE id = ?2",
@@ -1916,7 +1918,25 @@ impl SqliteStore {
         let decisions = serde_json::to_string(&checkpoint.decisions)?;
         let open_items = serde_json::to_string(&checkpoint.open_items)?;
         let references = serde_json::to_string(&checkpoint.references)?;
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(last_message_id) = checkpoint.last_message_id {
+            let belongs_to_conversation: bool = transaction.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM messages WHERE id = ?1 AND conversation_id = ?2
+                 )",
+                params![
+                    last_message_id.to_string(),
+                    checkpoint.conversation_id.to_string()
+                ],
+                |row| row.get(0),
+            )?;
+            if !belongs_to_conversation {
+                return Err(StoreError::InvalidStoredValue(
+                    "checkpoint.last_message_id conversation",
+                ));
+            }
+        }
+        transaction.execute(
             "INSERT INTO checkpoints(
                 id, conversation_id, agent_id, goal, current_state, decisions_json,
                 open_items_json, references_json, last_message_id, created_at
@@ -1934,6 +1954,7 @@ impl SqliteStore {
                 checkpoint.created_at,
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1986,6 +2007,65 @@ impl SqliteStore {
                 memory.created_at,
             ],
         )?;
+        Ok(())
+    }
+
+    pub fn promote_memory(&self, memory: &Memory) -> Result<(), StoreError> {
+        memory.validate()?;
+        let evidence = serde_json::to_string(&memory.evidence)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let source_conversation_id =
+            memory
+                .source_conversation_id
+                .ok_or(StoreError::InvalidStoredValue(
+                    "memory.source_conversation_id",
+                ))?;
+        let source_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id = ?1)",
+            params![source_conversation_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !source_exists {
+            return Err(StoreError::InvalidStoredValue(
+                "memory.source_conversation_id",
+            ));
+        }
+        if let Some(supersedes_memory_id) = memory.supersedes_memory_id {
+            if supersedes_memory_id == memory.id {
+                return Err(StoreError::InvalidStoredValue(
+                    "memory.supersedes_memory_id",
+                ));
+            }
+            let predecessor_scope = query_optional(
+                &transaction,
+                "SELECT scope_type, scope_id FROM memories WHERE id = ?1",
+                params![supersedes_memory_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
+            if predecessor_scope != Some((memory.scope_type.to_string(), memory.scope_id.clone())) {
+                return Err(StoreError::InvalidStoredValue(
+                    "memory.supersedes_memory_id scope",
+                ));
+            }
+        }
+        transaction.execute(
+            "INSERT INTO memories(
+                id, scope_type, scope_id, kind, content, source_conversation_id,
+                evidence_json, supersedes_memory_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                memory.id.to_string(),
+                memory.scope_type.to_string(),
+                memory.scope_id,
+                memory.kind.to_string(),
+                memory.content,
+                source_conversation_id.to_string(),
+                evidence,
+                memory.supersedes_memory_id.map(|id| id.to_string()),
+                memory.created_at,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 

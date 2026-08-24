@@ -1079,7 +1079,7 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                 let _ = reply.send(store.get_latest_checkpoint(conversation_id, agent_id));
             }
             Command::PromoteMemory(memory, reply) => {
-                let _ = reply.send(store.insert_memory(&memory));
+                let _ = reply.send(store.promote_memory(&memory));
             }
             Command::ListMemories(scope_type, scope_id, kind, reply) => {
                 let _ = reply.send(store.list_memories(scope_type, &scope_id, kind));
