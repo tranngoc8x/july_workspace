@@ -945,6 +945,37 @@ impl DependencyRuntime for StorageWorker {
     }
 }
 
+impl PublishRuntime for StorageHandle {
+    async fn publish_result(
+        &mut self,
+        publish_id: PublishId,
+        result_id: ResultId,
+        target_conversation_id: ConversationId,
+        published_at: String,
+    ) -> Result<PublishedResult, PublishError> {
+        self.publish_request(|reply| {
+            Command::PublishResult(
+                publish_id,
+                result_id,
+                target_conversation_id,
+                published_at,
+                reply,
+            )
+        })
+        .await
+        .map(PublishedResult::from)
+    }
+
+    async fn list_published_results(
+        &mut self,
+        target_conversation_id: ConversationId,
+    ) -> Result<Vec<PublishedResult>, PublishError> {
+        self.publish_request(|reply| Command::ListPublishedResults(target_conversation_id, reply))
+            .await
+            .map(|results| results.into_iter().map(PublishedResult::from).collect())
+    }
+}
+
 impl PublishRuntime for StorageWorker {
     async fn publish_result(
         &mut self,

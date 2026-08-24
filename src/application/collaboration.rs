@@ -165,6 +165,16 @@ pub enum CollaborationError {
     AgentTargetNotBound,
     #[error("a Thread is already open in this runtime")]
     ThreadAlreadyOpen,
+    #[error("thread chat is not open")]
+    ChatNotOpen,
+    #[error("thread message content cannot be blank")]
+    EmptyMessage,
+    #[error("agent completed an empty message")]
+    EmptyAgentMessage,
+    #[error("transport event does not belong to the open thread")]
+    SessionMismatch,
+    #[error("permission request {0} is not pending")]
+    PermissionRequestNotFound(String),
     #[error("Thread context is stopped")]
     ContextStopped,
     #[error("the durable Agent session was lost")]

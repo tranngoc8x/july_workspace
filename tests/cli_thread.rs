@@ -294,12 +294,14 @@ fn thread_rejects_invalid_grammar_before_storage_and_exact_reference_misses_befo
         assert!(!workspace.database.exists());
     }
 
+    // `thread open` resolves its Agent before any session starts.
     let workspace = TestWorkspace::new();
     let thread_id = ConversationId::new().to_string();
     let output = workspace.run(&["thread", "open", &thread_id, "--agent", "Codex"]);
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
-    assert!(!workspace.database.exists());
+    assert!(stderr(&output).contains("agent Codex does not exist"));
+    assert_eq!(workspace.threads(), 0);
 
     let workspace = TestWorkspace::new();
     workspace.seed_agent("Codex");

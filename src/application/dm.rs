@@ -1,9 +1,16 @@
+use super::chat::{ChatEvent, ChatFailureKind, ChatPermissionRequestId, ChatRuntimeEvent};
 use crate::domain::{
-    AgentId, ConversationId, Message, MessageId, PermissionOption, PermissionOutcome,
-    SessionBindingId, SessionBindingStatus,
+    AgentId, ConversationId, Message, MessageId, PermissionOutcome, SessionBindingId,
+    SessionBindingStatus,
 };
-use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
+
+/// Direct messages use the shared chat vocabulary; the aliases keep the DM
+/// spelling that the existing DM boundary and tests already speak.
+pub type DirectMessagePermissionRequestId = ChatPermissionRequestId;
+pub type DirectMessageFailureKind = ChatFailureKind;
+pub type DirectMessageEvent = ChatEvent;
+pub type DirectMessageRuntimeEvent = ChatRuntimeEvent;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpenedDirectMessage {
@@ -47,60 +54,6 @@ pub struct DeliveredAgentDirectMessage {
 pub enum AgentDirectMessageOutcome {
     Delivered(DeliveredAgentDirectMessage),
     PersistedFailed(DirectMessageError),
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct DirectMessagePermissionRequestId(String);
-
-impl DirectMessagePermissionRequestId {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for DirectMessagePermissionRequestId {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl Display for DirectMessagePermissionRequestId {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DirectMessageFailureKind {
-    AuthenticationRequired,
-    Protocol,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DirectMessageEvent {
-    TextDelta(String),
-    MessageCompleted(Message),
-    PermissionRequested {
-        request_id: DirectMessagePermissionRequestId,
-        options: Vec<PermissionOption>,
-    },
-    TurnCompleted,
-    TurnFailed(DirectMessageFailureKind),
-    Disconnected(String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DirectMessageRuntimeEvent {
-    TextDelta(String),
-    AgentMessageCompleted,
-    PermissionRequested {
-        request_id: DirectMessagePermissionRequestId,
-        options: Vec<PermissionOption>,
-    },
-    TurnCompleted,
-    TurnFailed(DirectMessageFailureKind),
-    Disconnected(String),
-    SessionLost,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]

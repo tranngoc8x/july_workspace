@@ -1,15 +1,18 @@
 use super::{RuntimeError, RuntimeSession, WorkspaceHandle};
 use crate::application::{
-    CollaborationError, MentionThreadAgent, MentionedThreadAgent, OpenThreadForAgent, OpenedThread,
-    RetryThreadMention, ThreadMentionOutcome, ThreadRuntime,
+    ChatFailureKind, ChatPermissionRequestId, ChatRuntimeEvent, CollaborationError,
+    MentionThreadAgent, MentionedThreadAgent, OpenThreadForAgent, OpenedThread, RetryThreadMention,
+    ThreadChatRuntime, ThreadMentionOutcome, ThreadRuntime,
 };
 use crate::domain::{
     AgentId, MemberType, Message, MessageDelivery, MessageId, PermissionOutcome, SessionBinding,
     SessionBindingStatus,
 };
 use crate::transport::{
-    AgentConnection, AgentTransport, PermissionRequestId, TransportError, TransportEvent,
+    AgentConnection, AgentTransport, PermissionRequestId, SessionRef, TransportError,
+    TransportEvent, TransportFailureKind,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub struct AgentThreadRuntime<T: AgentTransport + Send + 'static> {
@@ -18,6 +21,7 @@ pub struct AgentThreadRuntime<T: AgentTransport + Send + 'static> {
     session: Option<RuntimeSession>,
     expected_agent_id: Option<AgentId>,
     opened: Option<OpenedThread>,
+    permissions: HashMap<String, SessionRef>,
     stopped: bool,
 }
 
@@ -33,6 +37,7 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
             session: None,
             expected_agent_id,
             opened: None,
+            permissions: HashMap::new(),
             stopped: false,
         }
     }
@@ -465,6 +470,143 @@ impl<T: AgentTransport + Send + 'static> ThreadRuntime for AgentThreadRuntime<T>
     }
 }
 
+impl<T: AgentTransport + Send + 'static> ThreadChatRuntime for AgentThreadRuntime<T> {
+    async fn open_thread_chat(
+        &mut self,
+        command: OpenThreadForAgent,
+    ) -> Result<OpenedThread, CollaborationError> {
+        ThreadRuntime::open_thread_for_agent(self, command).await
+    }
+
+    async fn persist_message(&mut self, message: Message) -> Result<(), CollaborationError> {
+        self.workspace
+            .storage()
+            .insert_message(message)
+            .await
+            .map_err(runtime_error)
+    }
+
+    async fn send_exact_message(&mut self, content: String) -> Result<(), CollaborationError> {
+        self.session
+            .as_ref()
+            .ok_or(CollaborationError::ChatNotOpen)?
+            .send_message(content)
+            .await
+            .map_err(runtime_error)
+    }
+
+    async fn next_runtime_event(
+        &mut self,
+        _observed_at: String,
+    ) -> Result<Option<ChatRuntimeEvent>, CollaborationError> {
+        loop {
+            let expected = self
+                .session
+                .as_ref()
+                .ok_or(CollaborationError::ChatNotOpen)?
+                .session()
+                .clone();
+            let event = self
+                .session
+                .as_mut()
+                .ok_or(CollaborationError::ChatNotOpen)?
+                .next_event()
+                .await;
+            let Some(event) = event else { return Ok(None) };
+            match event {
+                TransportEvent::AgentTextDelta { session, text } => {
+                    require_session(&expected, &session)?;
+                    return Ok(Some(ChatRuntimeEvent::TextDelta(text)));
+                }
+                TransportEvent::AgentMessageCompleted { session } => {
+                    require_session(&expected, &session)?;
+                    return Ok(Some(ChatRuntimeEvent::AgentMessageCompleted));
+                }
+                TransportEvent::PermissionRequested(request) => {
+                    require_session(&expected, &request.session)?;
+                    let request_id = request.request_id.to_string();
+                    self.permissions.insert(request_id.clone(), request.session);
+                    return Ok(Some(ChatRuntimeEvent::PermissionRequested {
+                        request_id: request_id.into(),
+                        options: request.options,
+                    }));
+                }
+                TransportEvent::TurnCompleted { session } => {
+                    require_session(&expected, &session)?;
+                    return Ok(Some(ChatRuntimeEvent::TurnCompleted));
+                }
+                TransportEvent::TurnFailed { session, failure } => {
+                    require_session(&expected, &session)?;
+                    return Ok(Some(ChatRuntimeEvent::TurnFailed(match failure {
+                        TransportFailureKind::AuthenticationRequired => {
+                            ChatFailureKind::AuthenticationRequired
+                        }
+                        TransportFailureKind::Protocol => ChatFailureKind::Protocol,
+                    })));
+                }
+                TransportEvent::TransportDisconnected { agent_id, reason } => {
+                    if self.opened.ok_or(CollaborationError::ChatNotOpen)?.agent_id != agent_id {
+                        return Err(CollaborationError::SessionMismatch);
+                    }
+                    return Ok(Some(ChatRuntimeEvent::Disconnected(reason)));
+                }
+                TransportEvent::SessionLost { session } => {
+                    require_session(&expected, &session)?;
+                    return Ok(Some(ChatRuntimeEvent::SessionLost));
+                }
+                TransportEvent::TurnStarted { session }
+                | TransportEvent::ToolCallStarted { session, .. }
+                | TransportEvent::ToolCallFinished { session, .. }
+                | TransportEvent::UsageReported { session, .. } => {
+                    require_session(&expected, &session)?;
+                }
+            }
+        }
+    }
+
+    async fn respond_permission(
+        &mut self,
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), CollaborationError> {
+        self.permissions
+            .remove(request_id.as_str())
+            .ok_or_else(|| CollaborationError::PermissionRequestNotFound(request_id.to_string()))?;
+        self.session
+            .as_ref()
+            .ok_or(CollaborationError::ChatNotOpen)?
+            .respond_permission(
+                PermissionRequestId::from(request_id.to_string()),
+                outcome,
+                decided_at,
+            )
+            .await
+            .map_err(runtime_error)
+    }
+
+    async fn cancel_turn(&mut self, cancelled_at: String) -> Result<(), CollaborationError> {
+        self.session
+            .as_ref()
+            .ok_or(CollaborationError::ChatNotOpen)?
+            .cancel_turn(cancelled_at)
+            .await
+            .map_err(runtime_error)
+    }
+
+    async fn shutdown(&mut self, stopped_at: String) -> Result<(), CollaborationError> {
+        ThreadRuntime::shutdown(self, stopped_at).await
+    }
+}
+
+fn require_session(expected: &SessionRef, session: &SessionRef) -> Result<(), CollaborationError> {
+    if expected == session {
+        Ok(())
+    } else {
+        Err(CollaborationError::SessionMismatch)
+    }
+}
+
 fn runtime_error(error: RuntimeError) -> CollaborationError {
     match error {
         RuntimeError::Transport(error) => transport_error(error),
@@ -472,6 +614,10 @@ fn runtime_error(error: RuntimeError) -> CollaborationError {
         RuntimeError::SessionBindingAlreadyAttached(id) => {
             CollaborationError::SessionAlreadyAttached(id)
         }
+        RuntimeError::PermissionRequestNotFound(id) => {
+            CollaborationError::PermissionRequestNotFound(id)
+        }
+        RuntimeError::SessionUnavailable(status) => CollaborationError::SessionUnavailable(status),
         other => CollaborationError::Runtime(other.to_string()),
     }
 }
@@ -479,6 +625,10 @@ fn runtime_error(error: RuntimeError) -> CollaborationError {
 fn transport_error(error: TransportError) -> CollaborationError {
     match error {
         TransportError::SessionLost(_) => CollaborationError::SessionLost,
+        TransportError::SessionReferenceMismatch(_) => CollaborationError::SessionMismatch,
+        TransportError::PermissionRequestNotFound(id) => {
+            CollaborationError::PermissionRequestNotFound(id)
+        }
         other => CollaborationError::Runtime(other.to_string()),
     }
 }

@@ -1,16 +1,17 @@
 use crate::application::{
-    AddRoomMember, AddThreadMember, AgentRef, CollaborationError, CollaborationService, CreateRoom,
-    CreateThread, DirectMessageError, DirectMessageEvent, DirectMessageFailureKind,
-    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState, PublishError,
-    PublishResult, PublishService, RemoveRoomMember, RemoveThreadMember, RoomRef,
+    AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind, ChatPermissionRequestId,
+    CollaborationError, CollaborationService, CreateRoom, CreateThread, DirectMessageError,
+    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState,
+    OpenThreadForAgent, PublishError, PublishResult, PublishService, RemoveRoomMember,
+    RemoveThreadMember, RoomRef, ThreadChatRuntime, ThreadChatService,
 };
 use crate::domain::{
     AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, PublishId, ResultId,
     RoomId, WorkItemId,
 };
 use crate::runtime::{
-    AgentDirectMessageRuntime, DirectMessageBootstrapError, StorageWorker, WorkspaceRuntime,
-    open_acp_direct_message, register_acp_agent,
+    AgentDirectMessageRuntime, AgentThreadRuntime, DirectMessageBootstrapError, StorageWorker,
+    WorkspaceRuntime, open_acp_direct_message, register_acp_agent,
 };
 use crate::transport::AcpTransport;
 use chrono::{SecondsFormat, Utc};
@@ -95,6 +96,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let result = match command {
         Command::Repl => run_repl().await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
+        Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
         Command::Publish {
@@ -166,6 +168,10 @@ impl CliError {
 enum Command {
     Repl,
     Dm(String),
+    ThreadOpen {
+        thread_id: ConversationId,
+        agent: AgentRef,
+    },
     Room {
         operation: RoomOperation,
         json: bool,
@@ -190,9 +196,151 @@ enum ReplContext {
         agent_id: AgentId,
         agent_name: String,
     },
+    Thread {
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+        agent_name: String,
+    },
+}
+
+impl ReplContext {
+    /// Publish targets a Conversation; a Room is not one.
+    fn conversation_id(&self) -> Option<ConversationId> {
+        match self {
+            Self::Root | Self::Room(_) => None,
+            Self::Dm {
+                conversation_id, ..
+            }
+            | Self::Thread {
+                conversation_id, ..
+            } => Some(*conversation_id),
+        }
+    }
 }
 
 type ReplDirectMessage = DirectMessageService<AgentDirectMessageRuntime<AcpTransport>>;
+type ReplThreadChat = ThreadChatService<AgentThreadRuntime<AcpTransport>>;
+
+/// One interactive context at a time; lower stack entries stay cold descriptors.
+enum ReplChat {
+    Dm(Box<ReplDirectMessage>),
+    Thread(Box<ReplThreadChat>),
+}
+
+/// Presentation-side view of an open DM or Thread turn.
+#[allow(async_fn_in_trait)]
+trait ChatContext {
+    async fn send(&mut self, body: String, sent_at: String) -> Result<(), CliError>;
+    async fn next(&mut self, observed_at: String) -> Result<Option<ChatEvent>, CliError>;
+    async fn permit(
+        &mut self,
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), CliError>;
+    async fn cancel(&mut self, cancelled_at: String) -> Result<(), CliError>;
+    async fn stop(&mut self, stopped_at: String) -> Result<(), CliError>;
+}
+
+impl<R: DirectMessageRuntime> ChatContext for DirectMessageService<R> {
+    async fn send(&mut self, body: String, sent_at: String) -> Result<(), CliError> {
+        Ok(self.send_message(body, sent_at).await?)
+    }
+
+    async fn next(&mut self, observed_at: String) -> Result<Option<ChatEvent>, CliError> {
+        Ok(self.next_event(observed_at).await?)
+    }
+
+    async fn permit(
+        &mut self,
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), CliError> {
+        Ok(self
+            .respond_permission(request_id, outcome, decided_at)
+            .await?)
+    }
+
+    async fn cancel(&mut self, cancelled_at: String) -> Result<(), CliError> {
+        Ok(self.cancel_turn(cancelled_at).await?)
+    }
+
+    async fn stop(&mut self, stopped_at: String) -> Result<(), CliError> {
+        Ok(self.shutdown(stopped_at).await?)
+    }
+}
+
+impl<R: ThreadChatRuntime> ChatContext for ThreadChatService<R> {
+    async fn send(&mut self, body: String, sent_at: String) -> Result<(), CliError> {
+        Ok(self.send_message(body, sent_at).await?)
+    }
+
+    async fn next(&mut self, observed_at: String) -> Result<Option<ChatEvent>, CliError> {
+        Ok(self.next_event(observed_at).await?)
+    }
+
+    async fn permit(
+        &mut self,
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), CliError> {
+        Ok(self
+            .respond_permission(request_id, outcome, decided_at)
+            .await?)
+    }
+
+    async fn cancel(&mut self, cancelled_at: String) -> Result<(), CliError> {
+        Ok(self.cancel_turn(cancelled_at).await?)
+    }
+
+    async fn stop(&mut self, stopped_at: String) -> Result<(), CliError> {
+        Ok(self.shutdown(stopped_at).await?)
+    }
+}
+
+impl ChatContext for ReplChat {
+    async fn send(&mut self, body: String, sent_at: String) -> Result<(), CliError> {
+        match self {
+            Self::Dm(dm) => dm.send(body, sent_at).await,
+            Self::Thread(thread) => thread.send(body, sent_at).await,
+        }
+    }
+
+    async fn next(&mut self, observed_at: String) -> Result<Option<ChatEvent>, CliError> {
+        match self {
+            Self::Dm(dm) => dm.next(observed_at).await,
+            Self::Thread(thread) => thread.next(observed_at).await,
+        }
+    }
+
+    async fn permit(
+        &mut self,
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+        decided_at: String,
+    ) -> Result<(), CliError> {
+        match self {
+            Self::Dm(dm) => dm.permit(request_id, outcome, decided_at).await,
+            Self::Thread(thread) => thread.permit(request_id, outcome, decided_at).await,
+        }
+    }
+
+    async fn cancel(&mut self, cancelled_at: String) -> Result<(), CliError> {
+        match self {
+            Self::Dm(dm) => dm.cancel(cancelled_at).await,
+            Self::Thread(thread) => thread.cancel(cancelled_at).await,
+        }
+    }
+
+    async fn stop(&mut self, stopped_at: String) -> Result<(), CliError> {
+        match self {
+            Self::Dm(dm) => dm.stop(stopped_at).await,
+            Self::Thread(thread) => thread.stop(stopped_at).await,
+        }
+    }
+}
 
 impl Command {
     fn json(&self) -> bool {
@@ -271,6 +419,13 @@ fn parse_publish(args: Vec<String>, json: bool) -> Result<Command, CliError> {
 
 fn parse_thread(args: Vec<String>, json: bool) -> Result<Command, CliError> {
     let operation = match args.as_slice() {
+        // `thread open` streams an interactive session, so it never frames JSON.
+        [_, command, thread, flag, agent] if command == "open" && flag == "--agent" && !json => {
+            return Ok(Command::ThreadOpen {
+                thread_id: thread_id(thread)?,
+                agent: agent_ref(agent)?,
+            });
+        }
         [_, command, title, rest @ ..] if command == "create" => {
             let (room, goal, members) = parse_thread_create(rest)?;
             ThreadOperation::Create {
@@ -471,9 +626,9 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
 ) -> Result<(), CliError> {
-    let mut live_dm = None;
-    let interaction = interact_repl_loop(service, workspace, &mut live_dm).await;
-    let shutdown = close_repl_dm(&mut live_dm).await;
+    let mut live = None;
+    let interaction = interact_repl_loop(service, workspace, &mut live).await;
+    let shutdown = close_repl_context(&mut live).await;
     match (interaction, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(operation), Ok(())) => Err(operation),
@@ -488,49 +643,51 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
 async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
-    live_dm: &mut Option<ReplDirectMessage>,
+    live: &mut Option<ReplChat>,
 ) -> Result<(), CliError> {
     let mut input = repl_input();
     let mut contexts = vec![ReplContext::Root];
     let mut registered = HashSet::new();
+    let mut publish = PublishService::new(workspace.storage());
     loop {
         repl_stdout(format_args!("> "))?;
         let line = tokio::select! {
             line = input.recv() => match line {
                 Some(line) => line?,
                 None => {
-                    close_repl_dm(live_dm).await?;
+                    close_repl_context(live).await?;
                     return Ok(());
                 }
             },
             result = tokio::signal::ctrl_c() => {
                 result?;
-                close_repl_dm(live_dm).await?;
+                close_repl_context(live).await?;
                 return Ok(());
             }
         };
         let Some(line) = line else {
-            close_repl_dm(live_dm).await?;
+            close_repl_context(live).await?;
             return Ok(());
         };
         match line.as_str() {
             "/quit" => {
-                close_repl_dm(live_dm).await?;
+                close_repl_context(live).await?;
                 return Ok(());
             }
             "/status" => print_repl_status(service, workspace, contexts.last().unwrap()).await?,
             "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
             "/back" => {
                 let previous = contexts.last().unwrap().clone();
-                if let Err(error) = close_repl_dm(live_dm).await {
+                if let Err(error) = close_repl_context(live).await {
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
                 contexts.pop();
-                if let Err(error) = restore_repl_dm(service, workspace, &contexts, live_dm).await {
+                if let Err(error) = restore_repl_context(service, workspace, &contexts, live).await
+                {
                     contexts.push(previous);
                     if let Err(restore) =
-                        restore_repl_dm(service, workspace, &contexts, live_dm).await
+                        restore_repl_context(service, workspace, &contexts, live).await
                     {
                         return Err(CliError::OperationAndRestore {
                             operation: Box::new(error),
@@ -561,6 +718,23 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         Err(error) => repl_stderr(format_args!("{error}\n"))?,
                     }
                 }
+                ReplContext::Thread {
+                    conversation_id, ..
+                } => match service.list_thread_members(*conversation_id).await {
+                    Ok(members) => {
+                        let output = render_thread_members(
+                            members
+                                .into_iter()
+                                .filter(|member| member.left_at.is_none())
+                                .collect(),
+                            false,
+                        );
+                        if !output.is_empty() {
+                            repl_stdout(format_args!("{output}\n"))?;
+                        }
+                    }
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                },
                 ReplContext::Dm { .. } => repl_stderr(format_args!("members unavailable in dm\n"))?,
             },
             _ if line.trim().is_empty() => {}
@@ -570,7 +744,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 match room_ref(reference) {
                     Ok(reference) => match service.resolve_room(reference).await {
                         Ok(room) => {
-                            if let Err(error) = close_repl_dm(live_dm).await {
+                            if let Err(error) = close_repl_context(live).await {
                                 repl_stderr(format_args!("{error}\n"))?;
                                 continue;
                             }
@@ -580,6 +754,114 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         Err(error) => repl_stderr(format_args!("{error}\n"))?,
                     },
                     Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
+            _ if let Some(reference) = line.strip_prefix("/publish ")
+                && !reference.trim().is_empty() =>
+            {
+                let Some(target_conversation_id) = contexts.last().unwrap().conversation_id()
+                else {
+                    repl_stderr(format_args!("publish requires a dm or thread context\n"))?;
+                    continue;
+                };
+                let result_id = match result_id(reference) {
+                    Ok(result_id) => result_id,
+                    Err(error) => {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                match publish
+                    .publish(PublishResult {
+                        publish_id: PublishId::new(),
+                        result_id,
+                        target_conversation_id,
+                        published_at: timestamp(),
+                    })
+                    .await
+                {
+                    Ok(published) => repl_stdout(format_args!(
+                        "{}\t{}\t{}\t{}\t{}\n",
+                        published.publish_id,
+                        published.result.id,
+                        published.source_conversation_id,
+                        published.target_conversation_id,
+                        published.published_at,
+                    ))?,
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
+            _ if let Some(reference) = line.strip_prefix("/thread ")
+                && !reference.trim().is_empty() =>
+            {
+                let fields: Vec<_> = reference.split_whitespace().collect();
+                let [thread, flag, agent] = fields.as_slice() else {
+                    repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                    continue;
+                };
+                if *flag != "--agent" {
+                    repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                    continue;
+                }
+                let thread_id = match thread_id(thread) {
+                    Ok(thread_id) => thread_id,
+                    Err(error) => {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                let agent = match agent_ref(agent) {
+                    Ok(reference) => match service.resolve_agent(reference).await {
+                        Ok(agent) => agent,
+                        Err(error) => {
+                            repl_stderr(format_args!("{error}\n"))?;
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                // A Thread entered from a Room must belong to that Room.
+                let room_id = match contexts.last() {
+                    Some(ReplContext::Room(room_id)) => Some(*room_id),
+                    _ => None,
+                };
+                if let Some(room_id) = room_id
+                    && let Err(error) = require_thread_in_room(service, room_id, thread_id).await
+                {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                if !registered.contains(&agent.id) {
+                    if let Err(error) = register_acp_agent(workspace, &agent).await {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                    registered.insert(agent.id);
+                }
+                if let Err(error) = close_repl_context(live).await {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                match open_repl_thread(workspace, &agent, thread_id).await {
+                    Ok((context, chat)) => {
+                        contexts.push(context);
+                        *live = Some(chat);
+                        repl_stdout(format_args!("thread\t{thread_id}\t{}\n", agent.name))?;
+                    }
+                    Err(error) => {
+                        if let Err(restore) =
+                            restore_repl_context(service, workspace, &contexts, live).await
+                        {
+                            return Err(CliError::OperationAndRestore {
+                                operation: Box::new(error),
+                                restore: restore.to_string(),
+                            });
+                        }
+                        repl_stderr(format_args!("{error}\n"))?;
+                    }
                 }
             }
             _ if let Some(reference) = line.strip_prefix("/dm ")
@@ -605,19 +887,19 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                     registered.insert(agent.id);
                 }
-                if let Err(error) = close_repl_dm(live_dm).await {
+                if let Err(error) = close_repl_context(live).await {
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
                 match open_repl_dm(workspace, &agent).await {
                     Ok((context, dm)) => {
                         contexts.push(context);
-                        *live_dm = Some(dm);
+                        *live = Some(dm);
                         repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                     }
                     Err(error) => {
                         if let Err(restore) =
-                            restore_repl_dm(service, workspace, &contexts, live_dm).await
+                            restore_repl_context(service, workspace, &contexts, live).await
                         {
                             return Err(CliError::OperationAndRestore {
                                 operation: Box::new(error),
@@ -631,23 +913,45 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             _ if is_known_repl_command(&line) => {
                 repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?
             }
-            _ if matches!(contexts.last(), Some(ReplContext::Dm { .. })) => {
-                let dm = live_dm.as_mut().expect("active DM has a live service");
-                if let Err(error) = dm.send_message(line, timestamp()).await {
+            _ if matches!(
+                contexts.last(),
+                Some(ReplContext::Dm { .. } | ReplContext::Thread { .. })
+            ) =>
+            {
+                let chat = live.as_mut().expect("active context has a live service");
+                if let Err(error) = chat.send(line, timestamp()).await {
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
-                drain_repl_turn(dm, &mut input).await?;
+                drain_repl_turn(chat, &mut input).await?;
             }
             _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
         }
     }
 }
 
+async fn require_thread_in_room<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+    thread_id: ConversationId,
+) -> Result<(), CliError> {
+    let threads = service.list_threads(RoomRef::Id(room_id)).await?;
+    threads
+        .iter()
+        .any(|thread| thread.id == thread_id)
+        .then_some(())
+        .ok_or_else(|| {
+            CollaborationError::InvalidCommand(format!(
+                "thread {thread_id} does not belong to room {room_id}"
+            ))
+            .into()
+        })
+}
+
 async fn open_repl_dm(
     workspace: &WorkspaceRuntime<AcpTransport>,
     agent: &crate::domain::Agent,
-) -> Result<(ReplContext, ReplDirectMessage), CliError> {
+) -> Result<(ReplContext, ReplChat), CliError> {
     let runtime = workspace
         .direct_message_for_agent(agent.id)
         .map_err(|error| CliError::Runtime(error.to_string()))?;
@@ -661,15 +965,50 @@ async fn open_repl_dm(
             agent_id: opened.agent_id,
             agent_name: opened.agent_name,
         },
-        dm,
+        ReplChat::Dm(Box::new(dm)),
     ))
 }
 
-async fn close_repl_dm(live_dm: &mut Option<ReplDirectMessage>) -> Result<(), CliError> {
-    if let Some(dm) = live_dm.as_mut() {
-        dm.shutdown(timestamp()).await?;
+async fn open_repl_thread(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    agent: &crate::domain::Agent,
+    thread_id: ConversationId,
+) -> Result<(ReplContext, ReplChat), CliError> {
+    let mut chat = ThreadChatService::new(open_thread_runtime(workspace, agent.id)?);
+    let opened = chat
+        .open(
+            LOCAL_USER_ID.into(),
+            OpenThreadForAgent {
+                thread_id,
+                agent_id: agent.id,
+                opened_at: timestamp(),
+            },
+        )
+        .await?;
+    Ok((
+        ReplContext::Thread {
+            conversation_id: opened.thread_id,
+            agent_id: opened.agent_id,
+            agent_name: agent.name.clone(),
+        },
+        ReplChat::Thread(Box::new(chat)),
+    ))
+}
+
+fn open_thread_runtime(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    agent_id: AgentId,
+) -> Result<AgentThreadRuntime<AcpTransport>, CliError> {
+    workspace
+        .thread(agent_id)
+        .map_err(|error| CliError::Runtime(error.to_string()))
+}
+
+async fn close_repl_context(live: &mut Option<ReplChat>) -> Result<(), CliError> {
+    if let Some(chat) = live.as_mut() {
+        chat.stop(timestamp()).await?;
     }
-    *live_dm = None;
+    *live = None;
     Ok(())
 }
 
@@ -690,34 +1029,44 @@ fn is_known_repl_command(line: &str) -> bool {
         )
 }
 
-async fn restore_repl_dm<R: crate::application::CollaborationRuntime>(
+async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
     contexts: &[ReplContext],
-    live_dm: &mut Option<ReplDirectMessage>,
+    live: &mut Option<ReplChat>,
 ) -> Result<(), CliError> {
-    let Some(ReplContext::Dm { agent_id, .. }) = contexts.last() else {
-        return Ok(());
+    let restored = match contexts.last() {
+        Some(ReplContext::Dm { agent_id, .. }) => {
+            let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
+            open_repl_dm(workspace, &agent).await?
+        }
+        Some(ReplContext::Thread {
+            conversation_id,
+            agent_id,
+            ..
+        }) => {
+            let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
+            open_repl_thread(workspace, &agent, *conversation_id).await?
+        }
+        _ => return Ok(()),
     };
-    let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
-    let (_, dm) = open_repl_dm(workspace, &agent).await?;
-    *live_dm = Some(dm);
+    *live = Some(restored.1);
     Ok(())
 }
 
-async fn drain_repl_turn(
-    service: &mut ReplDirectMessage,
+async fn drain_repl_turn<C: ChatContext>(
+    service: &mut C,
     input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
     loop {
         tokio::select! {
-            event = service.next_event(timestamp()) => {
+            event = service.next(timestamp()) => {
                 let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
                 match event {
-                    DirectMessageEvent::TextDelta(text) => repl_stdout(format_args!("{text}"))?,
-                    DirectMessageEvent::MessageCompleted(_) => repl_stdout(format_args!("\n"))?,
-                    DirectMessageEvent::PermissionRequested { request_id, options } => {
+                    ChatEvent::TextDelta(text) => repl_stdout(format_args!("{text}"))?,
+                    ChatEvent::MessageCompleted(_) => repl_stdout(format_args!("\n"))?,
+                    ChatEvent::PermissionRequested { request_id, options } => {
                         for (index, option) in options.iter().enumerate() {
                             repl_stdout(format_args!("{}. {}\n", index + 1, option.label))?;
                         }
@@ -737,20 +1086,20 @@ async fn drain_repl_turn(
                                 (PermissionOutcome::Cancelled, true)
                             }
                         };
-                        service.respond_permission(request_id, selected, timestamp()).await?;
+                        service.permit(request_id, selected, timestamp()).await?;
                         if interrupted {
-                            service.cancel_turn(timestamp()).await?;
+                            service.cancel(timestamp()).await?;
                             cancelled = true;
                         }
                     }
-                    DirectMessageEvent::TurnCompleted => return Ok(()),
-                    DirectMessageEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
-                    DirectMessageEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
+                    ChatEvent::TurnCompleted => return Ok(()),
+                    ChatEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
+                    ChatEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
                 }
             }
             signal = tokio::signal::ctrl_c(), if !cancelled => {
                 signal?;
-                service.cancel_turn(timestamp()).await?;
+                service.cancel(timestamp()).await?;
                 cancelled = true;
             }
         }
@@ -796,6 +1145,11 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
             conversation_id,
             agent_id,
             agent_name,
+        }
+        | ReplContext::Thread {
+            conversation_id,
+            agent_id,
+            agent_name,
         } => {
             let binding = workspace
                 .storage()
@@ -809,8 +1163,12 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
             let status = binding
                 .map(|binding| binding.status.to_string())
                 .unwrap_or_else(|| "unbound".into());
+            let kind = match context {
+                ReplContext::Thread { .. } => "thread",
+                _ => "dm",
+            };
             repl_stdout(format_args!(
-                "dm\t{conversation_id}\t{agent_name}\t{binding_id}\t{status}\n"
+                "{kind}\t{conversation_id}\t{agent_name}\t{binding_id}\t{status}\n"
             ))?;
         }
     }
@@ -862,6 +1220,66 @@ async fn run_dm(agent_name: String) -> Result<(), CliError> {
     context_shutdown?;
     workspace_shutdown.map_err(DirectMessageBootstrapError::from)?;
     Ok(())
+}
+
+async fn run_thread_open(thread_id: ConversationId, agent: AgentRef) -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut workspace =
+        WorkspaceRuntime::new(worker).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut collaboration = CollaborationService::new(workspace.storage());
+    let interaction = run_thread_session(&workspace, &mut collaboration, thread_id, agent).await;
+    let shutdown = workspace
+        .shutdown(timestamp())
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn run_thread_session<R: crate::application::CollaborationRuntime>(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    collaboration: &mut CollaborationService<R>,
+    thread_id: ConversationId,
+    agent: AgentRef,
+) -> Result<(), CliError> {
+    let agent = collaboration.resolve_agent(agent).await?;
+    register_acp_agent(workspace, &agent).await?;
+    let mut chat = ThreadChatService::new(open_thread_runtime(workspace, agent.id)?);
+    chat.open(
+        LOCAL_USER_ID.into(),
+        OpenThreadForAgent {
+            thread_id,
+            agent_id: agent.id,
+            opened_at: timestamp(),
+        },
+    )
+    .await?;
+    let interaction = interact(&mut chat, &agent.name).await;
+    let shutdown = chat.stop(timestamp()).await;
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndContextShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
 }
 
 async fn run_publish(
@@ -1270,10 +1688,7 @@ fn database_path() -> Result<PathBuf, CliError> {
     Ok(PathBuf::from(home).join(".july/workspace.db"))
 }
 
-async fn interact<R: DirectMessageRuntime>(
-    service: &mut DirectMessageService<R>,
-    agent_name: &str,
-) -> Result<(), CliError> {
+async fn interact<C: ChatContext>(service: &mut C, agent_name: &str) -> Result<(), CliError> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     loop {
         print!("[{agent_name}] > ");
@@ -1287,19 +1702,19 @@ async fn interact<R: DirectMessageRuntime>(
         if line.trim().is_empty() {
             continue;
         }
-        service.send_message(line, timestamp()).await?;
+        service.send(line, timestamp()).await?;
         drain_turn(service, &mut lines).await?;
     }
 }
 
-async fn next_input_or_event<R: DirectMessageRuntime>(
-    service: &mut DirectMessageService<R>,
+async fn next_input_or_event<C: ChatContext>(
+    service: &mut C,
     lines: &mut Lines<BufReader<Stdin>>,
 ) -> Result<Option<String>, CliError> {
     loop {
         tokio::select! {
             line = lines.next_line() => return Ok(line?),
-            event = service.next_event(timestamp()) => {
+            event = service.next(timestamp()) => {
                 let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
                 if handle_idle_event(service, lines, event).await? {
                     return Ok(None);
@@ -1313,69 +1728,69 @@ async fn next_input_or_event<R: DirectMessageRuntime>(
     }
 }
 
-async fn drain_turn<R: DirectMessageRuntime>(
-    service: &mut DirectMessageService<R>,
+async fn drain_turn<C: ChatContext>(
+    service: &mut C,
     lines: &mut Lines<BufReader<Stdin>>,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
     loop {
         tokio::select! {
-            event = service.next_event(timestamp()) => {
+            event = service.next(timestamp()) => {
                 let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
                 match event {
-                    DirectMessageEvent::TextDelta(text) => {
+                    ChatEvent::TextDelta(text) => {
                         print!("{text}");
                         io::stdout().flush()?;
                     }
-                    DirectMessageEvent::MessageCompleted(_) => println!(),
-                    DirectMessageEvent::PermissionRequested { request_id, options } => {
+                    ChatEvent::MessageCompleted(_) => println!(),
+                    ChatEvent::PermissionRequested { request_id, options } => {
                         if permission(service, lines, request_id, &options).await? && !cancelled {
-                            service.cancel_turn(timestamp()).await?;
+                            service.cancel(timestamp()).await?;
                             cancelled = true;
                         }
                     }
-                    DirectMessageEvent::TurnCompleted => return Ok(()),
-                    DirectMessageEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
-                    DirectMessageEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
+                    ChatEvent::TurnCompleted => return Ok(()),
+                    ChatEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
+                    ChatEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
                 }
             }
             signal = tokio::signal::ctrl_c(), if !cancelled => {
                 signal?;
-                service.cancel_turn(timestamp()).await?;
+                service.cancel(timestamp()).await?;
                 cancelled = true;
             }
         }
     }
 }
 
-async fn handle_idle_event<R: DirectMessageRuntime>(
-    service: &mut DirectMessageService<R>,
+async fn handle_idle_event<C: ChatContext>(
+    service: &mut C,
     lines: &mut Lines<BufReader<Stdin>>,
-    event: DirectMessageEvent,
+    event: ChatEvent,
 ) -> Result<bool, CliError> {
     match event {
-        DirectMessageEvent::TextDelta(text) => {
+        ChatEvent::TextDelta(text) => {
             print!("{text}");
             io::stdout().flush()?;
         }
-        DirectMessageEvent::MessageCompleted(_) => println!(),
-        DirectMessageEvent::PermissionRequested {
+        ChatEvent::MessageCompleted(_) => println!(),
+        ChatEvent::PermissionRequested {
             request_id,
             options,
         } => {
             return permission(service, lines, request_id, &options).await;
         }
-        DirectMessageEvent::TurnCompleted => {}
-        DirectMessageEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
-        DirectMessageEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
+        ChatEvent::TurnCompleted => {}
+        ChatEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
+        ChatEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
     }
     Ok(false)
 }
 
-async fn permission<R: DirectMessageRuntime>(
-    service: &mut DirectMessageService<R>,
+async fn permission<C: ChatContext>(
+    service: &mut C,
     lines: &mut Lines<BufReader<Stdin>>,
-    request_id: crate::application::DirectMessagePermissionRequestId,
+    request_id: ChatPermissionRequestId,
     options: &[PermissionOption],
 ) -> Result<bool, CliError> {
     for (index, option) in options.iter().enumerate() {
@@ -1397,16 +1812,14 @@ async fn permission<R: DirectMessageRuntime>(
             (PermissionOutcome::Cancelled, true)
         }
     };
-    service
-        .respond_permission(request_id, outcome, timestamp())
-        .await?;
+    service.permit(request_id, outcome, timestamp()).await?;
     Ok(interrupted)
 }
 
-fn turn_failed(failure: DirectMessageFailureKind) -> CliError {
+fn turn_failed(failure: ChatFailureKind) -> CliError {
     CliError::TurnFailed(match failure {
-        DirectMessageFailureKind::AuthenticationRequired => "authentication required",
-        DirectMessageFailureKind::Protocol => "protocol error",
+        ChatFailureKind::AuthenticationRequired => "authentication required",
+        ChatFailureKind::Protocol => "protocol error",
     })
 }
 

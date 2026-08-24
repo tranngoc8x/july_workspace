@@ -1,4 +1,7 @@
-use july_workspace::domain::{Agent, AgentId, Room, RoomId};
+use july_workspace::domain::{
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, ResultId, Room, RoomId,
+    WorkItem, WorkItemId, WorkResult, WorkStatus,
+};
 use july_workspace::storage::SqliteStore;
 use rusqlite::Connection;
 use serde_json::json;
@@ -114,6 +117,93 @@ impl TestWorkspace {
             .insert_agent(&agent)
             .unwrap();
         agent
+    }
+
+    fn seed_thread(&self, room: &Room, title: &str, agents: &[&Agent]) -> ConversationId {
+        let thread = Conversation {
+            id: ConversationId::new(),
+            kind: ConversationKind::Thread,
+            room_id: Some(room.id),
+            title: Some(title.into()),
+            goal: None,
+            parent_conversation_id: None,
+            origin_conversation_id: None,
+            status: "open".into(),
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        };
+        SqliteStore::open(&self.database)
+            .unwrap()
+            .create_thread_with_primary_work(
+                &thread,
+                WorkItemId::new(),
+                "local-user",
+                &agents.iter().map(|agent| agent.id).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        thread.id
+    }
+
+    /// An accepted Result in its own source Conversation, ready to publish.
+    fn seed_result(&self) -> ResultId {
+        let source = Conversation {
+            id: ConversationId::new(),
+            kind: ConversationKind::Dm,
+            room_id: None,
+            title: None,
+            goal: None,
+            parent_conversation_id: None,
+            origin_conversation_id: None,
+            status: "open".into(),
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        };
+        let work = WorkItem {
+            id: WorkItemId::new(),
+            conversation_id: source.id,
+            title: "Publish result".into(),
+            goal: None,
+            status: WorkStatus::Open,
+            owner_agent_id: None,
+            is_primary: false,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            completed_at: None,
+        };
+        let result = WorkResult {
+            id: ResultId::new(),
+            work_id: work.id,
+            status: "accepted".into(),
+            summary: "Ready to publish".into(),
+            outputs: vec![],
+            evidence: vec![],
+            supersedes_result_id: None,
+            created_at: NOW.into(),
+        };
+        let mut store = SqliteStore::open(&self.database).unwrap();
+        store.insert_conversation(&source).unwrap();
+        store.insert_work_item(&work).unwrap();
+        store
+            .transition_work(work.id, WorkStatus::Working, NOW)
+            .unwrap();
+        store.create_work_result(&result).unwrap();
+        result.id
+    }
+
+    fn messages(&self, conversation_id: ConversationId) -> Vec<(String, String)> {
+        Connection::open(&self.database)
+            .unwrap()
+            .prepare(
+                "SELECT body, metadata_json FROM messages WHERE conversation_id = ? \
+                 ORDER BY created_at, id",
+            )
+            .unwrap()
+            .query_map([conversation_id.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     fn add_member(&self, room: &Room, agent: &Agent) {
@@ -435,6 +525,249 @@ fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() 
     );
 }
 
+#[test]
+fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let refunds = workspace.seed_thread(&room, "Refunds", &[&codex]);
+
+    let output = workspace.repl(&format!(
+        "/room Operations\n/dm codex\ndm one\n1\n/thread {settlement} --agent codex\nthread one\n1\n\
+         /status\n/members\n/back\n/status\n/thread {refunds} --agent codex\nthread two\n1\n/back\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains(&format!("thread\t{settlement}\tcodex\n")));
+    assert!(stdout_output.contains(&format!("thread\t{refunds}\tcodex\n")));
+
+    let dm_conversation: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT id FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let dm_messages = workspace.messages(dm_conversation.parse().unwrap());
+    assert_eq!(
+        dm_messages
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["dm one", "fixture reply"]
+    );
+    assert!(
+        dm_messages
+            .iter()
+            .all(|(_, metadata)| metadata.contains("\"channel\":\"dm\""))
+    );
+
+    for (thread_id, sent) in [(settlement, "thread one"), (refunds, "thread two")] {
+        let messages = workspace.messages(thread_id);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|(body, _)| body.as_str())
+                .collect::<Vec<_>>(),
+            [sent, "fixture reply"],
+            "thread {thread_id} transcript"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|(_, metadata)| metadata.contains("\"channel\":\"thread\""))
+        );
+    }
+
+    // `/status` in the Thread reports the Thread binding, not the DM one.
+    let status = stdout_output
+        .lines()
+        .find(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            fields.len() == 5
+                && fields[0].ends_with("thread")
+                && fields[1] == settlement.to_string()
+        })
+        .unwrap_or_else(|| panic!("missing thread status in stdout: {stdout_output}"));
+    let fields: Vec<_> = status.split('\t').collect();
+    assert_eq!(fields[2], "codex");
+    assert!(!fields[3].is_empty());
+    assert_eq!(fields[4], "active");
+
+    // `/members` lists the Thread's active members only.
+    assert!(stdout_output.contains(&format!("{settlement}\tagent\t{}\t1\t", codex.id)));
+    assert!(stdout_output.contains(&format!("{settlement}\tuser\tlocal-user\t1\t")));
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    for conversation in [settlement.to_string(), refunds.to_string(), dm_conversation] {
+        let bindings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE conversation_id = ?",
+                [&conversation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bindings, 1, "conversation {conversation} binding count");
+    }
+}
+
+#[test]
+fn repl_thread_switch_failures_leave_the_previous_context_active() {
+    let workspace = TestWorkspace::new();
+    let operations = workspace.seed_room("Operations");
+    let payments = workspace.seed_room("Payments");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let outsider = workspace.seed_acp_agent("outsider", &[]);
+    workspace.add_member(&operations, &codex);
+    workspace.add_member(&payments, &codex);
+    let settlement = workspace.seed_thread(&payments, "Settlement", &[&codex]);
+
+    let output = workspace.repl(&format!(
+        "/room Operations\n/thread {settlement} --agent codex\n/status\n\
+         /thread {settlement}\n/thread not-an-id --agent codex\n\
+         /thread {settlement} --agent missing\n/status\n/back\n\
+         /thread {settlement} --agent outsider\n/status\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stderr_output = stderr(&output);
+    assert!(stderr_output.contains(&format!(
+        "thread {settlement} does not belong to room {}",
+        operations.id
+    )));
+    assert_eq!(stderr_output.matches("invalid command\n").count(), 1);
+    assert!(stderr_output.contains("usage: july dm <agent>"));
+    assert!(stderr_output.contains("agent missing does not exist"));
+    assert!(stderr_output.contains(&format!(
+        "agent {} must be an active member of room",
+        outsider.id
+    )));
+    // Every failed switch kept the previous descriptor: Room, then Root.
+    assert_eq!(
+        stdout(&output)
+            .matches(&format!("room\t{}\tOperations\n", operations.id))
+            .count(),
+        3
+    );
+    assert_eq!(stdout(&output).matches("root\n").count(), 2);
+    assert!(workspace.messages(settlement).is_empty());
+}
+
+#[test]
+fn repl_publish_targets_the_current_conversation_only() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let result_id = workspace.seed_result();
+
+    let output = workspace.repl(&format!(
+        "/publish {result_id}\n/room Operations\n/publish {result_id}\n\
+         /thread {settlement} --agent codex\n/publish not-a-result\n/publish {result_id}\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stderr(&output)
+            .matches("publish requires a dm or thread context\n")
+            .count(),
+        2
+    );
+    assert!(stderr(&output).contains("usage: july dm <agent>"));
+    let published = stdout(&output)
+        .lines()
+        .find(|line| {
+            line.starts_with(&result_id.to_string()) || line.contains(&result_id.to_string())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| panic!("missing publish output: {}", stdout(&output)));
+    let fields: Vec<_> = published.split('\t').collect();
+    assert_eq!(fields.len(), 5);
+    assert_eq!(fields[1], result_id.to_string());
+    assert_eq!(fields[3], settlement.to_string());
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let (publishes, target): (i64, String) = connection
+        .query_row(
+            "SELECT COUNT(*), MAX(target_conversation_id) FROM publishes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(publishes, 1);
+    assert_eq!(target, settlement.to_string());
+}
+
+#[test]
+fn thread_open_streams_one_turn_and_detaches_on_exit() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+
+    let output = workspace.run(
+        "hello thread\n1\n/quit\n",
+        &[
+            "thread",
+            "open",
+            &settlement.to_string(),
+            "--agent",
+            "codex",
+        ],
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("[codex] > "));
+    assert_eq!(
+        workspace
+            .messages(settlement)
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["hello thread", "fixture reply"]
+    );
+    let binding: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT status FROM session_bindings WHERE conversation_id = ?",
+            [settlement.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding, "disconnected");
+}
+
+#[test]
+fn thread_open_rejects_json_framing_and_malformed_grammar() {
+    for args in [
+        ["thread", "open"].as_slice(),
+        ["thread", "open", "01ARZ3NDEKTSV4RRFFQ69G5FAV"].as_slice(),
+        ["thread", "open", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--agent"].as_slice(),
+        [
+            "thread",
+            "open",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "--agent",
+            "codex",
+            "--json",
+        ]
+        .as_slice(),
+        ["thread", "open", "not-an-id", "--agent", "codex"].as_slice(),
+    ] {
+        let workspace = TestWorkspace::new();
+        let output = workspace.run("", args);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("usage: july dm <agent>"));
+        assert!(!workspace.database.exists(), "args: {args:?}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn repl_sigint_during_dm_permission_returns_to_prompt_and_disconnects_on_exit() {
@@ -484,6 +817,60 @@ fn repl_sigint_during_dm_permission_returns_to_prompt_and_disconnects_on_exit() 
         .query_row(
             "SELECT status FROM session_bindings WHERE agent_id = ? ORDER BY last_used_at DESC, id DESC LIMIT 1",
             [codex.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(binding, "disconnected");
+}
+
+#[cfg(unix)]
+#[test]
+fn repl_sigint_during_thread_permission_cancels_the_turn_and_keeps_the_context() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let mut child = workspace.spawn_repl();
+    let output = ChildOutput::take(&mut child);
+    assert!(output.read_until(b"> ").ends_with("> "));
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("/thread {settlement} --agent codex\nhello\n").as_bytes())
+        .unwrap();
+    assert!(output.read_until(b"permission> ").ends_with("permission> "));
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(output.read_until(b"> ").ends_with("> "));
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/status\n/quit\n")
+        .unwrap();
+    let status = output.read_until(b"active\n");
+    assert!(status.contains(&format!("thread\t{settlement}\tcodex\t")));
+
+    let exit = wait_for_exit(&mut child, Duration::from_secs(2));
+    if exit.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(exit.is_some(), "REPL did not exit after /quit");
+    assert!(exit.unwrap().success());
+    let binding: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT status FROM session_bindings WHERE conversation_id = ?",
+            [settlement.to_string()],
             |row| row.get(0),
         )
         .unwrap();
