@@ -1,4 +1,4 @@
-use july_workspace::domain::{Agent, AgentId};
+use july_workspace::domain::{Agent, AgentId, ConversationId, WorkItemId};
 use july_workspace::storage::SqliteStore;
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -108,17 +108,49 @@ fn thread_create_and_list_render_durable_ids_for_humans_and_json() {
     let created_stdout = stdout(&created);
     let ids: Vec<_> = created_stdout.trim().split('\t').collect();
     assert_eq!(ids.len(), 2);
-    assert_eq!(ids[0].len(), 26);
-    assert_eq!(ids[1].len(), 26);
+    let thread_id: ConversationId = ids[0].parse().unwrap();
+    let primary_work_id: WorkItemId = ids[1].parse().unwrap();
+    assert_eq!(thread_id.to_string(), ids[0]);
+    assert_eq!(primary_work_id.to_string(), ids[1]);
+    let primary_work = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .get_work_item(primary_work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(primary_work.conversation_id, thread_id);
+    assert!(primary_work.is_primary);
     assert_eq!(workspace.threads(), 1);
 
     assert!(workspace.run(&["room", "create", "Other"]).status.success());
-    assert!(
-        workspace
-            .run(&["thread", "create", "Other work", "--room", "Other"])
-            .status
-            .success()
+    let json_created = json_stdout(&workspace.run(&[
+        "--json",
+        "thread",
+        "create",
+        "Other work",
+        "--room",
+        "Other",
+    ]));
+    let json_thread_id: ConversationId =
+        json_created["thread_id"].as_str().unwrap().parse().unwrap();
+    let json_primary_work_id: WorkItemId = json_created["primary_work_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        json_created,
+        json!({
+            "thread_id": json_thread_id.to_string(),
+            "primary_work_id": json_primary_work_id.to_string(),
+        })
     );
+    let json_primary_work = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .get_work_item(json_primary_work_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(json_primary_work.conversation_id, json_thread_id);
+    assert!(json_primary_work.is_primary);
 
     let listed = workspace.run(&["thread", "list", "--room", &room_id]);
     assert_eq!(
@@ -196,30 +228,49 @@ fn thread_membership_preserves_user_and_agent_history_with_idempotent_changes() 
         stdout(&workspace.run(&["thread", "member", "remove", &thread_id, "Reviewer",])),
         "left\tfalse\n"
     );
+    assert_eq!(
+        stdout(&workspace.run(&["thread", "member", "add", &thread_id, "Reviewer",])),
+        "active\ttrue\n"
+    );
 
     let members = workspace.run(&["thread", "members", &thread_id, "--json"]);
     let members = json_stdout(&members);
     let members = members.as_array().unwrap();
-    assert_eq!(members.len(), 3);
-    assert!(members.iter().any(|member| {
-        member["thread_id"] == thread_id
-            && member["member_type"] == "user"
-            && member["member_id"] == "local-user"
-            && member["state"] == "active"
-    }));
-    assert!(members.iter().any(|member| {
-        member["member_type"] == "agent"
-            && member["member_id"] == codex.id.to_string()
-            && member["generation"] == 1
-            && member["state"] == "active"
-    }));
-    assert!(members.iter().any(|member| {
-        member["member_type"] == "agent"
-            && member["member_id"] == reviewer.id.to_string()
-            && member["generation"] == 1
-            && member["left_at"].as_str().is_some()
-            && member["state"] == "left"
-    }));
+    assert_eq!(members.len(), 4);
+    assert!(
+        members
+            .iter()
+            .all(|member| member["joined_at"].as_str().is_some())
+    );
+    assert!(members[1]["left_at"].as_str().is_some());
+    let codex_id = codex.id.to_string();
+    let reviewer_id = reviewer.id.to_string();
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| {
+                (
+                    member["thread_id"].as_str().unwrap(),
+                    member["member_type"].as_str().unwrap(),
+                    member["member_id"].as_str().unwrap(),
+                    member["generation"].as_u64().unwrap(),
+                    member["state"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (thread_id.as_str(), "agent", codex_id.as_str(), 1, "active"),
+            (thread_id.as_str(), "agent", reviewer_id.as_str(), 1, "left"),
+            (thread_id.as_str(), "user", "local-user", 1, "active"),
+            (
+                thread_id.as_str(),
+                "agent",
+                reviewer_id.as_str(),
+                2,
+                "active"
+            ),
+        ]
+    );
 }
 
 #[test]
@@ -229,7 +280,6 @@ fn thread_rejects_invalid_grammar_before_storage_and_exact_reference_misses_befo
         ["thread", "list", "--room"].as_slice(),
         ["thread", "members", "not-a-thread-id"].as_slice(),
         ["thread", "member", "add", "not-a-thread-id", "Codex"].as_slice(),
-        ["thread", "open", "not-a-thread-id", "--agent", "Codex"].as_slice(),
     ] {
         let workspace = TestWorkspace::new();
         let output = workspace.run(args);
@@ -237,6 +287,13 @@ fn thread_rejects_invalid_grammar_before_storage_and_exact_reference_misses_befo
         assert!(stderr(&output).contains("usage: july dm <agent>"));
         assert!(!workspace.database.exists());
     }
+
+    let workspace = TestWorkspace::new();
+    let thread_id = ConversationId::new().to_string();
+    let output = workspace.run(&["thread", "open", &thread_id, "--agent", "Codex"]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(!workspace.database.exists());
 
     let workspace = TestWorkspace::new();
     workspace.seed_agent("Codex");
