@@ -2,9 +2,10 @@ use july_workspace::domain::{Agent, AgentId, Room, RoomId};
 use july_workspace::storage::SqliteStore;
 use rusqlite::Connection;
 use serde_json::json;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 struct TestWorkspace {
     root: PathBuf,
@@ -42,6 +43,18 @@ impl TestWorkspace {
 
     fn repl(&self, input: &str) -> Output {
         self.run(input, &[])
+    }
+
+    #[cfg(unix)]
+    fn spawn_repl(&self) -> Child {
+        Command::new(env!("CARGO_BIN_EXE_july"))
+            .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
+            .current_dir(&self.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
     }
 
     fn rooms(&self) -> i64 {
@@ -115,6 +128,32 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
+#[cfg(unix)]
+fn read_prompt(child: &mut Child) {
+    let mut prompt = [0; 2];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut prompt)
+        .unwrap();
+    assert_eq!(&prompt, b"> ");
+}
+
+#[cfg(unix)]
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn repl_root_commands_are_nonfatal_and_do_not_mutate_rooms() {
     let workspace = TestWorkspace::new();
@@ -183,4 +222,50 @@ fn repl_room_stack_restores_context_and_lists_only_active_members() {
     )));
     assert!(!stdout(&output).contains(&left.id.to_string()));
     assert_eq!(workspace.rooms(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn repl_sigint_exits_while_stdin_remains_open() {
+    let workspace = TestWorkspace::new();
+    let mut child = workspace.spawn_repl();
+    read_prompt(&mut child);
+
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = wait_for_exit(&mut child, Duration::from_millis(500));
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(status.is_some(), "REPL did not exit after SIGINT");
+    assert!(status.unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn repl_broken_stdout_exits_without_a_panic() {
+    let workspace = TestWorkspace::new();
+    let mut child = workspace.spawn_repl();
+    read_prompt(&mut child);
+    drop(child.stdout.take());
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"/status\n")
+        .unwrap();
+    drop(child.stdin.take());
+
+    let status = wait_for_exit(&mut child, Duration::from_millis(500));
+    if status.is_none() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert_eq!(status.unwrap().code(), Some(1));
 }

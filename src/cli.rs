@@ -12,11 +12,13 @@ use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::fmt;
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
+use tokio::sync::mpsc;
 
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
@@ -442,15 +444,17 @@ async fn run_repl() -> Result<(), CliError> {
 async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
 ) -> Result<(), CliError> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut input = repl_input();
     let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
     let mut contexts = vec![ReplContext::Root];
     loop {
-        print!("> ");
-        io::stdout().flush()?;
+        repl_stdout(format_args!("> "))?;
         let line = tokio::select! {
-            line = lines.next_line() => line?,
+            line = input.recv() => match line {
+                Some(line) => line?,
+                None => return Ok(()),
+            },
             result = &mut interrupted => {
                 result?;
                 return Ok(());
@@ -461,14 +465,14 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
         };
         match line.as_str() {
             "/quit" => return Ok(()),
-            "/status" => print_repl_status(service, contexts.last().unwrap()).await,
-            "/back" if contexts.len() == 1 => eprintln!("already at root"),
+            "/status" => print_repl_status(service, contexts.last().unwrap()).await?,
+            "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
             "/back" => {
                 contexts.pop();
-                print_repl_status(service, contexts.last().unwrap()).await;
+                print_repl_status(service, contexts.last().unwrap()).await?;
             }
             "/members" => match contexts.last().unwrap() {
-                ReplContext::Root => eprintln!("members unavailable at root"),
+                ReplContext::Root => repl_stderr(format_args!("members unavailable at root\n"))?,
                 ReplContext::Room(room_id) => {
                     match service.list_room_members(RoomRef::Id(*room_id)).await {
                         Ok(members) => {
@@ -480,10 +484,10 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                                 false,
                             );
                             if !output.is_empty() {
-                                println!("{output}");
+                                repl_stdout(format_args!("{output}\n"))?;
                             }
                         }
-                        Err(error) => eprintln!("{error}"),
+                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
                     }
                 }
             },
@@ -494,30 +498,69 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                 match room_ref(reference) {
                     Ok(reference) => match service.resolve_room(reference).await {
                         Ok(room) => {
-                            println!("room\t{}\t{}", room.id, room.name);
+                            repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
                             contexts.push(ReplContext::Room(room.id));
                         }
-                        Err(error) => eprintln!("{error}"),
+                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
                     },
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
                 }
             }
-            _ => eprintln!("{}", CliError::InvalidCommand),
+            _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
         }
     }
+}
+
+fn repl_input() -> mpsc::UnboundedReceiver<io::Result<Option<String>>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        loop {
+            let mut line = String::new();
+            let input = match stdin.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    line = line.trim_end_matches(['\n', '\r']).into();
+                    Ok(Some(line))
+                }
+                Err(error) => Err(error),
+            };
+            let done = matches!(&input, Ok(None) | Err(_));
+            if sender.send(input).is_err() || done {
+                return;
+            }
+        }
+    });
+    receiver
 }
 
 async fn print_repl_status<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     context: &ReplContext,
-) {
+) -> Result<(), CliError> {
     match context {
-        ReplContext::Root => println!("root"),
+        ReplContext::Root => repl_stdout(format_args!("root\n"))?,
         ReplContext::Room(room_id) => match service.resolve_room(RoomRef::Id(*room_id)).await {
-            Ok(room) => println!("room\t{}\t{}", room.id, room.name),
-            Err(error) => eprintln!("{error}"),
+            Ok(room) => repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?,
+            Err(error) => repl_stderr(format_args!("{error}\n"))?,
         },
     }
+    Ok(())
+}
+
+fn repl_stdout(args: fmt::Arguments<'_>) -> Result<(), CliError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_fmt(args)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn repl_stderr(args: fmt::Arguments<'_>) -> Result<(), CliError> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_fmt(args)?;
+    stderr.flush()?;
+    Ok(())
 }
 
 async fn run_dm(agent_name: String) -> Result<(), CliError> {
