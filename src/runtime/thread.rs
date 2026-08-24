@@ -50,14 +50,10 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                 command.opened_at.clone(),
             )
             .await?;
-        match binding.as_ref().map(|binding| binding.status) {
-            Some(SessionBindingStatus::Lost) => return Err(CollaborationError::SessionLost),
-            Some(SessionBindingStatus::Closed) => {
-                return Err(CollaborationError::SessionUnavailable(
-                    SessionBindingStatus::Closed,
-                ));
-            }
-            _ => {}
+        if let Some(SessionBindingStatus::Closed) = binding.as_ref().map(|binding| binding.status) {
+            return Err(CollaborationError::SessionUnavailable(
+                SessionBindingStatus::Closed,
+            ));
         }
 
         let project_root = PathBuf::from(&agent.project_root);
@@ -86,7 +82,7 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
         });
         let session = self
             .workspace
-            .open_session(agent.id, binding, project_root, command.opened_at)
+            .open_recoverable_session(agent.id, binding, project_root, command.opened_at)
             .await
             .map_err(runtime_error)?;
         let opened = OpenedThread {

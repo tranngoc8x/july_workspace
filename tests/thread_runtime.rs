@@ -3,8 +3,9 @@ use july_workspace::application::{
     ThreadMentionOutcome, ThreadRuntime,
 };
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, Room, RoomId, SessionBinding,
-    SessionBindingId, SessionBindingStatus, WorkItemId,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, MemberType, Memory, MemoryKind,
+    MemoryScopeType, Message, MessageId, Room, RoomId, SessionBinding, SessionBindingId,
+    SessionBindingStatus, WorkItemId,
 };
 use july_workspace::runtime::{AgentThreadRuntime, StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
@@ -704,31 +705,39 @@ async fn shutdown_is_idempotent_and_next_open_resumes_the_same_binding() {
             observed.resumes[0].project_root,
             PathBuf::from(&fixture.agent.project_root)
         );
+        assert!(observed.messages.is_empty());
     }
     second.shutdown(LATER.into()).await.unwrap();
 }
 
 #[tokio::test]
-async fn missing_remote_and_terminal_bindings_are_not_replaced() {
-    for (status, remote_session_id, expected) in [
+async fn missing_or_provider_lost_remote_recovers_once_with_scoped_capsule() {
+    for (case, status, remote_session_id, resume_lost, expected_resumes) in [
         (
+            "missing-current-remote",
             SessionBindingStatus::Active,
             None,
-            CollaborationError::SessionLost,
+            false,
+            0,
         ),
         (
+            "persisted-lost",
             SessionBindingStatus::Lost,
             Some("remote-lost"),
-            CollaborationError::SessionLost,
+            false,
+            0,
         ),
         (
-            SessionBindingStatus::Closed,
-            Some("remote-closed"),
-            CollaborationError::SessionUnavailable(SessionBindingStatus::Closed),
+            "provider-lost",
+            SessionBindingStatus::Disconnected,
+            Some("remote-missing"),
+            true,
+            1,
         ),
     ] {
         let database = TestDatabase::new();
         let fixture = seed(&database, true, true);
+        let mut store = SqliteStore::open(database.path()).unwrap();
         let binding = SessionBinding {
             id: SessionBindingId::new(),
             conversation_id: fixture.thread.id,
@@ -740,41 +749,151 @@ async fn missing_remote_and_terminal_bindings_are_not_replaced() {
             created_at: NOW.into(),
             last_used_at: NOW.into(),
         };
-        SqliteStore::open(database.path())
-            .unwrap()
-            .insert_session_binding(&binding)
+        store.insert_session_binding(&binding).unwrap();
+        for index in 0..=20 {
+            store
+                .insert_message(&Message {
+                    id: MessageId::new(),
+                    conversation_id: fixture.thread.id,
+                    sender_type: MemberType::User,
+                    sender_id: "tony".into(),
+                    body: if index == 0 {
+                        "old-target-transcript".into()
+                    } else {
+                        format!("recent-thread-{index}")
+                    },
+                    reply_to: None,
+                    metadata: json!({}),
+                    created_at: format!("2026-08-13T10:{index:02}:00Z"),
+                })
+                .unwrap();
+        }
+        let sibling_thread = Conversation {
+            id: ConversationId::new(),
+            title: Some("Sibling Thread".into()),
+            ..fixture.thread.clone()
+        };
+        store
+            .create_thread_with_primary_work(
+                &sibling_thread,
+                WorkItemId::new(),
+                "tony",
+                &[fixture.agent.id],
+            )
             .unwrap();
-        let (transport, observed) = FakeTransport::new("replacement");
+        store
+            .insert_message(&Message {
+                id: MessageId::new(),
+                conversation_id: sibling_thread.id,
+                sender_type: MemberType::User,
+                sender_id: "tony".into(),
+                body: "sibling-thread-secret".into(),
+                reply_to: None,
+                metadata: json!({}),
+                created_at: NOW.into(),
+            })
+            .unwrap();
+        let dm = store
+            .get_or_create_dm("tony", fixture.agent.id, NOW)
+            .unwrap();
+        store
+            .insert_message(&Message {
+                id: MessageId::new(),
+                conversation_id: dm.id,
+                sender_type: MemberType::User,
+                sender_id: "tony".into(),
+                body: "sibling-dm-secret".into(),
+                reply_to: None,
+                metadata: json!({}),
+                created_at: NOW.into(),
+            })
+            .unwrap();
+        for memory in [
+            Memory {
+                id: Default::default(),
+                scope_type: MemoryScopeType::Project,
+                scope_id: fixture.agent.project_root.clone(),
+                kind: MemoryKind::Decision,
+                content: "current-project-contract".into(),
+                source_conversation_id: Some(fixture.thread.id),
+                evidence: vec!["verified".into()],
+                supersedes_memory_id: None,
+                created_at: NOW.into(),
+            },
+            Memory {
+                id: Default::default(),
+                scope_type: MemoryScopeType::Room,
+                scope_id: fixture.room.id.to_string(),
+                kind: MemoryKind::Constraint,
+                content: "current-room-contract".into(),
+                source_conversation_id: Some(fixture.thread.id),
+                evidence: vec!["verified".into()],
+                supersedes_memory_id: None,
+                created_at: NOW.into(),
+            },
+            Memory {
+                id: Default::default(),
+                scope_type: MemoryScopeType::Room,
+                scope_id: RoomId::new().to_string(),
+                kind: MemoryKind::Constraint,
+                content: "sibling-room-secret".into(),
+                source_conversation_id: Some(fixture.thread.id),
+                evidence: vec!["verified".into()],
+                supersedes_memory_id: None,
+                created_at: NOW.into(),
+            },
+        ] {
+            store.insert_memory(&memory).unwrap();
+        }
+        drop(store);
+
+        let (mut transport, observed) = FakeTransport::new("replacement");
+        transport.resume_lost = resume_lost;
         let mut runtime = runtime(&database, transport);
 
-        assert_eq!(
-            runtime
-                .open_thread_for_agent(command(&fixture, LATER))
-                .await,
-            Err(expected)
-        );
-        assert!(observed.lock().unwrap().connections.is_empty());
-        runtime.shutdown(LATER.into()).await.unwrap();
-        let latest = SqliteStore::open(database.path())
-            .unwrap()
+        let opened = runtime
+            .open_thread_for_agent(command(&fixture, LATER))
+            .await
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        let store = SqliteStore::open(database.path()).unwrap();
+        let source = store.get_session_binding(binding.id).unwrap().unwrap();
+        let replacement = store
             .get_latest_session_binding(fixture.thread.id, fixture.agent.id)
             .unwrap()
             .unwrap();
-        assert_eq!(latest.id, binding.id);
-        assert_eq!(latest.generation, 1);
-        assert_eq!(
-            latest.status,
-            if status == SessionBindingStatus::Active {
-                SessionBindingStatus::Lost
-            } else {
-                status
-            }
-        );
+        let recovery = store.get_session_recovery(replacement.id).unwrap().unwrap();
+        assert_eq!(source.status, SessionBindingStatus::Lost, "{case}");
+        assert_eq!(replacement.generation, 2, "{case}");
+        assert_eq!(replacement.status, SessionBindingStatus::Active, "{case}");
+        assert_eq!(opened.session_binding_id, replacement.id, "{case}");
+        assert!(recovery.capsule_delivered_at.is_some(), "{case}");
+        assert!(recovery.capsule.contains("current-project-contract"));
+        assert!(recovery.capsule.contains("current-room-contract"));
+        assert!(recovery.capsule.contains("recent-thread-20"));
+        for excluded in [
+            "old-target-transcript",
+            "sibling-thread-secret",
+            "sibling-dm-secret",
+            "sibling-room-secret",
+        ] {
+            assert!(!recovery.capsule.contains(excluded), "{case}: {excluded}");
+        }
+        drop(store);
+        {
+            let observed = observed.lock().unwrap();
+            assert_eq!(observed.connections.len(), 1, "{case}");
+            assert_eq!(observed.creates.len(), 1, "{case}");
+            assert_eq!(observed.resumes.len(), expected_resumes, "{case}");
+            assert_eq!(observed.messages.len(), 1, "{case}");
+            assert_eq!(observed.messages[0].content, recovery.capsule, "{case}");
+            assert_eq!(observed.messages[0].session.binding_id, replacement.id);
+        }
+        runtime.shutdown(LATER.into()).await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn provider_missing_remote_marks_the_resumed_binding_lost() {
+async fn closed_binding_is_not_replaced() {
     let database = TestDatabase::new();
     let fixture = seed(&database, true, true);
     let binding = SessionBinding {
@@ -782,9 +901,9 @@ async fn provider_missing_remote_marks_the_resumed_binding_lost() {
         conversation_id: fixture.thread.id,
         agent_id: fixture.agent.id,
         transport_type: "acp".into(),
-        remote_session_id: Some("remote-missing".into()),
+        remote_session_id: Some("remote-closed".into()),
         generation: 1,
-        status: SessionBindingStatus::Disconnected,
+        status: SessionBindingStatus::Closed,
         created_at: NOW.into(),
         last_used_at: NOW.into(),
     };
@@ -792,17 +911,18 @@ async fn provider_missing_remote_marks_the_resumed_binding_lost() {
         .unwrap()
         .insert_session_binding(&binding)
         .unwrap();
-    let (mut transport, observed) = FakeTransport::new("replacement");
-    transport.resume_lost = true;
+    let (transport, observed) = FakeTransport::new("replacement");
     let mut runtime = runtime(&database, transport);
 
     assert_eq!(
         runtime
             .open_thread_for_agent(command(&fixture, LATER))
             .await,
-        Err(CollaborationError::SessionLost)
+        Err(CollaborationError::SessionUnavailable(
+            SessionBindingStatus::Closed
+        ))
     );
-    assert_eq!(observed.lock().unwrap().resumes.len(), 1);
+    assert!(observed.lock().unwrap().connections.is_empty());
     runtime.shutdown(LATER.into()).await.unwrap();
     let latest = SqliteStore::open(database.path())
         .unwrap()
@@ -810,5 +930,5 @@ async fn provider_missing_remote_marks_the_resumed_binding_lost() {
         .unwrap()
         .unwrap();
     assert_eq!(latest.id, binding.id);
-    assert_eq!(latest.status, SessionBindingStatus::Lost);
+    assert_eq!(latest.status, SessionBindingStatus::Closed);
 }

@@ -72,24 +72,6 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
             .await
     }
 
-    pub(crate) async fn open_session(
-        &self,
-        agent_id: AgentId,
-        binding: SessionBinding,
-        project_root: PathBuf,
-        resumed_at: String,
-    ) -> Result<RuntimeSession, RuntimeError> {
-        self.request(|reply| WorkspaceCommand::OpenSession {
-            agent_id,
-            binding,
-            project_root,
-            resumed_at,
-            recover_missing: false,
-            reply,
-        })
-        .await
-    }
-
     pub(crate) async fn open_recoverable_session(
         &self,
         agent_id: AgentId,
