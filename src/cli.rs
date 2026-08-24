@@ -1,9 +1,11 @@
 use crate::application::{
-    AddRoomMember, AgentRef, CollaborationError, CollaborationService, CreateRoom,
+    AddRoomMember, AgentRef, CollaborationError, CollaborationService, CreateRoom, CreateThread,
     DirectMessageError, DirectMessageEvent, DirectMessageFailureKind, DirectMessageRuntime,
     DirectMessageService, MembershipChange, MembershipState, RemoveRoomMember, RoomRef,
 };
-use crate::domain::{AgentId, MemberType, PermissionOption, PermissionOutcome, RoomId};
+use crate::domain::{
+    AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, RoomId, WorkItemId,
+};
 use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct_message};
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
@@ -46,7 +48,7 @@ pub enum CliError {
     #[error("agent event stream closed")]
     EventStreamClosed,
     #[error("{operation}; storage shutdown failed: {shutdown}")]
-    RoomOperationAndShutdown {
+    OperationAndShutdown {
         operation: Box<CliError>,
         shutdown: String,
     },
@@ -72,6 +74,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let result = match command {
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
+        Command::Thread { operation, .. } => run_thread(operation, json).await,
     };
     result.map_err(|error| error.json_if_requested(json))
 }
@@ -103,6 +106,12 @@ impl CliError {
                 CollaborationError::RoomInactive(_) => "room_inactive",
                 CollaborationError::AgentInactive(_) => "agent_inactive",
                 CollaborationError::RoomRemovalBlocked { .. } => "room_removal_blocked",
+                CollaborationError::ThreadNotFound(_) => "thread_not_found",
+                CollaborationError::ThreadIdConflict(_) => "thread_id_conflict",
+                CollaborationError::PrimaryWorkIdConflict(_) => "primary_work_id_conflict",
+                CollaborationError::ThreadNotOpen(_) => "thread_not_open",
+                CollaborationError::RoomMembershipRequired { .. } => "room_membership_required",
+                CollaborationError::ThreadMembershipRequired { .. } => "thread_membership_required",
                 CollaborationError::InvalidCommand(_) => "invalid_command",
                 _ => "runtime_error",
             },
@@ -110,7 +119,7 @@ impl CliError {
             | Self::TurnFailed(_)
             | Self::Disconnected(_)
             | Self::EventStreamClosed => "runtime_error",
-            Self::RoomOperationAndShutdown { operation, .. } => operation.error_code(),
+            Self::OperationAndShutdown { operation, .. } => operation.error_code(),
             Self::Json(_) => unreachable!(),
         }
     }
@@ -122,11 +131,18 @@ enum Command {
         operation: RoomOperation,
         json: bool,
     },
+    Thread {
+        operation: ThreadOperation,
+        json: bool,
+    },
 }
 
 impl Command {
     fn json(&self) -> bool {
-        matches!(self, Self::Room { json: true, .. })
+        matches!(
+            self,
+            Self::Room { json: true, .. } | Self::Thread { json: true, .. }
+        )
     }
 }
 
@@ -147,6 +163,15 @@ enum RoomOperation {
     },
 }
 
+enum ThreadOperation {
+    Create {
+        title: String,
+        room: RoomRef,
+        goal: Option<String>,
+    },
+    List(RoomRef),
+}
+
 fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
     let json = remove_json(&mut args)?;
     match args.first().map(String::as_str) {
@@ -155,9 +180,60 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
             _ => Err(CliError::Usage),
         },
         Some("room") => parse_room(args, json),
+        Some("thread") => parse_thread(args, json),
         Some(_) => Err(CliError::InvalidCommand),
         None => Err(CliError::Usage),
     }
+}
+
+fn parse_thread(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+    let operation = match args.as_slice() {
+        [_, command, title, rest @ ..] if command == "create" => {
+            let (room, goal) = parse_thread_create(rest)?;
+            ThreadOperation::Create {
+                title: positional(title)?,
+                room,
+                goal,
+            }
+        }
+        [_, command, rest @ ..] if command == "list" => {
+            ThreadOperation::List(parse_thread_room(rest)?)
+        }
+        _ if matches!(
+            args.get(1).map(String::as_str),
+            Some("create" | "list" | "members" | "member" | "open")
+        ) =>
+        {
+            return Err(CliError::Usage);
+        }
+        _ => return Err(CliError::InvalidCommand),
+    };
+    Ok(Command::Thread { operation, json })
+}
+
+fn parse_thread_room(args: &[String]) -> Result<RoomRef, CliError> {
+    match args {
+        [flag, room] if flag == "--room" => room_ref(room),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_thread_create(args: &[String]) -> Result<(RoomRef, Option<String>), CliError> {
+    let mut room = None;
+    let mut goal = None;
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1) else {
+            return Err(CliError::Usage);
+        };
+        match args[index].as_str() {
+            "--room" if room.is_none() => room = Some(room_ref(value)?),
+            "--goal" if goal.is_none() && !value.starts_with("--") => goal = Some(value.clone()),
+            _ => return Err(CliError::Usage),
+        }
+        index += 2;
+    }
+    room.map(|room| (room, goal)).ok_or(CliError::Usage)
 }
 
 fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
@@ -407,7 +483,107 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
         (Ok(None), Ok(())) => Ok(()),
         (Err(operation), Ok(())) => Err(operation),
         (Ok(_), Err(shutdown)) => Err(shutdown),
-        (Err(operation), Err(shutdown)) => Err(CliError::RoomOperationAndShutdown {
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    let output = async {
+        let output = match operation {
+            ThreadOperation::Create { title, room, goal } => {
+                let thread = service
+                    .create_thread(CreateThread {
+                        thread_id: ConversationId::new(),
+                        primary_work_id: WorkItemId::new(),
+                        room,
+                        title,
+                        goal,
+                        user_id: LOCAL_USER_ID.into(),
+                        initial_agents: Vec::new(),
+                        created_at: timestamp(),
+                    })
+                    .await?;
+                if json_output {
+                    Some(
+                        json!({
+                            "thread_id": thread.thread_id.to_string(),
+                            "primary_work_id": thread.primary_work_id.to_string(),
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    Some(format!("{}\t{}", thread.thread_id, thread.primary_work_id))
+                }
+            }
+            ThreadOperation::List(room) => {
+                let threads = service.list_threads(room).await?;
+                if json_output {
+                    Some(
+                        json!(
+                            threads
+                                .into_iter()
+                                .map(|thread| json!({
+                                    "thread_id": thread.id.to_string(),
+                                    "room_id": thread.room_id.map(|id| id.to_string()),
+                                    "title": thread.title,
+                                    "goal": thread.goal,
+                                    "status": thread.status,
+                                    "created_at": thread.created_at,
+                                    "updated_at": thread.updated_at,
+                                }))
+                                .collect::<Vec<_>>()
+                        )
+                        .to_string(),
+                    )
+                } else {
+                    let output = threads
+                        .into_iter()
+                        .map(|thread| {
+                            format!(
+                                "{}\t{}\t{}\t{}\t{}",
+                                thread.id,
+                                thread.room_id.map(|id| id.to_string()).unwrap_or_default(),
+                                thread.title.unwrap_or_default(),
+                                thread.goal.unwrap_or_default(),
+                                thread.status,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!output.is_empty()).then_some(output)
+                }
+            }
+        };
+        Ok::<_, CliError>(output)
+    }
+    .await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (output, shutdown) {
+        (Ok(Some(output)), Ok(())) => {
+            println!("{output}");
+            Ok(())
+        }
+        (Ok(None), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
             operation: Box::new(operation),
             shutdown: shutdown.to_string(),
         }),
