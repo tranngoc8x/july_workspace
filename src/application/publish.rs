@@ -73,6 +73,10 @@ impl<R: PublishRuntime> PublishService<R> {
         Self { runtime }
     }
 
+    pub fn into_runtime(self) -> R {
+        self.runtime
+    }
+
     pub async fn publish(
         &mut self,
         command: PublishResult,
