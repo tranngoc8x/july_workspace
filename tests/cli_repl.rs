@@ -372,7 +372,12 @@ fn repl_switches_agents_without_merging_dm_history_or_bindings() {
     assert_eq!(fields.len(), 5);
     assert!(!fields[3].is_empty());
     assert_eq!(fields[4], "active");
-    assert!(output.contains(&format!("room\t{}\tOperations\n", room.id)));
+    assert_eq!(
+        output
+            .matches(&format!("room\t{}\tOperations\n", room.id))
+            .count(),
+        3
+    );
 }
 
 #[test]

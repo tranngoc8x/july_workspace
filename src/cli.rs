@@ -63,6 +63,11 @@ pub enum CliError {
         operation: Box<CliError>,
         shutdown: String,
     },
+    #[error("{operation}; context shutdown failed: {shutdown}")]
+    OperationAndContextShutdown {
+        operation: Box<CliError>,
+        shutdown: String,
+    },
     #[error("{operation}; context restore failed: {restore}")]
     OperationAndRestore {
         operation: Box<CliError>,
@@ -151,6 +156,7 @@ impl CliError {
             | Self::Disconnected(_)
             | Self::EventStreamClosed => "runtime_error",
             Self::OperationAndShutdown { operation, .. }
+            | Self::OperationAndContextShutdown { operation, .. }
             | Self::OperationAndRestore { operation, .. } => operation.error_code(),
             Self::Json(_) => unreachable!(),
         }
@@ -472,7 +478,7 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
         (Ok(()), Ok(())) => Ok(()),
         (Err(operation), Ok(())) => Err(operation),
         (Ok(()), Err(shutdown)) => Err(shutdown),
-        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndContextShutdown {
             operation: Box::new(operation),
             shutdown: shutdown.to_string(),
         }),
@@ -1423,6 +1429,20 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid command; context restore failed: restore failed"
+        );
+    }
+
+    #[test]
+    fn operation_and_context_shutdown_preserves_the_operation_error_code() {
+        let error = CliError::OperationAndContextShutdown {
+            operation: Box::new(CliError::InvalidCommand),
+            shutdown: "detach failed".into(),
+        };
+
+        assert_eq!(error.error_code(), "invalid_command");
+        assert_eq!(
+            error.to_string(),
+            "invalid command; context shutdown failed: detach failed"
         );
     }
 }
