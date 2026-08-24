@@ -7,6 +7,8 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Command, Output};
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 const NOW: &str = "2026-08-24T00:00:00Z";
 
@@ -25,6 +27,16 @@ impl TestWorkspace {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_july"))
+            .args(args)
+            .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
+            .current_dir(&self.root)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn run_os(&self, args: impl IntoIterator<Item = OsString>) -> Output {
         Command::new(env!("CARGO_BIN_EXE_july"))
             .args(args)
             .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
@@ -106,6 +118,14 @@ fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
+fn json_error(output: &Output, code: &str) {
+    assert!(!output.status.success());
+    assert!(stdout(output).is_empty());
+    let error: Value = serde_json::from_str(&stderr(output)).unwrap();
+    assert_eq!(error["error"]["code"], code);
+    assert!(error["error"]["message"].is_string());
+}
+
 #[test]
 fn publish_renders_human_and_json_and_retries_with_the_durable_publish() {
     let workspace = TestWorkspace::new();
@@ -176,4 +196,76 @@ fn publish_renders_human_and_json_and_retries_with_the_durable_publish() {
     assert_eq!(stored.source_conversation_id, source_id);
     assert_eq!(stored.target_conversation_id, target_id);
     assert_eq!(stored.created_at, fields[4]);
+}
+
+#[test]
+fn publish_reports_missing_result_and_target_as_typed_json_errors() {
+    let workspace = TestWorkspace::new();
+    let (_, target_id, result_id) = workspace.seed_result();
+
+    let missing_result = workspace.run(&[
+        "publish",
+        &ResultId::new().to_string(),
+        "--to",
+        &target_id.to_string(),
+        "--json",
+    ]);
+    json_error(&missing_result, "result_not_found");
+
+    let missing_target = workspace.run(&[
+        "--json",
+        "publish",
+        &result_id.to_string(),
+        "--to",
+        &ConversationId::new().to_string(),
+    ]);
+    json_error(&missing_target, "target_not_found");
+    assert_eq!(workspace.publishes(), 0);
+}
+
+#[test]
+fn publish_rejects_invalid_grammar_and_ids_before_creating_storage() {
+    let result_id = ResultId::new().to_string();
+    let target_id = ConversationId::new().to_string();
+    let lowercase_result = result_id.to_ascii_lowercase();
+    let lowercase_target = target_id.to_ascii_lowercase();
+    for args in [
+        ["publish", &result_id].as_slice(),
+        ["publish", &result_id, "--to"].as_slice(),
+        [
+            "publish", &result_id, "--to", &target_id, "--to", &target_id,
+        ]
+        .as_slice(),
+        ["publish", &result_id, "--unknown", &target_id].as_slice(),
+        ["publish", &result_id, "--to", &target_id, "extra"].as_slice(),
+        ["publish", "not-a-result", "--to", &target_id].as_slice(),
+        ["publish", &lowercase_result, "--to", &target_id].as_slice(),
+        ["publish", &result_id, "--to", "not-a-conversation"].as_slice(),
+        ["publish", &result_id, "--to", &lowercase_target].as_slice(),
+        [
+            "publish", &result_id, "--to", &target_id, "--json", "--json",
+        ]
+        .as_slice(),
+    ] {
+        let workspace = TestWorkspace::new();
+        let output = workspace.run(args);
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains("usage: july dm <agent>"));
+        assert!(!workspace.database.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_rejects_invalid_utf8_before_creating_storage() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run_os([
+        OsString::from("--json"),
+        OsString::from("publish"),
+        OsString::from_vec(vec![0xFF]),
+        OsString::from("--to"),
+        OsString::from(ConversationId::new().to_string()),
+    ]);
+    json_error(&output, "usage");
+    assert!(!workspace.database.exists());
 }
