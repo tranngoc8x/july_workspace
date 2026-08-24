@@ -152,10 +152,13 @@ canonical typed ID.
 `OpenThreadForAgent(thread_id, agent_id)` requires an active Agent, active Room,
 open Thread and active Agent membership in both scopes. It addresses exactly
 one Agent. It never broadcasts, joins an Agent implicitly, copies another
-conversation transcript or uses an LLM to choose a recipient. The future CLI
-maps this command to `july thread open <thread-id> --agent <agent>`.
+conversation transcript or uses an LLM to choose a recipient. Phase 8 maps this
+command to `july thread open <thread-id> --agent <agent>` and to the REPL
+`/thread <thread-id> --agent <agent>`.
 
-The full REPL, `room use`, implicit current context and `--json` remain Phase 8.
+Phase 8 implements the full REPL and `--json`; current context lives in the
+REPL descriptor stack, so no `room use` command exists and non-interactive
+commands establish no implicit context.
 Mentions, Agent-originated membership changes and dynamic joins remain Phase 5.
 
 ## ADR-022 — Membership is a durable generational state machine

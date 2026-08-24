@@ -355,9 +355,11 @@ smoke; live smoke remains opt-in.
 
 ---
 
-## Phase 8 — CLI / REPL
+## Phase 8 — CLI / REPL — Implemented
 
-Implement:
+Status: implemented and verified.
+
+Implemented:
 
 ```text
 /dm
@@ -369,12 +371,40 @@ Implement:
 /publish
 ```
 
-Also support machine-readable `--json` where operationally useful.
+Machine-readable `--json` frames the operational commands. Interactive
+commands (`july dm`, `july thread open`) stream a session and never frame JSON.
 
-DoD:
+Implemented evidence:
 
-- common workflow is faster than manually juggling multiple coding-agent terminals;
-- switching UI context does not merge LLM contexts.
+- Room operational commands with exact name/`RoomId` resolution, retained
+  membership history, human and `--json` framing, and malformed grammar that
+  mutates nothing — `tests/cli_room.rs`;
+- non-interactive Thread commands with durable IDs, idempotent membership
+  changes, and typed membership/open-state error codes —
+  `tests/cli_thread.rs`;
+- explicit Publish with a durable idempotent retry and typed missing
+  result/target errors — `tests/cli_publish.rs`;
+- REPL Root/Room descriptor stack, `/back` restoration, active-only
+  `/members`, and non-fatal slash-command failures —
+  `tests/cli_repl.rs`;
+- multi-Agent DM switching that preserves distinct bindings and histories, and
+  a failed switch that leaves the previous descriptor active —
+  `tests/cli_repl.rs`;
+- interactive Thread context with DM-to-Thread and Thread-to-Thread isolation,
+  contextual `/publish`, `thread open` streaming and detaching, and SIGINT
+  during a permission prompt cancelling the turn without dropping the context —
+  `tests/cli_repl.rs`.
+
+Verified DoD:
+
+- one process reaches every Agent, Room, Thread and Publish target through the
+  descriptor stack instead of one terminal per coding agent;
+- switching UI context does not merge LLM contexts: each Conversation keeps its
+  own session binding and transcript, only the top descriptor is live, and a
+  cold descriptor holds no transcript or model state.
+
+Phase 8 adds no daemon, no TUI, no `room use` command, and no implicit context
+for non-interactive commands. Live-provider smoke remains opt-in.
 
 ---
 

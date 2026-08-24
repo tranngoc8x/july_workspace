@@ -23,10 +23,10 @@ database path is `JULY_WORKSPACE_DB` when set, otherwise
 configuration; the CLI never writes SQLite directly and does not invoke an LLM
 to route an explicit target.
 
-The full top-level REPL and the Room/Thread shell commands below remain Phase 8.
 Phase 4 locks and implements the corresponding application command surface so
-the presentation layer does not define domain behavior. No full TUI is
-required.
+the presentation layer does not define domain behavior. Phase 8 adds the
+top-level REPL and the Room/Thread shell commands below on top of that surface.
+No full TUI is required.
 
 ## Core commands
 
@@ -90,8 +90,11 @@ Phase 4.
 Create commands return the durable IDs they create. Membership mutations return
 the target state (`active` or `left`) and whether durable state changed. Phase 4
 uses typed not-found, inactive-parent, membership-required, active-Thread-
-membership and conflicting-ID errors. Human table formatting and `--json`
-remain Phase 8 concerns.
+membership and conflicting-ID errors. Phase 8 adds human table formatting and
+`--json` on top of those results.
+
+`thread open` streams an interactive session, so it never frames `--json`; the
+same rule applies to `july dm`.
 
 ### Work
 
@@ -116,26 +119,49 @@ july session restart <conversation> --agent cashpoint
 
 ## REPL UX
 
+`july` with no arguments starts the Phase 8 REPL. The prompt is always `> `;
+entering a context echoes the resolved descriptor.
+
 ```text
 $ july
 
 > /dm cashpoint
-[cashpoint] > fix callback retry
+dm	<agent-id>	cashpoint
+> fix callback retry
 ```
 
-Switch:
+Slash commands:
 
 ```text
+/dm <agent>
+/room <room>
+/thread <thread-id> --agent <agent>
 /back
-/room vna
-/thread payment-42
-/dm pay
+/members
+/status
+/publish <result-id>
+/quit
 ```
 
-Switching shell context must not merge underlying LLM session histories.
+`<thread-id>` is a canonical `ConversationId`, never a title, so
+`/thread <thread-id> --agent <agent>` addresses exactly the Thread that
+`july thread open` addresses. Entering a Thread from a Room context requires
+that Thread to belong to that Room.
 
-`room use`, implicit current Room/Thread state and these slash commands are
-Phase 8 presentation behavior, not part of the Phase 4 application contract.
+`/members` lists the active members of the current Room or Thread and is
+unavailable at root and inside a DM. `/status` prints the current descriptor.
+`/publish <result-id>` targets the current Conversation and is rejected at root
+and in a Room context. `/back` pops one descriptor and restores the one below
+it. Any line that is not a slash command is sent to the live Conversation.
+
+Switching shell context must not merge underlying LLM session histories. Only
+the top descriptor is live; a cold descriptor holds no transcript or model
+state, and a failed switch leaves the previous descriptor active.
+
+Phase 8 keeps current context in the REPL descriptor stack instead of adding a
+`room use` command; non-interactive commands still establish no implicit
+context, so this remains presentation behavior and not part of the Phase 4
+application contract.
 
 ## Thread mention
 
