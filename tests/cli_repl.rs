@@ -81,12 +81,28 @@ impl TestWorkspace {
     }
 
     fn seed_agent(&self, name: &str) -> Agent {
+        self.seed_acp_agent(name, &[])
+    }
+
+    fn seed_acp_agent(&self, name: &str, arguments: &[&str]) -> Agent {
         let agent = Agent {
             id: AgentId::new(),
             name: name.into(),
             project_root: self.root.to_string_lossy().into_owned(),
             transport_type: "acp".into(),
-            transport_config: json!({}),
+            transport_config: json!({
+                "executable": "/usr/bin/python3",
+                "arguments": std::iter::once(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/acp_agent.py")
+                        .to_string_lossy()
+                        .into_owned(),
+                ).chain(arguments.iter().map(|argument| (*argument).into())).collect::<Vec<_>>(),
+                "environment": {},
+                "state_directory": self.root,
+                "expected_agent_name": if arguments.contains(&"--claude") { "claude-test" } else { "test-acp-agent" },
+                "expected_agent_version": "1.0.0",
+            }),
             status: "active".into(),
             metadata: json!({}),
             created_at: NOW.into(),
@@ -163,7 +179,7 @@ fn repl_root_commands_are_nonfatal_and_do_not_mutate_rooms() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stdout(&output).matches("> ").count(), 7);
     assert!(stdout(&output).contains("root\n"));
-    assert_eq!(stderr(&output).matches("invalid command\n").count(), 2);
+    assert_eq!(stderr(&output).matches("invalid command\n").count(), 1);
     assert!(stderr(&output).contains("already at root\n"));
     assert!(stderr(&output).contains("members unavailable at root\n"));
     assert_eq!(workspace.rooms(), 0);
@@ -222,6 +238,99 @@ fn repl_room_stack_restores_context_and_lists_only_active_members() {
     )));
     assert!(!stdout(&output).contains(&left.id.to_string()));
     assert_eq!(workspace.rooms(), 2);
+}
+
+#[test]
+fn repl_switches_agents_without_merging_dm_history_or_bindings() {
+    let workspace = TestWorkspace::new();
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let claude = workspace.seed_acp_agent("claude", &["--claude", "--claude-mode"]);
+
+    let output = workspace
+        .repl("/dm codex\none\n1\n/back\n/dm claude\ntwo\n1\n/back\n/dm codex\n/status\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("dm\t"));
+    assert!(stdout(&output).contains("codex"));
+    assert!(
+        stdout(&output).contains("claude"),
+        "stdout: {}; stderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let mut conversations = connection
+        .prepare(
+            "SELECT c.id, cm.member_id FROM conversations c \
+             JOIN conversation_members cm ON cm.conversation_id = c.id \
+             WHERE c.type = 'dm' AND cm.member_type = 'agent' ORDER BY cm.member_id",
+        )
+        .unwrap();
+    let conversations = conversations
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(conversations.len(), 2);
+
+    for (conversation_id, agent_id) in conversations {
+        let messages: Vec<String> = connection
+            .prepare("SELECT body FROM messages WHERE conversation_id = ? ORDER BY created_at, id")
+            .unwrap()
+            .query_map([&conversation_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        if agent_id == codex.id.to_string() {
+            assert_eq!(messages, ["one", "fixture reply"]);
+        } else {
+            assert_eq!(agent_id, claude.id.to_string());
+            assert_eq!(messages, ["two", "fixture reply"]);
+        }
+        let bindings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE conversation_id = ? AND agent_id = ?",
+                [&conversation_id, &agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(bindings >= 1);
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM session_bindings WHERE conversation_id = ? AND agent_id = ? ORDER BY last_used_at DESC, id DESC LIMIT 1",
+                [&conversation_id, &agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "disconnected");
+    }
+}
+
+#[test]
+fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("/dm codex\nhello\n1\n/members\n/dm missing\n/status\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("members unavailable in dm\n"));
+    assert!(stderr(&output).contains("agent missing does not exist\n"));
+    assert!(stdout(&output).contains("dm\t"));
+    assert!(stdout(&output).contains("\tcodex\t"));
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let conversations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conversations, 1);
 }
 
 #[cfg(unix)]

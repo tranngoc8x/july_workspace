@@ -8,9 +8,14 @@ use crate::domain::{
     AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, PublishId, ResultId,
     RoomId, WorkItemId,
 };
-use crate::runtime::{DirectMessageBootstrapError, StorageWorker, open_acp_direct_message};
+use crate::runtime::{
+    AgentDirectMessageRuntime, DirectMessageBootstrapError, StorageWorker, WorkspaceRuntime,
+    open_acp_direct_message, register_acp_agent,
+};
+use crate::transport::AcpTransport;
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, BufRead, Write};
@@ -164,10 +169,18 @@ enum Command {
     },
 }
 
+#[derive(Clone)]
 enum ReplContext {
     Root,
     Room(RoomId),
+    Dm {
+        conversation_id: ConversationId,
+        agent_id: AgentId,
+        agent_name: String,
+    },
 }
+
+type ReplDirectMessage = DirectMessageService<AgentDirectMessageRuntime<AcpTransport>>;
 
 impl Command {
     fn json(&self) -> bool {
@@ -423,11 +436,12 @@ async fn run_repl() -> Result<(), CliError> {
     }
     let worker =
         StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
-    let mut service = CollaborationService::new(worker);
-    let interaction = interact_repl(&mut service).await;
-    let mut worker = service.into_runtime();
-    let shutdown = worker
-        .shutdown()
+    let mut workspace =
+        WorkspaceRuntime::new(worker).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(workspace.storage());
+    let interaction = interact_repl(&mut service, &workspace).await;
+    let shutdown = workspace
+        .shutdown(timestamp())
         .await
         .map_err(|error| CliError::Runtime(error.to_string()));
     match (interaction, shutdown) {
@@ -443,33 +457,58 @@ async fn run_repl() -> Result<(), CliError> {
 
 async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
 ) -> Result<(), CliError> {
     let mut input = repl_input();
     let interrupted = tokio::signal::ctrl_c();
     tokio::pin!(interrupted);
     let mut contexts = vec![ReplContext::Root];
+    let mut registered = HashSet::new();
+    let mut live_dm = None;
     loop {
         repl_stdout(format_args!("> "))?;
         let line = tokio::select! {
             line = input.recv() => match line {
                 Some(line) => line?,
-                None => return Ok(()),
+                None => {
+                    close_repl_dm(&mut live_dm).await?;
+                    return Ok(());
+                }
             },
             result = &mut interrupted => {
                 result?;
+                close_repl_dm(&mut live_dm).await?;
                 return Ok(());
             }
         };
         let Some(line) = line else {
+            close_repl_dm(&mut live_dm).await?;
             return Ok(());
         };
         match line.as_str() {
-            "/quit" => return Ok(()),
-            "/status" => print_repl_status(service, contexts.last().unwrap()).await?,
+            "/quit" => {
+                close_repl_dm(&mut live_dm).await?;
+                return Ok(());
+            }
+            "/status" => print_repl_status(service, workspace, contexts.last().unwrap()).await?,
             "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
             "/back" => {
+                let previous = contexts.last().unwrap().clone();
+                if let Err(error) = close_repl_dm(&mut live_dm).await {
+                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
                 contexts.pop();
-                print_repl_status(service, contexts.last().unwrap()).await?;
+                if let Err(error) =
+                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await
+                {
+                    contexts.push(previous);
+                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                print_repl_status(service, workspace, contexts.last().unwrap()).await?;
             }
             "/members" => match contexts.last().unwrap() {
                 ReplContext::Root => repl_stderr(format_args!("members unavailable at root\n"))?,
@@ -490,6 +529,7 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                         Err(error) => repl_stderr(format_args!("{error}\n"))?,
                     }
                 }
+                ReplContext::Dm { .. } => repl_stderr(format_args!("members unavailable in dm\n"))?,
             },
             _ if line.trim().is_empty() => {}
             _ if let Some(reference) = line.strip_prefix("/room ")
@@ -498,6 +538,12 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                 match room_ref(reference) {
                     Ok(reference) => match service.resolve_room(reference).await {
                         Ok(room) => {
+                            if let Err(error) = close_repl_dm(&mut live_dm).await {
+                                restore_repl_dm(service, workspace, &contexts, &mut live_dm)
+                                    .await?;
+                                repl_stderr(format_args!("{error}\n"))?;
+                                continue;
+                            }
                             repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
                             contexts.push(ReplContext::Room(room.id));
                         }
@@ -506,7 +552,150 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
                     Err(error) => repl_stderr(format_args!("{error}\n"))?,
                 }
             }
+            _ if let Some(reference) = line.strip_prefix("/dm ")
+                && !reference.is_empty() =>
+            {
+                let agent = match agent_ref(reference) {
+                    Ok(reference) => match service.resolve_agent(reference).await {
+                        Ok(agent) => agent,
+                        Err(error) => {
+                            repl_stderr(format_args!("{error}\n"))?;
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                if !registered.contains(&agent.id) {
+                    if let Err(error) = register_acp_agent(workspace, &agent).await {
+                        repl_stderr(format_args!("{error}\n"))?;
+                        continue;
+                    }
+                    registered.insert(agent.id);
+                }
+                if let Err(error) = close_repl_dm(&mut live_dm).await {
+                    restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                match open_repl_dm(workspace, &agent).await {
+                    Ok((context, dm)) => {
+                        repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
+                        contexts.push(context);
+                        live_dm = Some(dm);
+                    }
+                    Err(error) => {
+                        restore_repl_dm(service, workspace, &contexts, &mut live_dm).await?;
+                        repl_stderr(format_args!("{error}\n"))?;
+                    }
+                }
+            }
+            _ if matches!(contexts.last(), Some(ReplContext::Dm { .. })) => {
+                let dm = live_dm.as_mut().expect("active DM has a live service");
+                if let Err(error) = dm.send_message(line, timestamp()).await {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                drain_repl_turn(dm, &mut input).await?;
+            }
             _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
+        }
+    }
+}
+
+async fn open_repl_dm(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    agent: &crate::domain::Agent,
+) -> Result<(ReplContext, ReplDirectMessage), CliError> {
+    let runtime = workspace
+        .direct_message_for_agent(agent.id)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut dm = DirectMessageService::new(runtime);
+    let opened = dm
+        .open(LOCAL_USER_ID.into(), agent.name.clone(), timestamp())
+        .await?;
+    Ok((
+        ReplContext::Dm {
+            conversation_id: opened.conversation_id,
+            agent_id: opened.agent_id,
+            agent_name: opened.agent_name,
+        },
+        dm,
+    ))
+}
+
+async fn close_repl_dm(live_dm: &mut Option<ReplDirectMessage>) -> Result<(), CliError> {
+    if let Some(mut dm) = live_dm.take() {
+        dm.shutdown(timestamp()).await?;
+    }
+    Ok(())
+}
+
+async fn restore_repl_dm<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &[ReplContext],
+    live_dm: &mut Option<ReplDirectMessage>,
+) -> Result<(), CliError> {
+    let Some(ReplContext::Dm { agent_id, .. }) = contexts.last() else {
+        return Ok(());
+    };
+    let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
+    let (_, dm) = open_repl_dm(workspace, &agent).await?;
+    *live_dm = Some(dm);
+    Ok(())
+}
+
+async fn drain_repl_turn(
+    service: &mut ReplDirectMessage,
+    input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
+) -> Result<(), CliError> {
+    let mut cancelled = false;
+    loop {
+        tokio::select! {
+            event = service.next_event(timestamp()) => {
+                let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
+                match event {
+                    DirectMessageEvent::TextDelta(text) => repl_stdout(format_args!("{text}"))?,
+                    DirectMessageEvent::MessageCompleted(_) => repl_stdout(format_args!("\n"))?,
+                    DirectMessageEvent::PermissionRequested { request_id, options } => {
+                        for (index, option) in options.iter().enumerate() {
+                            repl_stdout(format_args!("{}. {}\n", index + 1, option.label))?;
+                        }
+                        repl_stdout(format_args!("permission> "))?;
+                        let (selected, interrupted) = tokio::select! {
+                            line = input.recv() => (
+                                line.transpose()?.flatten()
+                                    .and_then(|line| line.parse::<usize>().ok())
+                                    .and_then(|index| index.checked_sub(1))
+                                    .and_then(|index| options.get(index))
+                                    .map(|option| PermissionOutcome::Selected(option.id.clone()))
+                                    .unwrap_or(PermissionOutcome::Cancelled),
+                                false,
+                            ),
+                            signal = tokio::signal::ctrl_c(), if !cancelled => {
+                                signal?;
+                                (PermissionOutcome::Cancelled, true)
+                            }
+                        };
+                        service.respond_permission(request_id, selected, timestamp()).await?;
+                        if interrupted {
+                            service.cancel_turn(timestamp()).await?;
+                            cancelled = true;
+                        }
+                    }
+                    DirectMessageEvent::TurnCompleted => return Ok(()),
+                    DirectMessageEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
+                    DirectMessageEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
+                }
+            }
+            signal = tokio::signal::ctrl_c(), if !cancelled => {
+                signal?;
+                service.cancel_turn(timestamp()).await?;
+                cancelled = true;
+            }
         }
     }
 }
@@ -537,6 +726,7 @@ fn repl_input() -> mpsc::UnboundedReceiver<io::Result<Option<String>>> {
 
 async fn print_repl_status<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
     context: &ReplContext,
 ) -> Result<(), CliError> {
     match context {
@@ -545,6 +735,27 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
             Ok(room) => repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?,
             Err(error) => repl_stderr(format_args!("{error}\n"))?,
         },
+        ReplContext::Dm {
+            conversation_id,
+            agent_id,
+            agent_name,
+        } => {
+            let binding = workspace
+                .storage()
+                .get_current_session_binding(*conversation_id, *agent_id)
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let binding_id = binding
+                .as_ref()
+                .map(|binding| binding.id.to_string())
+                .unwrap_or_default();
+            let status = binding
+                .map(|binding| binding.status.to_string())
+                .unwrap_or_else(|| "unbound".into());
+            repl_stdout(format_args!(
+                "dm\t{conversation_id}\t{agent_name}\t{binding_id}\t{status}\n"
+            ))?;
+        }
     }
     Ok(())
 }
