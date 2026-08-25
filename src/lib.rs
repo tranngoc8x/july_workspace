@@ -9,6 +9,9 @@ pub mod domain;
 /// Deterministic use cases coordinating domain concepts and ports.
 pub mod application;
 
+/// Danh mục và vòng đời của các ACP adapter cài trên máy.
+pub mod adapter;
+
 /// Minimal terminal presentation for the current roadmap phase.
 pub mod cli;
 
