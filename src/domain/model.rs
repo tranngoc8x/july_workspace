@@ -1,6 +1,6 @@
 use super::{
-    AgentId, CheckpointId, ConversationId, DomainError, MemoryId, MessageId, PublishId, ResultId,
-    RoomId, SessionBindingId, WorkItemId,
+    AgentId, CheckpointId, ConversationId, DecisionId, DomainError, HandoffId, MemoryId, MessageId,
+    ProposalId, ProposalResponseId, PublishId, ResultId, RoomId, SessionBindingId, WorkItemId,
 };
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
@@ -103,6 +103,103 @@ string_enum!(SessionBindingStatus {
     Lost => "lost",
     Closed => "closed",
 });
+string_enum!(HandoffStatus {
+    Proposed => "proposed",
+    Accepted => "accepted",
+    Rejected => "rejected",
+    Partial => "partial",
+    Disputed => "disputed",
+    Resolved => "resolved",
+    Cancelled => "cancelled",
+});
+
+impl HandoffStatus {
+    /// A negotiation still waiting for the source, the target, or a decision.
+    pub const fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::Proposed | Self::Rejected | Self::Partial | Self::Disputed
+        )
+    }
+}
+
+// The target agent's answer to a proposed handoff.
+string_enum!(HandoffDecision {
+    Accept => "accept",
+    Reject => "reject",
+    Partial => "partial",
+});
+
+string_enum!(ProposalStatus {
+    Open => "open",
+    Amended => "amended",
+    Accepted => "accepted",
+    Rejected => "rejected",
+    Superseded => "superseded",
+    Withdrawn => "withdrawn",
+});
+
+impl ProposalStatus {
+    /// A proposal still open to responses and selection.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::Open | Self::Amended)
+    }
+}
+
+string_enum!(ProposalResponseType {
+    Support => "support",
+    Challenge => "challenge",
+    Amend => "amend",
+    Reject => "reject",
+});
+
+string_enum!(DecisionType {
+    Ownership => "ownership",
+    Technical => "technical",
+    Scope => "scope",
+});
+string_enum!(DecisionStatus {
+    Pending => "pending",
+    NeedsDecision => "needs_decision",
+    Decided => "decided",
+    Superseded => "superseded",
+    Cancelled => "cancelled",
+});
+
+/// Who settles a decision. The default is the user; a named agent may be
+/// nominated instead. A facilitator only recommends and is never the owner.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum DecisionOwner {
+    User,
+    Agent(AgentId),
+}
+
+impl Display for DecisionOwner {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User => formatter.write_str("user"),
+            Self::Agent(agent_id) => agent_id.fmt(formatter),
+        }
+    }
+}
+
+impl FromStr for DecisionOwner {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "user" {
+            return Ok(Self::User);
+        }
+        value
+            .parse()
+            .map(Self::Agent)
+            .map_err(|_| DomainError::InvalidEnum {
+                kind: "DecisionOwner",
+                value: value.into(),
+            })
+    }
+}
+
 string_enum!(DeliveryStatus {
     Pending => "pending",
     Delivered => "delivered",
@@ -512,6 +609,341 @@ impl Memory {
         require_text(&self.scope_id, "memory.scope_id")?;
         require_text(&self.content, "memory.content")?;
         require_text(&self.created_at, "memory.created_at")
+    }
+}
+
+/// The structured answer a target agent gives to a proposed handoff.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandoffResponse {
+    pub agent_id: AgentId,
+    pub decision: HandoffDecision,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub owned_scope: Vec<String>,
+    pub rejected_scope: Vec<String>,
+    pub proposed_owner_id: Option<AgentId>,
+}
+
+impl HandoffResponse {
+    pub fn accept(agent_id: AgentId) -> Self {
+        Self {
+            agent_id,
+            decision: HandoffDecision::Accept,
+            reason: None,
+            evidence: Vec::new(),
+            owned_scope: Vec::new(),
+            rejected_scope: Vec::new(),
+            proposed_owner_id: None,
+        }
+    }
+
+    pub fn reject(agent_id: AgentId, reason: impl Into<String>, evidence: Vec<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+            evidence,
+            decision: HandoffDecision::Reject,
+            ..Self::accept(agent_id)
+        }
+    }
+
+    pub fn partial(
+        agent_id: AgentId,
+        reason: impl Into<String>,
+        owned_scope: Vec<String>,
+        rejected_scope: Vec<String>,
+    ) -> Self {
+        Self {
+            reason: Some(reason.into()),
+            owned_scope,
+            rejected_scope,
+            decision: HandoffDecision::Partial,
+            ..Self::accept(agent_id)
+        }
+    }
+
+    #[must_use]
+    pub fn with_proposed_owner(mut self, proposed_owner_id: AgentId) -> Self {
+        self.proposed_owner_id = Some(proposed_owner_id);
+        self
+    }
+
+    #[must_use]
+    pub fn with_evidence(mut self, evidence: Vec<String>) -> Self {
+        self.evidence = evidence;
+        self
+    }
+}
+
+/// The source agent's structured challenge to a rejection, carrying the
+/// decision to open if the round budget is already spent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandoffChallenge {
+    pub agent_id: AgentId,
+    pub evidence: Vec<String>,
+    pub decision_id: DecisionId,
+    pub decision_owner: DecisionOwner,
+}
+
+impl HandoffChallenge {
+    pub fn new(agent_id: AgentId, evidence: Vec<String>) -> Self {
+        Self {
+            agent_id,
+            evidence,
+            decision_id: DecisionId::new(),
+            decision_owner: DecisionOwner::User,
+        }
+    }
+
+    #[must_use]
+    pub fn decided_by(mut self, decision_owner: DecisionOwner) -> Self {
+        self.decision_owner = decision_owner;
+        self
+    }
+}
+
+/// What the decision owner concluded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionOutcome {
+    pub decided_by: DecisionOwner,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub selected_proposal_id: Option<ProposalId>,
+    /// For an ownership dispute: the agent that ends up owning the work.
+    pub assigned_owner_id: Option<AgentId>,
+}
+
+impl DecisionOutcome {
+    pub fn new(decided_by: DecisionOwner, decision: impl Into<String>) -> Self {
+        Self {
+            decided_by,
+            decision: decision.into(),
+            reason: None,
+            evidence: Vec::new(),
+            selected_proposal_id: None,
+            assigned_owner_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn assigning_owner(mut self, owner_agent_id: AgentId) -> Self {
+        self.assigned_owner_id = Some(owner_agent_id);
+        self
+    }
+
+    #[must_use]
+    pub fn because(mut self, reason: impl Into<String>, evidence: Vec<String>) -> Self {
+        self.reason = Some(reason.into());
+        self.evidence = evidence;
+        self
+    }
+}
+
+/// One ownership negotiation: the source agent proposes that the target agent
+/// owns a work item, and the target answers with evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handoff {
+    pub id: HandoffId,
+    pub thread_id: ConversationId,
+    pub work_id: WorkItemId,
+    pub from_agent_id: AgentId,
+    pub to_agent_id: AgentId,
+    pub status: HandoffStatus,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub owned_scope: Vec<String>,
+    pub rejected_scope: Vec<String>,
+    pub proposed_owner_id: Option<AgentId>,
+    pub round_count: u32,
+    /// Set when the dispute exhausted its rounds and needs a decision.
+    pub decision_id: Option<DecisionId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Handoff {
+    /// Structured challenge rounds allowed before a dispute must be decided
+    /// instead of continuing: claim, response, and one challenged response.
+    pub const MAX_DISPUTE_ROUNDS: u32 = 2;
+
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.from_agent_id == self.to_agent_id {
+            return Err(DomainError::HandoffSelfTarget);
+        }
+        require_text(&self.created_at, "handoff.created_at")?;
+        require_text(&self.updated_at, "handoff.updated_at")?;
+        let scoped = self.status == HandoffStatus::Partial;
+        if !scoped && !(self.owned_scope.is_empty() && self.rejected_scope.is_empty()) {
+            return Err(DomainError::HandoffScopeNotAllowed);
+        }
+        match self.status {
+            HandoffStatus::Rejected | HandoffStatus::Disputed => {
+                self.require_reason("rejected")?;
+                if self.evidence.is_empty() {
+                    return Err(DomainError::HandoffRejectionMissingEvidence);
+                }
+            }
+            HandoffStatus::Partial => {
+                self.require_reason("partial")?;
+                if self.owned_scope.is_empty() || self.rejected_scope.is_empty() {
+                    return Err(DomainError::HandoffPartialScopeMissing);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn require_reason(&self, kind: &'static str) -> Result<(), DomainError> {
+        match &self.reason {
+            Some(reason) if !reason.trim().is_empty() => Ok(()),
+            _ => Err(DomainError::HandoffResponseMissingReason(kind)),
+        }
+    }
+}
+
+/// One candidate solution offered to a thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub id: ProposalId,
+    pub thread_id: ConversationId,
+    pub author_agent_id: AgentId,
+    pub title: String,
+    pub problem_statement: Option<String>,
+    pub approach: Option<String>,
+    pub benefits: Vec<String>,
+    pub costs: Vec<String>,
+    pub risks: Vec<String>,
+    pub assumptions: Vec<String>,
+    pub evidence: Vec<String>,
+    pub status: ProposalStatus,
+    pub supersedes_proposal_id: Option<ProposalId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Proposal {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.title, "proposal.title")?;
+        require_text(&self.created_at, "proposal.created_at")?;
+        require_text(&self.updated_at, "proposal.updated_at")?;
+        if self.supersedes_proposal_id == Some(self.id) {
+            return Err(DomainError::ProposalSupersedesItself);
+        }
+        Ok(())
+    }
+}
+
+/// One agent's structured answer to a proposal. Disagreement must carry
+/// actionable content, never bare rejection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProposalResponse {
+    pub id: ProposalResponseId,
+    pub proposal_id: ProposalId,
+    pub agent_id: AgentId,
+    pub response_type: ProposalResponseType,
+    pub reason: Option<String>,
+    pub evidence: Vec<String>,
+    pub created_at: String,
+}
+
+impl ProposalResponse {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.created_at, "proposal_response.created_at")?;
+        let stated = self
+            .reason
+            .as_ref()
+            .is_some_and(|reason| !reason.trim().is_empty());
+        match self.response_type {
+            ProposalResponseType::Support => Ok(()),
+            ProposalResponseType::Amend if stated => Ok(()),
+            ProposalResponseType::Challenge | ProposalResponseType::Reject
+                if stated && !self.evidence.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(DomainError::ProposalResponseNotActionable(
+                self.response_type,
+            )),
+        }
+    }
+}
+
+/// One work item a decision asks for, with the upstream work it waits on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionWork {
+    pub work_id: WorkItemId,
+    pub title: String,
+    pub goal: Option<String>,
+    pub owner_agent_id: Option<AgentId>,
+    pub depends_on: Vec<WorkItemId>,
+}
+
+impl DecisionWork {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            work_id: WorkItemId::new(),
+            title: title.into(),
+            goal: None,
+            owner_agent_id: None,
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn owned_by(mut self, owner_agent_id: AgentId) -> Self {
+        self.owner_agent_id = Some(owner_agent_id);
+        self
+    }
+
+    #[must_use]
+    pub fn after(mut self, upstream_work_id: WorkItemId) -> Self {
+        self.depends_on.push(upstream_work_id);
+        self
+    }
+}
+
+/// A durable conclusion of a deliberation. It is workspace state, not a chat
+/// message, and it stays distinct from the work it may generate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Decision {
+    pub id: DecisionId,
+    pub thread_id: ConversationId,
+    pub decision_type: DecisionType,
+    pub title: String,
+    pub decision: Option<String>,
+    pub reason: Option<String>,
+    pub selected_proposal_id: Option<ProposalId>,
+    pub alternatives: Vec<String>,
+    pub evidence: Vec<String>,
+    pub participants: Vec<AgentId>,
+    pub decision_owner: DecisionOwner,
+    pub status: DecisionStatus,
+    pub supersedes_decision_id: Option<DecisionId>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Decision {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.title, "decision.title")?;
+        require_text(&self.created_at, "decision.created_at")?;
+        require_text(&self.updated_at, "decision.updated_at")?;
+        if self.supersedes_decision_id == Some(self.id) {
+            return Err(DomainError::DecisionSupersedesItself);
+        }
+        let stated = self
+            .decision
+            .as_ref()
+            .is_some_and(|decision| !decision.trim().is_empty());
+        let settled = matches!(
+            self.status,
+            DecisionStatus::Decided | DecisionStatus::Superseded
+        );
+        if stated != settled {
+            return Err(DomainError::DecisionOutcomeStatusMismatch);
+        }
+        Ok(())
     }
 }
 

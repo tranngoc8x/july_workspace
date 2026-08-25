@@ -28,6 +28,24 @@ pub enum DomainError {
     WorkCompletionTimestampMismatch,
     #[error("work result cannot supersede itself")]
     ResultSupersedesItself,
+    #[error("proposal cannot supersede itself")]
+    ProposalSupersedesItself,
+    #[error("a {0} response must carry a reason, and evidence when it disagrees")]
+    ProposalResponseNotActionable(crate::domain::ProposalResponseType),
+    #[error("decision cannot supersede itself")]
+    DecisionSupersedesItself,
+    #[error("a decision states its outcome exactly when it is decided")]
+    DecisionOutcomeStatusMismatch,
+    #[error("handoff source and target agent must differ")]
+    HandoffSelfTarget,
+    #[error("a {0} handoff response requires a reason")]
+    HandoffResponseMissingReason(&'static str),
+    #[error("a rejected handoff requires at least one piece of evidence")]
+    HandoffRejectionMissingEvidence,
+    #[error("a partial handoff requires both an owned and a rejected scope")]
+    HandoffPartialScopeMissing,
+    #[error("only a partial handoff may carry owned or rejected scope")]
+    HandoffScopeNotAllowed,
     #[error("permission option was not advertised: {0}")]
     PermissionOptionNotAdvertised(String),
     #[error("invalid {kind}: {value}")]

@@ -1,6 +1,7 @@
 use crate::domain::{
-    AgentId, ConversationId, DomainError, MessageId, PublishId, ResultId, RoomId, SessionBindingId,
-    SessionBindingStatus, WorkItemId, WorkStatus,
+    AgentId, ConversationId, DecisionId, DecisionOwner, DecisionStatus, DomainError, HandoffId,
+    HandoffStatus, MessageId, ProposalId, ProposalResponseId, ProposalStatus, PublishId, ResultId,
+    RoomId, SessionBindingId, SessionBindingStatus, WorkItemId, WorkStatus,
 };
 use thiserror::Error;
 
@@ -100,6 +101,105 @@ pub enum StoreError {
         result_id: ResultId,
         supersedes_result_id: ResultId,
     },
+    #[error("handoff {0} does not exist")]
+    HandoffNotFound(HandoffId),
+    #[error("handoff id {0} already exists with different content")]
+    HandoffIdConflict(HandoffId),
+    #[error("work {work_id} does not belong to thread {thread_id}")]
+    HandoffWorkOutOfThread {
+        work_id: WorkItemId,
+        thread_id: ConversationId,
+    },
+    #[error("work {0} already has an open handoff")]
+    HandoffAlreadyOpen(WorkItemId),
+    #[error("only target agent {expected} may respond to handoff {handoff_id}")]
+    HandoffRespondentMismatch {
+        handoff_id: HandoffId,
+        expected: AgentId,
+    },
+    #[error("only source agent {expected} may act on handoff {handoff_id}")]
+    HandoffSourceMismatch {
+        handoff_id: HandoffId,
+        expected: AgentId,
+    },
+    #[error("handoff {handoff_id} cannot transition from {from} to {to}")]
+    InvalidHandoffTransition {
+        handoff_id: HandoffId,
+        from: HandoffStatus,
+        to: HandoffStatus,
+    },
+    #[error("handoff timestamp must not be blank")]
+    InvalidHandoffTimestamp,
+    #[error("challenging handoff {0} requires new evidence")]
+    HandoffChallengeMissingEvidence(HandoffId),
+    #[error("proposal {0} does not exist")]
+    ProposalNotFound(ProposalId),
+    #[error("proposal id {0} already exists with different content")]
+    ProposalIdConflict(ProposalId),
+    #[error("proposal response id {0} already exists with different content")]
+    ProposalResponseIdConflict(ProposalResponseId),
+    #[error("proposal {proposal_id} is {status} and takes no further responses")]
+    ProposalNotLive {
+        proposal_id: ProposalId,
+        status: ProposalStatus,
+    },
+    #[error("proposal {proposal_id} cannot transition from {from} to {to}")]
+    InvalidProposalTransition {
+        proposal_id: ProposalId,
+        from: ProposalStatus,
+        to: ProposalStatus,
+    },
+    #[error("proposal {proposal_id} belongs to author {expected}")]
+    ProposalAuthorMismatch {
+        proposal_id: ProposalId,
+        expected: AgentId,
+    },
+    #[error("proposal {proposal_id} cannot supersede proposal {superseded_id} from another thread")]
+    ProposalSupersedeOutOfThread {
+        proposal_id: ProposalId,
+        superseded_id: ProposalId,
+    },
+    #[error("proposal {proposal_id} does not belong to thread {thread_id}")]
+    ProposalOutOfThread {
+        proposal_id: ProposalId,
+        thread_id: ConversationId,
+    },
+    #[error("proposal timestamp must not be blank")]
+    InvalidProposalTimestamp,
+    #[error("decision {0} does not exist")]
+    DecisionNotFound(DecisionId),
+    #[error("decision id {0} already exists with different content")]
+    DecisionIdConflict(DecisionId),
+    #[error("decision {decision_id} cannot supersede decision {superseded_id} from another thread")]
+    DecisionSupersedeOutOfThread {
+        decision_id: DecisionId,
+        superseded_id: DecisionId,
+    },
+    #[error("decision {decision_id} cannot transition from {from} to {to}")]
+    InvalidDecisionTransition {
+        decision_id: DecisionId,
+        from: DecisionStatus,
+        to: DecisionStatus,
+    },
+    #[error("decision {decision_id} belongs to owner {expected}")]
+    DecisionOwnerMismatch {
+        decision_id: DecisionId,
+        expected: DecisionOwner,
+    },
+    #[error("decision {decision_id} is {status}, so it generates no work")]
+    DecisionNotDecided {
+        decision_id: DecisionId,
+        status: DecisionStatus,
+    },
+    #[error("work {work_id} conflicts with an earlier conversion of decision {decision_id}")]
+    DecisionWorkConflict {
+        decision_id: DecisionId,
+        work_id: WorkItemId,
+    },
+    #[error("decision {0} settles no handoff, so it cannot assign an owner")]
+    DecisionHasNoHandoff(DecisionId),
+    #[error("decision timestamp must not be blank")]
+    InvalidDecisionTimestamp,
     #[error("result {0} does not exist")]
     PublishResultNotFound(ResultId),
     #[error("source conversation {0} does not exist")]

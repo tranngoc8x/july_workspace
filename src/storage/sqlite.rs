@@ -1,10 +1,14 @@
 use super::{StoreError, records};
 use crate::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
-    ConversationMember, DeliveryStatus, MemberType, Memory, MemoryId, MemoryKind, MemoryScopeType,
-    Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome, Publish, PublishId,
-    ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
-    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner, DecisionStatus,
+    DecisionType, DecisionWork, DeliveryStatus, Handoff, HandoffChallenge, HandoffDecision,
+    HandoffId, HandoffResponse, HandoffStatus, MemberType, Memory, MemoryId, MemoryKind,
+    MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome,
+    Proposal, ProposalId, ProposalResponse, ProposalResponseId, ProposalResponseType,
+    ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding,
+    SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
+    WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -12,7 +16,22 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
-const MIGRATIONS: [Migration; 11] = [
+const HANDOFF_COLUMNS: &str = "SELECT id, thread_id, work_id, from_agent_id, to_agent_id, status,
+            reason, evidence_json, owned_scope_json, rejected_scope_json,
+            proposed_owner_id, round_count, decision_id, created_at, updated_at
+     FROM handoffs";
+const DECISION_COLUMNS: &str = "SELECT id, thread_id, decision_type, title, decision, reason,
+            selected_proposal_id, alternatives_json, evidence_json, decision_owner,
+            participants_json, status, supersedes_decision_id, created_at, updated_at
+     FROM decisions";
+const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, problem_statement,
+            approach, benefits_json, costs_json, risks_json, assumptions_json,
+            evidence_json, status, supersedes_proposal_id, created_at, updated_at
+     FROM proposals";
+const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
+            evidence_json, created_at
+     FROM proposal_responses";
+const MIGRATIONS: [Migration; 15] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -56,6 +75,22 @@ const MIGRATIONS: [Migration; 11] = [
     Migration {
         version: 11,
         sql: include_str!("migrations/0011_session_recovery.sql"),
+    },
+    Migration {
+        version: 12,
+        sql: include_str!("migrations/0012_handoffs.sql"),
+    },
+    Migration {
+        version: 13,
+        sql: include_str!("migrations/0013_decisions.sql"),
+    },
+    Migration {
+        version: 14,
+        sql: include_str!("migrations/0014_proposals.sql"),
+    },
+    Migration {
+        version: 15,
+        sql: include_str!("migrations/0015_decision_work.sql"),
     },
 ];
 
@@ -1168,28 +1203,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut work = require_work_item(&transaction, work_id)?;
-        if work.owner_agent_id == Some(owner_agent_id) {
-            transaction.commit()?;
-            return Ok(work);
-        }
-        if work.status.is_terminal() {
-            return Err(StoreError::TerminalWorkOwnerImmutable(work_id));
-        }
-        require_active_agent(&transaction, owner_agent_id)?;
-        require_active_conversation_membership(
-            &transaction,
-            work.conversation_id,
-            work_id,
-            owner_agent_id,
-        )?;
-        work.owner_agent_id = Some(owner_agent_id);
-        work.updated_at = assigned_at.into();
-        work.validate()?;
-        transaction.execute(
-            "UPDATE work_items SET owner_agent_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![work_id.to_string(), owner_agent_id.to_string(), assigned_at],
-        )?;
+        let work = assign_work_owner(&transaction, work_id, owner_agent_id, assigned_at)?;
         transaction.commit()?;
         Ok(work)
     }
@@ -1249,67 +1263,14 @@ impl SqliteStore {
         downstream_work_id: WorkItemId,
         created_at: &str,
     ) -> Result<WorkDependency, StoreError> {
-        if upstream_work_id == downstream_work_id {
-            return Err(StoreError::WorkDependencySelf(upstream_work_id));
-        }
-        let dependency = WorkDependency {
-            upstream_work_id,
-            downstream_work_id,
-            dependency_type: crate::domain::DependencyType::Requires,
-            status: crate::domain::DependencyStatus::Waiting,
-            result_id: None,
-            created_at: created_at.into(),
-        };
-        dependency.validate()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_work_item(&transaction, upstream_work_id)?;
-        require_work_item(&transaction, downstream_work_id)?;
-        if let Some(stored) =
-            get_work_dependency(&transaction, upstream_work_id, downstream_work_id)?
-        {
-            if stored.created_at == dependency.created_at {
-                transaction.commit()?;
-                return Ok(stored);
-            }
-            return Err(StoreError::WorkDependencyConflict {
-                upstream_work_id,
-                downstream_work_id,
-            });
-        }
-        let cyclic: bool = transaction.query_row(
-            "WITH RECURSIVE reachable(work_id) AS (
-                 SELECT downstream_work_id
-                 FROM work_dependencies
-                 WHERE upstream_work_id = ?1
-                 UNION
-                 SELECT dependency.downstream_work_id
-                 FROM work_dependencies AS dependency
-                 JOIN reachable ON dependency.upstream_work_id = reachable.work_id
-             )
-             SELECT EXISTS(SELECT 1 FROM reachable WHERE work_id = ?2)",
-            params![downstream_work_id.to_string(), upstream_work_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if cyclic {
-            return Err(StoreError::WorkDependencyCycle {
-                upstream_work_id,
-                downstream_work_id,
-            });
-        }
-        transaction.execute(
-            "INSERT INTO work_dependencies(
-                upstream_work_id, downstream_work_id, dependency_type, status, result_id, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                dependency.upstream_work_id.to_string(),
-                dependency.downstream_work_id.to_string(),
-                dependency.dependency_type.to_string(),
-                dependency.status.to_string(),
-                dependency.result_id.map(|id| id.to_string()),
-                dependency.created_at,
-            ],
+        let dependency = add_work_dependency(
+            &transaction,
+            upstream_work_id,
+            downstream_work_id,
+            created_at,
         )?;
         transaction.commit()?;
         Ok(dependency)
@@ -1522,6 +1483,648 @@ impl SqliteStore {
             Ok((publish, result))
         })
         .collect()
+    }
+
+    /// Open one ownership negotiation for a work item. The proposal itself
+    /// never moves ownership; only an accepted handoff does.
+    pub fn propose_handoff(&mut self, handoff: &Handoff) -> Result<Handoff, StoreError> {
+        require_handoff_timestamp(&handoff.created_at)?;
+        require_handoff_timestamp(&handoff.updated_at)?;
+        if handoff.status != HandoffStatus::Proposed || handoff.round_count != 0 {
+            return Err(StoreError::InvalidHandoffTransition {
+                handoff_id: handoff.id,
+                from: handoff.status,
+                to: HandoffStatus::Proposed,
+            });
+        }
+        handoff.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = get_handoff(&transaction, handoff.id)? {
+            transaction.commit()?;
+            return if stored == *handoff {
+                Ok(stored)
+            } else {
+                Err(StoreError::HandoffIdConflict(handoff.id))
+            };
+        }
+        let work = require_work_item(&transaction, handoff.work_id)?;
+        if work.conversation_id != handoff.thread_id {
+            return Err(StoreError::HandoffWorkOutOfThread {
+                work_id: handoff.work_id,
+                thread_id: handoff.thread_id,
+            });
+        }
+        if work.status.is_terminal() {
+            return Err(StoreError::TerminalWorkOwnerImmutable(handoff.work_id));
+        }
+        for agent_id in [handoff.from_agent_id, handoff.to_agent_id] {
+            require_active_agent(&transaction, agent_id)?;
+            require_active_conversation_membership(
+                &transaction,
+                handoff.thread_id,
+                handoff.work_id,
+                agent_id,
+            )?;
+        }
+        if let Some(proposed_owner_id) = handoff.proposed_owner_id {
+            require_active_agent(&transaction, proposed_owner_id)?;
+        }
+        if open_handoff_exists(&transaction, handoff.work_id)? {
+            return Err(StoreError::HandoffAlreadyOpen(handoff.work_id));
+        }
+        insert_handoff(&transaction, handoff)?;
+        transaction.commit()?;
+        Ok(handoff.clone())
+    }
+
+    /// Record the target agent's structured answer. Accepting transfers
+    /// ownership; rejecting never does.
+    pub fn respond_to_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        response: &HandoffResponse,
+        responded_at: &str,
+    ) -> Result<Handoff, StoreError> {
+        require_handoff_timestamp(responded_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut handoff = require_handoff(&transaction, handoff_id)?;
+        if response.agent_id != handoff.to_agent_id {
+            return Err(StoreError::HandoffRespondentMismatch {
+                handoff_id,
+                expected: handoff.to_agent_id,
+            });
+        }
+        let target = match response.decision {
+            HandoffDecision::Accept => HandoffStatus::Accepted,
+            HandoffDecision::Reject => HandoffStatus::Rejected,
+            HandoffDecision::Partial => HandoffStatus::Partial,
+        };
+        if handoff.status != HandoffStatus::Proposed {
+            return Err(StoreError::InvalidHandoffTransition {
+                handoff_id,
+                from: handoff.status,
+                to: target,
+            });
+        }
+        if let Some(proposed_owner_id) = response.proposed_owner_id {
+            require_active_agent(&transaction, proposed_owner_id)?;
+        }
+
+        handoff.status = target;
+        handoff.reason.clone_from(&response.reason);
+        handoff.evidence.clone_from(&response.evidence);
+        handoff.owned_scope.clone_from(&response.owned_scope);
+        handoff.rejected_scope.clone_from(&response.rejected_scope);
+        handoff.proposed_owner_id = response.proposed_owner_id;
+        handoff.updated_at = responded_at.into();
+        if target != HandoffStatus::Accepted {
+            handoff.round_count += 1;
+        }
+        handoff.validate()?;
+        if target == HandoffStatus::Accepted {
+            assign_work_owner(
+                &transaction,
+                handoff.work_id,
+                handoff.to_agent_id,
+                responded_at,
+            )?;
+        }
+        update_handoff(&transaction, &handoff)?;
+        transaction.commit()?;
+        Ok(handoff)
+    }
+
+    /// The source agent accepts the target's answer and closes the
+    /// negotiation without further rounds.
+    pub fn resolve_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        agent_id: AgentId,
+        resolved_at: &str,
+    ) -> Result<Handoff, StoreError> {
+        self.close_handoff(handoff_id, agent_id, HandoffStatus::Resolved, resolved_at)
+    }
+
+    /// The source agent withdraws a proposal nobody has answered yet.
+    pub fn cancel_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        agent_id: AgentId,
+        cancelled_at: &str,
+    ) -> Result<Handoff, StoreError> {
+        self.close_handoff(handoff_id, agent_id, HandoffStatus::Cancelled, cancelled_at)
+    }
+
+    fn close_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        agent_id: AgentId,
+        target: HandoffStatus,
+        closed_at: &str,
+    ) -> Result<Handoff, StoreError> {
+        require_handoff_timestamp(closed_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut handoff = require_handoff(&transaction, handoff_id)?;
+        if agent_id != handoff.from_agent_id {
+            return Err(StoreError::HandoffSourceMismatch {
+                handoff_id,
+                expected: handoff.from_agent_id,
+            });
+        }
+        let allowed = match target {
+            HandoffStatus::Resolved => {
+                matches!(
+                    handoff.status,
+                    HandoffStatus::Rejected | HandoffStatus::Partial
+                )
+            }
+            _ => handoff.status == HandoffStatus::Proposed,
+        };
+        if !allowed {
+            return Err(StoreError::InvalidHandoffTransition {
+                handoff_id,
+                from: handoff.status,
+                to: target,
+            });
+        }
+        handoff.status = target;
+        handoff.updated_at = closed_at.into();
+        handoff.validate()?;
+        update_handoff(&transaction, &handoff)?;
+        transaction.commit()?;
+        Ok(handoff)
+    }
+
+    /// The source agent challenges the target's answer with new evidence.
+    /// Within the round budget this reopens the proposal for another answer;
+    /// once the budget is spent the negotiation escalates to a decision
+    /// instead of continuing to ping-pong.
+    pub fn challenge_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        challenge: &HandoffChallenge,
+        challenged_at: &str,
+    ) -> Result<(Handoff, Option<Decision>), StoreError> {
+        require_handoff_timestamp(challenged_at)?;
+        if challenge.evidence.is_empty() {
+            return Err(StoreError::HandoffChallengeMissingEvidence(handoff_id));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut handoff = require_handoff(&transaction, handoff_id)?;
+        if challenge.agent_id != handoff.from_agent_id {
+            return Err(StoreError::HandoffSourceMismatch {
+                handoff_id,
+                expected: handoff.from_agent_id,
+            });
+        }
+        if !matches!(
+            handoff.status,
+            HandoffStatus::Rejected | HandoffStatus::Partial
+        ) {
+            return Err(StoreError::InvalidHandoffTransition {
+                handoff_id,
+                from: handoff.status,
+                to: HandoffStatus::Disputed,
+            });
+        }
+
+        for evidence in &challenge.evidence {
+            if !handoff.evidence.contains(evidence) {
+                handoff.evidence.push(evidence.clone());
+            }
+        }
+        handoff.updated_at = challenged_at.into();
+        let escalated = handoff.round_count >= Handoff::MAX_DISPUTE_ROUNDS;
+        let decision = if escalated {
+            let decision = Decision {
+                id: challenge.decision_id,
+                thread_id: handoff.thread_id,
+                decision_type: DecisionType::Ownership,
+                title: format!("Ownership of work {}", handoff.work_id),
+                decision: None,
+                reason: handoff.reason.clone(),
+                selected_proposal_id: None,
+                alternatives: Vec::new(),
+                evidence: handoff.evidence.clone(),
+                participants: vec![handoff.from_agent_id, handoff.to_agent_id],
+                decision_owner: challenge.decision_owner,
+                status: DecisionStatus::NeedsDecision,
+                supersedes_decision_id: None,
+                created_at: challenged_at.into(),
+                updated_at: challenged_at.into(),
+            };
+            insert_decision(&transaction, &decision)?;
+            handoff.status = HandoffStatus::Disputed;
+            handoff.decision_id = Some(decision.id);
+            Some(decision)
+        } else {
+            // Inside the budget the target owes one more structured answer.
+            handoff.status = HandoffStatus::Proposed;
+            handoff.owned_scope.clear();
+            handoff.rejected_scope.clear();
+            None
+        };
+        handoff.validate()?;
+        update_handoff(&transaction, &handoff)?;
+        transaction.commit()?;
+        Ok((handoff, decision))
+    }
+
+    /// Offer one candidate solution to a thread. A revision supersedes the
+    /// proposal it replaces instead of mutating it.
+    pub fn create_proposal(&mut self, proposal: &Proposal) -> Result<Proposal, StoreError> {
+        require_proposal_timestamp(&proposal.created_at)?;
+        require_proposal_timestamp(&proposal.updated_at)?;
+        proposal.validate()?;
+        if !proposal.status.is_live() {
+            return Err(StoreError::InvalidProposalTransition {
+                proposal_id: proposal.id,
+                from: proposal.status,
+                to: ProposalStatus::Open,
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = get_proposal(&transaction, proposal.id)? {
+            transaction.commit()?;
+            return if stored == *proposal {
+                Ok(stored)
+            } else {
+                Err(StoreError::ProposalIdConflict(proposal.id))
+            };
+        }
+        require_thread(&transaction, proposal.thread_id)?;
+        require_active_agent(&transaction, proposal.author_agent_id)?;
+        require_active_thread_membership(
+            &transaction,
+            proposal.thread_id,
+            proposal.author_agent_id,
+        )?;
+        if let Some(superseded_id) = proposal.supersedes_proposal_id {
+            let superseded = require_proposal(&transaction, superseded_id)?;
+            if superseded.thread_id != proposal.thread_id {
+                return Err(StoreError::ProposalSupersedeOutOfThread {
+                    proposal_id: proposal.id,
+                    superseded_id,
+                });
+            }
+            set_proposal_status(
+                &transaction,
+                superseded_id,
+                ProposalStatus::Superseded,
+                &proposal.updated_at,
+            )?;
+        }
+        insert_proposal(&transaction, proposal)?;
+        transaction.commit()?;
+        Ok(proposal.clone())
+    }
+
+    /// Record one agent's answer to a live proposal. An amendment request
+    /// marks the proposal as amended so the author owes a revision.
+    pub fn respond_to_proposal(
+        &mut self,
+        response: &ProposalResponse,
+    ) -> Result<ProposalResponse, StoreError> {
+        require_proposal_timestamp(&response.created_at)?;
+        response.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = get_proposal_response(&transaction, response.id)? {
+            transaction.commit()?;
+            return if stored == *response {
+                Ok(stored)
+            } else {
+                Err(StoreError::ProposalResponseIdConflict(response.id))
+            };
+        }
+        let proposal = require_proposal(&transaction, response.proposal_id)?;
+        if !proposal.status.is_live() {
+            return Err(StoreError::ProposalNotLive {
+                proposal_id: proposal.id,
+                status: proposal.status,
+            });
+        }
+        require_active_agent(&transaction, response.agent_id)?;
+        require_active_thread_membership(&transaction, proposal.thread_id, response.agent_id)?;
+        insert_proposal_response(&transaction, response)?;
+        if response.response_type == ProposalResponseType::Amend {
+            set_proposal_status(
+                &transaction,
+                proposal.id,
+                ProposalStatus::Amended,
+                &response.created_at,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(response.clone())
+    }
+
+    /// The author takes a live proposal off the table.
+    pub fn withdraw_proposal(
+        &mut self,
+        proposal_id: ProposalId,
+        agent_id: AgentId,
+        withdrawn_at: &str,
+    ) -> Result<Proposal, StoreError> {
+        require_proposal_timestamp(withdrawn_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let proposal = require_proposal(&transaction, proposal_id)?;
+        if proposal.author_agent_id != agent_id {
+            return Err(StoreError::ProposalAuthorMismatch {
+                proposal_id,
+                expected: proposal.author_agent_id,
+            });
+        }
+        let proposal = set_proposal_status(
+            &transaction,
+            proposal_id,
+            ProposalStatus::Withdrawn,
+            withdrawn_at,
+        )?;
+        transaction.commit()?;
+        Ok(proposal)
+    }
+
+    pub fn get_proposal(&self, proposal_id: ProposalId) -> Result<Option<Proposal>, StoreError> {
+        get_proposal(&self.connection, proposal_id)
+    }
+
+    pub fn list_proposals_for_thread(
+        &self,
+        thread_id: ConversationId,
+    ) -> Result<Vec<Proposal>, StoreError> {
+        query_all(
+            &self.connection,
+            &format!("{PROPOSAL_COLUMNS} WHERE thread_id = ?1 ORDER BY created_at, id"),
+            params![thread_id.to_string()],
+            records::proposal,
+        )
+    }
+
+    pub fn list_proposal_responses(
+        &self,
+        proposal_id: ProposalId,
+    ) -> Result<Vec<ProposalResponse>, StoreError> {
+        query_all(
+            &self.connection,
+            &format!("{PROPOSAL_RESPONSE_COLUMNS} WHERE proposal_id = ?1 ORDER BY created_at, id"),
+            params![proposal_id.to_string()],
+            records::proposal_response,
+        )
+    }
+
+    /// Open a decision without settling it, for example a technical question
+    /// a thread wants recorded before proposals exist.
+    pub fn record_decision(&mut self, decision: &Decision) -> Result<Decision, StoreError> {
+        require_decision_timestamp(&decision.created_at)?;
+        require_decision_timestamp(&decision.updated_at)?;
+        decision.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = get_decision(&transaction, decision.id)? {
+            transaction.commit()?;
+            return if stored == *decision {
+                Ok(stored)
+            } else {
+                Err(StoreError::DecisionIdConflict(decision.id))
+            };
+        }
+        require_thread(&transaction, decision.thread_id)?;
+        for agent_id in &decision.participants {
+            require_active_thread_membership(&transaction, decision.thread_id, *agent_id)?;
+        }
+        if let DecisionOwner::Agent(agent_id) = decision.decision_owner {
+            require_active_agent(&transaction, agent_id)?;
+        }
+        if let Some(superseded_id) = decision.supersedes_decision_id {
+            let superseded = require_decision(&transaction, superseded_id)?;
+            if superseded.thread_id != decision.thread_id {
+                return Err(StoreError::DecisionSupersedeOutOfThread {
+                    decision_id: decision.id,
+                    superseded_id,
+                });
+            }
+            mark_decision_superseded(&transaction, superseded_id, &decision.updated_at)?;
+        }
+        insert_decision(&transaction, decision)?;
+        transaction.commit()?;
+        Ok(decision.clone())
+    }
+
+    /// Settle a decision. An ownership outcome may name the agent that ends up
+    /// owning the disputed work, which also closes the escalated handoff.
+    pub fn decide(
+        &mut self,
+        decision_id: DecisionId,
+        outcome: &DecisionOutcome,
+        decided_at: &str,
+    ) -> Result<Decision, StoreError> {
+        require_decision_timestamp(decided_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut decision = require_decision(&transaction, decision_id)?;
+        if !matches!(
+            decision.status,
+            DecisionStatus::Pending | DecisionStatus::NeedsDecision
+        ) {
+            return Err(StoreError::InvalidDecisionTransition {
+                decision_id,
+                from: decision.status,
+                to: DecisionStatus::Decided,
+            });
+        }
+        if outcome.decided_by != decision.decision_owner {
+            return Err(StoreError::DecisionOwnerMismatch {
+                decision_id,
+                expected: decision.decision_owner,
+            });
+        }
+        decision.decision = Some(outcome.decision.clone());
+        decision.reason.clone_from(&outcome.reason);
+        decision
+            .selected_proposal_id
+            .clone_from(&outcome.selected_proposal_id);
+        if !outcome.evidence.is_empty() {
+            decision.evidence.clone_from(&outcome.evidence);
+        }
+        decision.status = DecisionStatus::Decided;
+        decision.updated_at = decided_at.into();
+        decision.validate()?;
+        update_decision(&transaction, &decision)?;
+        if let Some(proposal_id) = decision.selected_proposal_id {
+            let proposal = require_proposal(&transaction, proposal_id)?;
+            if proposal.thread_id != decision.thread_id {
+                return Err(StoreError::ProposalOutOfThread {
+                    proposal_id,
+                    thread_id: decision.thread_id,
+                });
+            }
+            set_proposal_status(
+                &transaction,
+                proposal_id,
+                ProposalStatus::Accepted,
+                decided_at,
+            )?;
+        }
+
+        if let Some(mut handoff) = get_handoff_for_decision(&transaction, decision_id)? {
+            if let Some(owner_agent_id) = outcome.assigned_owner_id {
+                assign_work_owner(&transaction, handoff.work_id, owner_agent_id, decided_at)?;
+            }
+            handoff.status = HandoffStatus::Resolved;
+            handoff.updated_at = decided_at.into();
+            handoff.validate()?;
+            update_handoff(&transaction, &handoff)?;
+        } else if outcome.assigned_owner_id.is_some() {
+            return Err(StoreError::DecisionHasNoHandoff(decision_id));
+        }
+        transaction.commit()?;
+        Ok(decision)
+    }
+
+    /// Turn a settled decision into executable work. The conversion is
+    /// explicit, links every generated work item back to the decision, and a
+    /// replay of the same request creates nothing new.
+    pub fn convert_decision_to_work(
+        &mut self,
+        decision_id: DecisionId,
+        items: &[DecisionWork],
+        created_at: &str,
+    ) -> Result<Vec<WorkItem>, StoreError> {
+        require_work_timestamp(created_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let decision = require_decision(&transaction, decision_id)?;
+        if decision.status != DecisionStatus::Decided {
+            return Err(StoreError::DecisionNotDecided {
+                decision_id,
+                status: decision.status,
+            });
+        }
+
+        let mut created = Vec::with_capacity(items.len());
+        for item in items {
+            let work = WorkItem {
+                id: item.work_id,
+                conversation_id: decision.thread_id,
+                title: item.title.clone(),
+                goal: item.goal.clone(),
+                status: WorkStatus::Open,
+                owner_agent_id: item.owner_agent_id,
+                is_primary: false,
+                created_at: created_at.into(),
+                updated_at: created_at.into(),
+                completed_at: None,
+            };
+            work.validate()?;
+            match get_work_item(&transaction, item.work_id)? {
+                Some(stored) => {
+                    // Only work this decision already generated may be reused.
+                    if !decision_generated_work(&transaction, decision_id, item.work_id)?
+                        || stored.conversation_id != work.conversation_id
+                        || stored.title != work.title
+                        || stored.goal != work.goal
+                        || stored.owner_agent_id != work.owner_agent_id
+                    {
+                        return Err(StoreError::DecisionWorkConflict {
+                            decision_id,
+                            work_id: item.work_id,
+                        });
+                    }
+                    created.push(stored);
+                }
+                None => {
+                    if let Some(owner_agent_id) = item.owner_agent_id {
+                        require_active_agent(&transaction, owner_agent_id)?;
+                        require_active_conversation_membership(
+                            &transaction,
+                            decision.thread_id,
+                            item.work_id,
+                            owner_agent_id,
+                        )?;
+                    }
+                    insert_work_item(&transaction, &work)?;
+                    transaction.execute(
+                        "INSERT INTO decision_work_items(decision_id, work_id, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            decision_id.to_string(),
+                            item.work_id.to_string(),
+                            created_at
+                        ],
+                    )?;
+                    created.push(work);
+                }
+            }
+        }
+
+        for item in items {
+            for upstream_work_id in &item.depends_on {
+                add_work_dependency(&transaction, *upstream_work_id, item.work_id, created_at)?;
+            }
+        }
+        transaction.commit()?;
+        Ok(created)
+    }
+
+    pub fn list_decision_work(&self, decision_id: DecisionId) -> Result<Vec<WorkItem>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT work.id, work.conversation_id, work.title, work.goal, work.status,
+                    work.owner_agent_id, work.is_primary, work.created_at, work.updated_at,
+                    work.completed_at
+             FROM decision_work_items AS link
+             JOIN work_items AS work ON work.id = link.work_id
+             WHERE link.decision_id = ?1
+             ORDER BY link.created_at, work.id",
+            params![decision_id.to_string()],
+            records::work_item,
+        )
+    }
+
+    pub fn get_decision(&self, decision_id: DecisionId) -> Result<Option<Decision>, StoreError> {
+        get_decision(&self.connection, decision_id)
+    }
+
+    pub fn list_decisions_for_thread(
+        &self,
+        thread_id: ConversationId,
+    ) -> Result<Vec<Decision>, StoreError> {
+        query_all(
+            &self.connection,
+            &format!("{DECISION_COLUMNS} WHERE thread_id = ?1 ORDER BY created_at, id"),
+            params![thread_id.to_string()],
+            records::decision,
+        )
+    }
+
+    pub fn get_handoff(&self, handoff_id: HandoffId) -> Result<Option<Handoff>, StoreError> {
+        get_handoff(&self.connection, handoff_id)
+    }
+
+    pub fn list_handoffs_for_work(&self, work_id: WorkItemId) -> Result<Vec<Handoff>, StoreError> {
+        query_all(
+            &self.connection,
+            &format!("{HANDOFF_COLUMNS} WHERE work_id = ?1 ORDER BY created_at, id"),
+            params![work_id.to_string()],
+            records::handoff,
+        )
     }
 
     pub fn insert_session_binding(&self, binding: &SessionBinding) -> Result<(), StoreError> {
@@ -2522,6 +3125,441 @@ fn get_publish_by_natural_key(
     )
 }
 
+fn add_work_dependency(
+    connection: &Connection,
+    upstream_work_id: WorkItemId,
+    downstream_work_id: WorkItemId,
+    created_at: &str,
+) -> Result<WorkDependency, StoreError> {
+    if upstream_work_id == downstream_work_id {
+        return Err(StoreError::WorkDependencySelf(upstream_work_id));
+    }
+    let dependency = WorkDependency {
+        upstream_work_id,
+        downstream_work_id,
+        dependency_type: crate::domain::DependencyType::Requires,
+        status: crate::domain::DependencyStatus::Waiting,
+        result_id: None,
+        created_at: created_at.into(),
+    };
+    dependency.validate()?;
+    require_work_item(connection, upstream_work_id)?;
+    require_work_item(connection, downstream_work_id)?;
+    if let Some(stored) = get_work_dependency(connection, upstream_work_id, downstream_work_id)? {
+        if stored.created_at == dependency.created_at {
+            return Ok(stored);
+        }
+        return Err(StoreError::WorkDependencyConflict {
+            upstream_work_id,
+            downstream_work_id,
+        });
+    }
+    let cyclic: bool = connection.query_row(
+        "WITH RECURSIVE reachable(work_id) AS (
+             SELECT downstream_work_id
+             FROM work_dependencies
+             WHERE upstream_work_id = ?1
+             UNION
+             SELECT dependency.downstream_work_id
+             FROM work_dependencies AS dependency
+             JOIN reachable ON dependency.upstream_work_id = reachable.work_id
+         )
+         SELECT EXISTS(SELECT 1 FROM reachable WHERE work_id = ?2)",
+        params![downstream_work_id.to_string(), upstream_work_id.to_string()],
+        |row| row.get(0),
+    )?;
+    if cyclic {
+        return Err(StoreError::WorkDependencyCycle {
+            upstream_work_id,
+            downstream_work_id,
+        });
+    }
+    connection.execute(
+        "INSERT INTO work_dependencies(
+            upstream_work_id, downstream_work_id, dependency_type, status, result_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            dependency.upstream_work_id.to_string(),
+            dependency.downstream_work_id.to_string(),
+            dependency.dependency_type.to_string(),
+            dependency.status.to_string(),
+            dependency.result_id.map(|id| id.to_string()),
+            dependency.created_at,
+        ],
+    )?;
+    Ok(dependency)
+}
+
+fn assign_work_owner(
+    connection: &Connection,
+    work_id: WorkItemId,
+    owner_agent_id: AgentId,
+    assigned_at: &str,
+) -> Result<WorkItem, StoreError> {
+    let mut work = require_work_item(connection, work_id)?;
+    if work.owner_agent_id == Some(owner_agent_id) {
+        return Ok(work);
+    }
+    if work.status.is_terminal() {
+        return Err(StoreError::TerminalWorkOwnerImmutable(work_id));
+    }
+    require_active_agent(connection, owner_agent_id)?;
+    require_active_conversation_membership(
+        connection,
+        work.conversation_id,
+        work_id,
+        owner_agent_id,
+    )?;
+    work.owner_agent_id = Some(owner_agent_id);
+    work.updated_at = assigned_at.into();
+    work.validate()?;
+    connection.execute(
+        "UPDATE work_items SET owner_agent_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![work_id.to_string(), owner_agent_id.to_string(), assigned_at],
+    )?;
+    Ok(work)
+}
+
+fn require_handoff_timestamp(timestamp: &str) -> Result<(), StoreError> {
+    if timestamp.trim().is_empty() {
+        Err(StoreError::InvalidHandoffTimestamp)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_handoff(connection: &Connection, handoff_id: HandoffId) -> Result<Handoff, StoreError> {
+    get_handoff(connection, handoff_id)?.ok_or(StoreError::HandoffNotFound(handoff_id))
+}
+
+fn get_handoff(
+    connection: &Connection,
+    handoff_id: HandoffId,
+) -> Result<Option<Handoff>, StoreError> {
+    query_optional(
+        connection,
+        &format!("{HANDOFF_COLUMNS} WHERE id = ?1"),
+        params![handoff_id.to_string()],
+        records::handoff,
+    )
+}
+
+fn open_handoff_exists(connection: &Connection, work_id: WorkItemId) -> Result<bool, StoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM handoffs
+            WHERE work_id = ?1
+              AND status IN ('proposed', 'rejected', 'partial', 'disputed')
+        )",
+        params![work_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+fn insert_handoff(connection: &Connection, handoff: &Handoff) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO handoffs(
+            id, thread_id, work_id, from_agent_id, to_agent_id, status, reason,
+            evidence_json, owned_scope_json, rejected_scope_json, proposed_owner_id,
+            round_count, decision_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            handoff.id.to_string(),
+            handoff.thread_id.to_string(),
+            handoff.work_id.to_string(),
+            handoff.from_agent_id.to_string(),
+            handoff.to_agent_id.to_string(),
+            handoff.status.to_string(),
+            handoff.reason,
+            serde_json::to_string(&handoff.evidence)?,
+            serde_json::to_string(&handoff.owned_scope)?,
+            serde_json::to_string(&handoff.rejected_scope)?,
+            handoff.proposed_owner_id.map(|id| id.to_string()),
+            handoff.round_count,
+            handoff.decision_id.map(|id| id.to_string()),
+            handoff.created_at,
+            handoff.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_handoff(connection: &Connection, handoff: &Handoff) -> Result<(), StoreError> {
+    connection.execute(
+        "UPDATE handoffs
+         SET status = ?2, reason = ?3, evidence_json = ?4, owned_scope_json = ?5,
+             rejected_scope_json = ?6, proposed_owner_id = ?7, round_count = ?8,
+             decision_id = ?9, updated_at = ?10
+         WHERE id = ?1",
+        params![
+            handoff.id.to_string(),
+            handoff.status.to_string(),
+            handoff.reason,
+            serde_json::to_string(&handoff.evidence)?,
+            serde_json::to_string(&handoff.owned_scope)?,
+            serde_json::to_string(&handoff.rejected_scope)?,
+            handoff.proposed_owner_id.map(|id| id.to_string()),
+            handoff.round_count,
+            handoff.decision_id.map(|id| id.to_string()),
+            handoff.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn require_proposal_timestamp(timestamp: &str) -> Result<(), StoreError> {
+    if timestamp.trim().is_empty() {
+        Err(StoreError::InvalidProposalTimestamp)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_proposal(
+    connection: &Connection,
+    proposal_id: ProposalId,
+) -> Result<Proposal, StoreError> {
+    get_proposal(connection, proposal_id)?.ok_or(StoreError::ProposalNotFound(proposal_id))
+}
+
+fn get_proposal(
+    connection: &Connection,
+    proposal_id: ProposalId,
+) -> Result<Option<Proposal>, StoreError> {
+    query_optional(
+        connection,
+        &format!("{PROPOSAL_COLUMNS} WHERE id = ?1"),
+        params![proposal_id.to_string()],
+        records::proposal,
+    )
+}
+
+fn get_proposal_response(
+    connection: &Connection,
+    response_id: ProposalResponseId,
+) -> Result<Option<ProposalResponse>, StoreError> {
+    query_optional(
+        connection,
+        &format!("{PROPOSAL_RESPONSE_COLUMNS} WHERE id = ?1"),
+        params![response_id.to_string()],
+        records::proposal_response,
+    )
+}
+
+fn set_proposal_status(
+    connection: &Connection,
+    proposal_id: ProposalId,
+    target: ProposalStatus,
+    changed_at: &str,
+) -> Result<Proposal, StoreError> {
+    let mut proposal = require_proposal(connection, proposal_id)?;
+    if proposal.status == target {
+        return Ok(proposal);
+    }
+    if !proposal.status.is_live() {
+        return Err(StoreError::InvalidProposalTransition {
+            proposal_id,
+            from: proposal.status,
+            to: target,
+        });
+    }
+    proposal.status = target;
+    proposal.updated_at = changed_at.into();
+    proposal.validate()?;
+    connection.execute(
+        "UPDATE proposals SET status = ?2, updated_at = ?3 WHERE id = ?1",
+        params![proposal_id.to_string(), target.to_string(), changed_at],
+    )?;
+    Ok(proposal)
+}
+
+fn insert_proposal(connection: &Connection, proposal: &Proposal) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO proposals(
+            id, thread_id, author_agent_id, title, problem_statement, approach,
+            benefits_json, costs_json, risks_json, assumptions_json, evidence_json,
+            status, supersedes_proposal_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            proposal.id.to_string(),
+            proposal.thread_id.to_string(),
+            proposal.author_agent_id.to_string(),
+            proposal.title,
+            proposal.problem_statement,
+            proposal.approach,
+            serde_json::to_string(&proposal.benefits)?,
+            serde_json::to_string(&proposal.costs)?,
+            serde_json::to_string(&proposal.risks)?,
+            serde_json::to_string(&proposal.assumptions)?,
+            serde_json::to_string(&proposal.evidence)?,
+            proposal.status.to_string(),
+            proposal.supersedes_proposal_id.map(|id| id.to_string()),
+            proposal.created_at,
+            proposal.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_proposal_response(
+    connection: &Connection,
+    response: &ProposalResponse,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO proposal_responses(
+            id, proposal_id, agent_id, response_type, reason, evidence_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            response.id.to_string(),
+            response.proposal_id.to_string(),
+            response.agent_id.to_string(),
+            response.response_type.to_string(),
+            response.reason,
+            serde_json::to_string(&response.evidence)?,
+            response.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn decision_generated_work(
+    connection: &Connection,
+    decision_id: DecisionId,
+    work_id: WorkItemId,
+) -> Result<bool, StoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM decision_work_items WHERE decision_id = ?1 AND work_id = ?2
+        )",
+        params![decision_id.to_string(), work_id.to_string()],
+        |row| row.get(0),
+    )?)
+}
+
+fn require_decision_timestamp(timestamp: &str) -> Result<(), StoreError> {
+    if timestamp.trim().is_empty() {
+        Err(StoreError::InvalidDecisionTimestamp)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_decision(
+    connection: &Connection,
+    decision_id: DecisionId,
+) -> Result<Decision, StoreError> {
+    get_decision(connection, decision_id)?.ok_or(StoreError::DecisionNotFound(decision_id))
+}
+
+fn get_decision(
+    connection: &Connection,
+    decision_id: DecisionId,
+) -> Result<Option<Decision>, StoreError> {
+    query_optional(
+        connection,
+        &format!("{DECISION_COLUMNS} WHERE id = ?1"),
+        params![decision_id.to_string()],
+        records::decision,
+    )
+}
+
+fn get_handoff_for_decision(
+    connection: &Connection,
+    decision_id: DecisionId,
+) -> Result<Option<Handoff>, StoreError> {
+    query_optional(
+        connection,
+        &format!("{HANDOFF_COLUMNS} WHERE decision_id = ?1"),
+        params![decision_id.to_string()],
+        records::handoff,
+    )
+}
+
+fn decision_participants(decision: &Decision) -> Result<String, StoreError> {
+    let participants: Vec<String> = decision
+        .participants
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    Ok(serde_json::to_string(&participants)?)
+}
+
+fn insert_decision(connection: &Connection, decision: &Decision) -> Result<(), StoreError> {
+    decision.validate()?;
+    connection.execute(
+        "INSERT INTO decisions(
+            id, thread_id, decision_type, title, decision, reason, selected_proposal_id,
+            alternatives_json, evidence_json, decision_owner, participants_json, status,
+            supersedes_decision_id, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            decision.id.to_string(),
+            decision.thread_id.to_string(),
+            decision.decision_type.to_string(),
+            decision.title,
+            decision.decision,
+            decision.reason,
+            decision.selected_proposal_id.map(|id| id.to_string()),
+            serde_json::to_string(&decision.alternatives)?,
+            serde_json::to_string(&decision.evidence)?,
+            decision.decision_owner.to_string(),
+            decision_participants(decision)?,
+            decision.status.to_string(),
+            decision.supersedes_decision_id.map(|id| id.to_string()),
+            decision.created_at,
+            decision.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_decision(connection: &Connection, decision: &Decision) -> Result<(), StoreError> {
+    decision.validate()?;
+    connection.execute(
+        "UPDATE decisions
+         SET decision = ?2, reason = ?3, selected_proposal_id = ?4, alternatives_json = ?5,
+             evidence_json = ?6, participants_json = ?7, status = ?8, updated_at = ?9
+         WHERE id = ?1",
+        params![
+            decision.id.to_string(),
+            decision.decision,
+            decision.reason,
+            decision.selected_proposal_id.map(|id| id.to_string()),
+            serde_json::to_string(&decision.alternatives)?,
+            serde_json::to_string(&decision.evidence)?,
+            decision_participants(decision)?,
+            decision.status.to_string(),
+            decision.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn mark_decision_superseded(
+    connection: &Connection,
+    decision_id: DecisionId,
+    superseded_at: &str,
+) -> Result<(), StoreError> {
+    let mut decision = require_decision(connection, decision_id)?;
+    if decision.status == DecisionStatus::Superseded {
+        return Ok(());
+    }
+    if decision.status != DecisionStatus::Decided {
+        return Err(StoreError::InvalidDecisionTransition {
+            decision_id,
+            from: decision.status,
+            to: DecisionStatus::Superseded,
+        });
+    }
+    // A superseded decision keeps the outcome it once stated: the audit trail
+    // is the point of recording it.
+    decision.status = DecisionStatus::Superseded;
+    decision.updated_at = superseded_at.into();
+    decision.validate()?;
+    update_decision(connection, &decision)?;
+    Ok(())
+}
+
 fn require_work_item(connection: &Connection, work_id: WorkItemId) -> Result<WorkItem, StoreError> {
     get_work_item(connection, work_id)?.ok_or(StoreError::WorkItemNotFound(work_id))
 }
@@ -2999,11 +4037,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_eleven() {
+    fn fresh_database_has_schema_version_fifteen() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 15);
     }
 
     #[test]
@@ -3373,14 +4411,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            11
+            15
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            11
+            15
         );
     }
 
@@ -4049,7 +5087,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 11);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 15);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -4537,15 +5575,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (12);",
+                 INSERT INTO schema_migrations(version) VALUES (16);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 12,
-                supported: 11,
+                found: 16,
+                supported: 15,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

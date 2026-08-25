@@ -58,6 +58,10 @@ typed_id!(
     SessionBindingId,
     CheckpointId,
     MemoryId,
+    HandoffId,
+    DecisionId,
+    ProposalId,
+    ProposalResponseId,
 );
 
 #[cfg(test)]
@@ -88,6 +92,10 @@ mod tests {
             SessionBindingId,
             CheckpointId,
             MemoryId,
+            HandoffId,
+            DecisionId,
+            ProposalId,
+            ProposalResponseId,
         );
     }
 

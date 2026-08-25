@@ -1,8 +1,9 @@
 use super::StoreError;
 use crate::domain::{
-    Agent, Checkpoint, Conversation, ConversationMember, DomainError, Memory, Message,
-    MessageDelivery, PermissionDecision, PermissionOption, PermissionOutcome, Publish, Room,
-    RoomMember, SessionBinding, SessionRecovery, WorkDependency, WorkItem, WorkResult,
+    Agent, Checkpoint, Conversation, ConversationMember, Decision, DomainError, Handoff, Memory,
+    Message, MessageDelivery, PermissionDecision, PermissionOption, PermissionOutcome, Proposal,
+    ProposalResponse, Publish, Room, RoomMember, SessionBinding, SessionRecovery, WorkDependency,
+    WorkItem, WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -182,6 +183,96 @@ pub(super) fn work_result(row: &Row<'_>) -> Result<WorkResult, StoreError> {
     };
     result.validate()?;
     Ok(result)
+}
+
+pub(super) fn handoff(row: &Row<'_>) -> Result<Handoff, StoreError> {
+    let round_count: i64 = row.get(11)?;
+    let handoff = Handoff {
+        id: id(row.get(0)?)?,
+        thread_id: id(row.get(1)?)?,
+        work_id: id(row.get(2)?)?,
+        from_agent_id: id(row.get(3)?)?,
+        to_agent_id: id(row.get(4)?)?,
+        status: domain_enum(row.get(5)?)?,
+        reason: row.get(6)?,
+        evidence: string_vec(row.get(7)?)?,
+        owned_scope: string_vec(row.get(8)?)?,
+        rejected_scope: string_vec(row.get(9)?)?,
+        proposed_owner_id: optional_id(row.get(10)?)?,
+        round_count: round_count
+            .try_into()
+            .map_err(|_| StoreError::IntegerOutOfRange {
+                field: "handoffs.round_count",
+                value: i128::from(round_count),
+            })?,
+        decision_id: optional_id(row.get(12)?)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    };
+    handoff.validate()?;
+    Ok(handoff)
+}
+
+pub(super) fn proposal(row: &Row<'_>) -> Result<Proposal, StoreError> {
+    let proposal = Proposal {
+        id: id(row.get(0)?)?,
+        thread_id: id(row.get(1)?)?,
+        author_agent_id: id(row.get(2)?)?,
+        title: row.get(3)?,
+        problem_statement: row.get(4)?,
+        approach: row.get(5)?,
+        benefits: string_vec(row.get(6)?)?,
+        costs: string_vec(row.get(7)?)?,
+        risks: string_vec(row.get(8)?)?,
+        assumptions: string_vec(row.get(9)?)?,
+        evidence: string_vec(row.get(10)?)?,
+        status: domain_enum(row.get(11)?)?,
+        supersedes_proposal_id: optional_id(row.get(12)?)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    };
+    proposal.validate()?;
+    Ok(proposal)
+}
+
+pub(super) fn proposal_response(row: &Row<'_>) -> Result<ProposalResponse, StoreError> {
+    let response = ProposalResponse {
+        id: id(row.get(0)?)?,
+        proposal_id: id(row.get(1)?)?,
+        agent_id: id(row.get(2)?)?,
+        response_type: domain_enum(row.get(3)?)?,
+        reason: row.get(4)?,
+        evidence: string_vec(row.get(5)?)?,
+        created_at: row.get(6)?,
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+pub(super) fn decision(row: &Row<'_>) -> Result<Decision, StoreError> {
+    let participants: Vec<String> = string_vec(row.get(10)?)?;
+    let decision = Decision {
+        id: id(row.get(0)?)?,
+        thread_id: id(row.get(1)?)?,
+        decision_type: domain_enum(row.get(2)?)?,
+        title: row.get(3)?,
+        decision: row.get(4)?,
+        reason: row.get(5)?,
+        selected_proposal_id: optional_id(row.get(6)?)?,
+        alternatives: string_vec(row.get(7)?)?,
+        evidence: string_vec(row.get(8)?)?,
+        decision_owner: domain_enum(row.get(9)?)?,
+        participants: participants
+            .into_iter()
+            .map(id)
+            .collect::<Result<_, StoreError>>()?,
+        status: domain_enum(row.get(11)?)?,
+        supersedes_decision_id: optional_id(row.get(12)?)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+    };
+    decision.validate()?;
+    Ok(decision)
 }
 
 pub(super) fn publish(row: &Row<'_>) -> Result<Publish, StoreError> {

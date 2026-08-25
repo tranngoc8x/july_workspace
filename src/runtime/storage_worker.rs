@@ -1,16 +1,17 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
-    BuildRecoveryCapsule, CollaborationError, CollaborationRuntime, DependencyError,
-    DependencyOutcome, DependencyRuntime, MembershipChange, MembershipState, PublishError,
-    PublishRuntime, PublishedResult, RecoveryCapsule, RecoveryError, RecoveryInput,
-    RecoveryRuntime, WorkError, WorkRuntime, format_recovery_capsule,
+    BuildRecoveryCapsule, CollaborationError, CollaborationRuntime, DeliberationError,
+    DeliberationRuntime, DependencyError, DependencyOutcome, DependencyRuntime, MembershipChange,
+    MembershipState, PublishError, PublishRuntime, PublishedResult, RecoveryCapsule, RecoveryError,
+    RecoveryInput, RecoveryRuntime, WorkError, WorkRuntime, format_recovery_capsule,
 };
 use crate::domain::{
-    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, MemberType,
-    Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision,
-    Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId,
-    SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
-    WorkStatus,
+    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Decision,
+    DecisionId, DecisionOutcome, DecisionWork, Handoff, HandoffChallenge, HandoffId,
+    HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery,
+    MessageId, PermissionDecision, Proposal, ProposalId, ProposalResponse, Publish, PublishId,
+    ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
+    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -58,6 +59,21 @@ enum Command {
         Reply<(Publish, WorkResult)>,
     ),
     ListPublishedResults(ConversationId, Reply<Vec<(Publish, WorkResult)>>),
+    ProposeHandoff(Box<Handoff>, Reply<Handoff>),
+    RespondToHandoff(HandoffId, Box<HandoffResponse>, String, Reply<Handoff>),
+    ChallengeHandoff(
+        HandoffId,
+        Box<HandoffChallenge>,
+        String,
+        Reply<(Handoff, Option<Decision>)>,
+    ),
+    ResolveHandoff(HandoffId, AgentId, String, Reply<Handoff>),
+    CreateProposal(Box<Proposal>, Reply<Proposal>),
+    RespondToProposal(Box<ProposalResponse>, Reply<ProposalResponse>),
+    WithdrawProposal(ProposalId, AgentId, String, Reply<Proposal>),
+    RecordDecision(Box<Decision>, Reply<Decision>),
+    DecideDecision(DecisionId, Box<DecisionOutcome>, String, Reply<Decision>),
+    ConvertDecisionToWork(DecisionId, Vec<DecisionWork>, String, Reply<Vec<WorkItem>>),
     AdmitThreadSession(
         ConversationId,
         AgentId,
@@ -568,6 +584,21 @@ impl StorageHandle {
             .await
             .map_err(|_| CollaborationError::Runtime("storage owner channel closed".into()))?
             .map_err(map_store_error)
+    }
+
+    async fn deliberation_request<R>(
+        &self,
+        build: impl FnOnce(Reply<R>) -> Command,
+    ) -> Result<R, DeliberationError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(build(reply))
+            .await
+            .map_err(|_| DeliberationError::Runtime("storage owner channel closed".into()))?;
+        response
+            .await
+            .map_err(|_| DeliberationError::Runtime("storage owner channel closed".into()))?
+            .map_err(map_deliberation_error)
     }
 
     async fn work_request<R>(
@@ -1125,6 +1156,37 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::ListPublishedResults(target_conversation_id, reply) => {
                 let _ = reply.send(store.list_published_results(target_conversation_id));
             }
+            Command::ProposeHandoff(handoff, reply) => {
+                let _ = reply.send(store.propose_handoff(&handoff));
+            }
+            Command::RespondToHandoff(handoff_id, response, responded_at, reply) => {
+                let _ = reply.send(store.respond_to_handoff(handoff_id, &response, &responded_at));
+            }
+            Command::ChallengeHandoff(handoff_id, challenge, challenged_at, reply) => {
+                let _ = reply.send(store.challenge_handoff(handoff_id, &challenge, &challenged_at));
+            }
+            Command::ResolveHandoff(handoff_id, agent_id, resolved_at, reply) => {
+                let _ = reply.send(store.resolve_handoff(handoff_id, agent_id, &resolved_at));
+            }
+            Command::CreateProposal(proposal, reply) => {
+                let _ = reply.send(store.create_proposal(&proposal));
+            }
+            Command::RespondToProposal(response, reply) => {
+                let _ = reply.send(store.respond_to_proposal(&response));
+            }
+            Command::WithdrawProposal(proposal_id, agent_id, withdrawn_at, reply) => {
+                let _ = reply.send(store.withdraw_proposal(proposal_id, agent_id, &withdrawn_at));
+            }
+            Command::RecordDecision(decision, reply) => {
+                let _ = reply.send(store.record_decision(&decision));
+            }
+            Command::DecideDecision(decision_id, outcome, decided_at, reply) => {
+                let _ = reply.send(store.decide(decision_id, &outcome, &decided_at));
+            }
+            Command::ConvertDecisionToWork(decision_id, items, created_at, reply) => {
+                let _ =
+                    reply.send(store.convert_decision_to_work(decision_id, &items, &created_at));
+            }
             Command::AdmitThreadSession(thread_id, agent_id, admitted_at, reply) => {
                 let _ = reply.send(store.admit_thread_session(thread_id, agent_id, &admitted_at));
             }
@@ -1473,6 +1535,151 @@ fn map_dependency_error(error: StoreError) -> DependencyError {
             "work_dependency.created_at",
         )) => DependencyError::InvalidTimestamp,
         error => DependencyError::Runtime(error.to_string()),
+    }
+}
+
+fn map_deliberation_error(error: StoreError) -> DeliberationError {
+    match &error {
+        StoreError::HandoffNotFound(_)
+        | StoreError::ProposalNotFound(_)
+        | StoreError::DecisionNotFound(_)
+        | StoreError::WorkItemNotFound(_)
+        | StoreError::ThreadNotFound(_)
+        | StoreError::AgentNotFound(_) => DeliberationError::NotFound(error.to_string()),
+        StoreError::HandoffIdConflict(_)
+        | StoreError::HandoffAlreadyOpen(_)
+        | StoreError::ProposalIdConflict(_)
+        | StoreError::ProposalResponseIdConflict(_)
+        | StoreError::DecisionIdConflict(_)
+        | StoreError::DecisionWorkConflict { .. }
+        | StoreError::WorkDependencyConflict { .. } => {
+            DeliberationError::Conflict(error.to_string())
+        }
+        StoreError::HandoffRespondentMismatch { .. }
+        | StoreError::HandoffSourceMismatch { .. }
+        | StoreError::ProposalAuthorMismatch { .. }
+        | StoreError::DecisionOwnerMismatch { .. }
+        | StoreError::ThreadMembershipRequired { .. }
+        | StoreError::RoomMembershipRequired { .. }
+        | StoreError::WorkOwnerScopeRequired { .. }
+        | StoreError::AgentInactive(_) => DeliberationError::NotPermitted(error.to_string()),
+        StoreError::InvalidHandoffTransition { .. }
+        | StoreError::InvalidProposalTransition { .. }
+        | StoreError::InvalidDecisionTransition { .. }
+        | StoreError::ProposalNotLive { .. }
+        | StoreError::DecisionNotDecided { .. }
+        | StoreError::TerminalWorkOwnerImmutable(_) => {
+            DeliberationError::InvalidTransition(error.to_string())
+        }
+        StoreError::Domain(_)
+        | StoreError::HandoffChallengeMissingEvidence(_)
+        | StoreError::HandoffWorkOutOfThread { .. }
+        | StoreError::ProposalOutOfThread { .. }
+        | StoreError::ProposalSupersedeOutOfThread { .. }
+        | StoreError::DecisionSupersedeOutOfThread { .. }
+        | StoreError::DecisionHasNoHandoff(_)
+        | StoreError::InvalidHandoffTimestamp
+        | StoreError::InvalidProposalTimestamp
+        | StoreError::InvalidDecisionTimestamp
+        | StoreError::InvalidWorkTimestamp => DeliberationError::Invalid(error.to_string()),
+        _ => DeliberationError::Runtime(error.to_string()),
+    }
+}
+
+impl DeliberationRuntime for StorageWorker {
+    async fn propose_handoff(&mut self, handoff: Handoff) -> Result<Handoff, DeliberationError> {
+        self.deliberation_request(|reply| Command::ProposeHandoff(Box::new(handoff), reply))
+            .await
+    }
+
+    async fn respond_to_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        response: HandoffResponse,
+        responded_at: String,
+    ) -> Result<Handoff, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::RespondToHandoff(handoff_id, Box::new(response), responded_at, reply)
+        })
+        .await
+    }
+
+    async fn challenge_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        challenge: HandoffChallenge,
+        challenged_at: String,
+    ) -> Result<(Handoff, Option<Decision>), DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::ChallengeHandoff(handoff_id, Box::new(challenge), challenged_at, reply)
+        })
+        .await
+    }
+
+    async fn resolve_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        agent_id: AgentId,
+        resolved_at: String,
+    ) -> Result<Handoff, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::ResolveHandoff(handoff_id, agent_id, resolved_at, reply)
+        })
+        .await
+    }
+
+    async fn create_proposal(&mut self, proposal: Proposal) -> Result<Proposal, DeliberationError> {
+        self.deliberation_request(|reply| Command::CreateProposal(Box::new(proposal), reply))
+            .await
+    }
+
+    async fn respond_to_proposal(
+        &mut self,
+        response: ProposalResponse,
+    ) -> Result<ProposalResponse, DeliberationError> {
+        self.deliberation_request(|reply| Command::RespondToProposal(Box::new(response), reply))
+            .await
+    }
+
+    async fn withdraw_proposal(
+        &mut self,
+        proposal_id: ProposalId,
+        agent_id: AgentId,
+        withdrawn_at: String,
+    ) -> Result<Proposal, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::WithdrawProposal(proposal_id, agent_id, withdrawn_at, reply)
+        })
+        .await
+    }
+
+    async fn record_decision(&mut self, decision: Decision) -> Result<Decision, DeliberationError> {
+        self.deliberation_request(|reply| Command::RecordDecision(Box::new(decision), reply))
+            .await
+    }
+
+    async fn decide(
+        &mut self,
+        decision_id: DecisionId,
+        outcome: DecisionOutcome,
+        decided_at: String,
+    ) -> Result<Decision, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::DecideDecision(decision_id, Box::new(outcome), decided_at, reply)
+        })
+        .await
+    }
+
+    async fn convert_decision_to_work(
+        &mut self,
+        decision_id: DecisionId,
+        items: Vec<DecisionWork>,
+        created_at: String,
+    ) -> Result<Vec<WorkItem>, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::ConvertDecisionToWork(decision_id, items, created_at, reply)
+        })
+        .await
     }
 }
 

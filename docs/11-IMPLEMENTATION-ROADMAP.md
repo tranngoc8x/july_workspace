@@ -273,6 +273,33 @@ roadmap phases.
 
 ## Phase 6.5 — Agent Deliberation & Decision Protocol
 
+Status: implemented and verified.
+
+Implemented evidence:
+
+- Handoff ownership negotiation with ACCEPT/REJECT/PARTIAL, attached evidence,
+  alternate owner, one open negotiation per Work, and rejected work that is
+  never silently reassigned — migration `0012`, `tests/handoff_storage.rs`;
+- bounded disputes: a challenge inside the round budget reopens the proposal,
+  an exhausted budget marks the Handoff `DISPUTED`, opens a `NEEDS_DECISION`
+  ownership Decision and stops all further turns — migration `0013`,
+  `tests/decision_storage.rs`;
+- durable Decisions with user or named-agent owners, supersede chains that keep
+  the outcome they once stated, and ownership that moves only because a
+  Decision said so — `tests/decision_storage.rs`;
+- Proposals with SUPPORT/CHALLENGE/AMEND/REJECT, disagreement that must carry
+  actionable content, revision by supersede, and withdrawal — migration `0014`,
+  `tests/proposal_storage.rs`;
+- explicit, auditable and idempotent Decision → WorkItem/Dependency conversion —
+  migration `0015`, `tests/decision_work.rs`;
+- the application boundary `DeliberationService` over `StorageWorker` with
+  caller-actionable typed errors — `tests/deliberation_application.rs`;
+- the full section 16 scenario end to end, including loop prevention, restart
+  persistence and thread context isolation — `tests/deliberation_e2e.rs`.
+
+Phase 6.5 adds no CLI surface, no semantic facilitator, no Thread phase field,
+and no voting or scoring engine; those stay deferred as the plan requires.
+
 Detailed plan:
 
 ```text

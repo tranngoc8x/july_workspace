@@ -2,6 +2,13 @@
 
 ## Status
 
+**Implemented as Phase 6.5.** Handoff, bounded dispute, Proposal, Decision and
+Decision → Work all exist in storage (migrations `0012`-`0015`) behind
+`DeliberationService`. Deferred as planned: the semantic facilitator, a Thread
+phase field, voting/scoring, and any CLI surface.
+
+The original plan text follows unchanged.
+
 **Planned upgrade — deferred until the collaboration substrate is complete.**
 
 This plan must **not** expand the scope of the currently running Phase 2.

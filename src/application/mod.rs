@@ -2,6 +2,7 @@
 
 mod chat;
 mod collaboration;
+mod deliberation;
 mod dependency;
 mod dm;
 mod publish;
@@ -11,6 +12,7 @@ mod work;
 
 pub use chat::*;
 pub use collaboration::*;
+pub use deliberation::*;
 pub use dependency::*;
 pub use dm::*;
 pub use publish::*;
