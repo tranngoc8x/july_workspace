@@ -222,13 +222,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         examples: &["/help", "/help thread"],
     },
     CommandSpec {
-        name: "/quit",
-        aliases: &["/exit"],
+        name: "/exit",
+        aliases: &["/quit"],
         kind: Control,
         scopes: CommandScope::ALL,
         summary: "leave the July REPL",
-        usage: "/quit",
-        examples: &["/quit"],
+        usage: "/exit",
+        examples: &["/exit"],
     },
 ];
 
@@ -380,15 +380,15 @@ mod tests {
         assert!(resolve("/threading abc").is_none());
         assert!(resolve(" /status").is_none());
         assert!(resolve("hello").is_none());
-        assert_eq!(resolve("/quit").unwrap().0.name, "/quit");
-        assert_eq!(resolve("/exit").unwrap().0.name, "/quit");
+        assert_eq!(resolve("/exit").unwrap().0.name, "/exit");
+        assert_eq!(resolve("/quit").unwrap().0.name, "/exit");
     }
 
     #[test]
     fn find_accepts_bare_and_slashed_names() {
         assert_eq!(find("thread").unwrap().name, "/thread");
         assert_eq!(find("/publish").unwrap().name, "/publish");
-        assert_eq!(find("exit").unwrap().name, "/quit");
+        assert_eq!(find("quit").unwrap().name, "/exit");
         assert!(find("nope").is_none());
     }
 
@@ -405,8 +405,8 @@ mod tests {
 
     #[test]
     fn detailed_help_reports_registry_metadata() {
-        let rendered = help_command(find("quit").unwrap());
-        assert!(rendered.contains("aliases\n  /exit"));
+        let rendered = help_command(find("exit").unwrap());
+        assert!(rendered.contains("aliases\n  /quit"));
         assert!(rendered.contains("contexts\n  root, room, dm, thread"));
     }
 }

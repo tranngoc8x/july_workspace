@@ -810,7 +810,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         let arguments = arguments.to_owned();
         let arguments = arguments.as_str();
         match spec.name {
-            "/quit" if arguments.is_empty() => {
+            "/exit" if arguments.is_empty() => {
                 close_repl_context(live).await?;
                 return Ok(());
             }
@@ -2151,7 +2151,8 @@ async fn interact<C: ChatContext>(service: &mut C, agent_name: &str) -> Result<(
         let Some(line) = next_input_or_event(service, &mut lines).await? else {
             return Ok(());
         };
-        if line == "/quit" {
+        // The single-conversation stream shares the REPL's exit vocabulary.
+        if line == "/exit" || line == "/quit" {
             return Ok(());
         }
         if line.trim().is_empty() {

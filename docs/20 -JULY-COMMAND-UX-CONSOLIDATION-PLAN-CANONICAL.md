@@ -39,7 +39,7 @@ The following decisions are canonical for this consolidation:
 3. `/thread` is available from Room and Thread contexts.
 4. Thread creation uses `/thread new <title>` rather than a top-level `/thread new`.
 5. `/help` supports both `/help` and `/help <command>`.
-6. `/quit` is the canonical interactive exit command; `/exit` may be an alias.
+6. `/exit` is the canonical interactive exit command; `/quit` is an alias.
 7. `/back` means navigation-history pop only.
 8. `/publish` target resolution is deterministic; use `--to` when the destination is ambiguous.
 9. `/activity` is optional for this refactor.
@@ -138,7 +138,7 @@ Workspace
 
 General
   /help
-  /quit
+  /exit
 ```
 
 Room example:
@@ -721,7 +721,7 @@ Example:
     Inspection
     All
 
-/quit
+/exit
     Control
     All
 ```
@@ -742,7 +742,7 @@ Commands must declare valid contexts.
 /rooms
 /agents
 /help
-/quit
+/exit
 ```
 
 ### Room
@@ -769,7 +769,7 @@ Commands must declare valid contexts.
 /publish
 /help
 /back
-/quit
+/exit
 ```
 
 ### DM
@@ -780,7 +780,7 @@ Commands must declare valid contexts.
 /restart
 /help
 /back
-/quit
+/exit
 ```
 
 `/thread` requires a Room/Thread parent context. From a DM, use `/room <name>` first.
@@ -799,21 +799,21 @@ Use /room <name> first.
 
 ---
 
-## 12.5 `/quit`
+## 12.5 `/exit`
 
-`/quit` is the canonical command for leaving the interactive July REPL.
-
-```text
-/quit
-```
-
-Optional compatibility alias:
+`/exit` is the canonical command for leaving the interactive July REPL.
 
 ```text
 /exit
 ```
 
-may resolve to `/quit`, but `/quit` remains canonical.
+Compatibility alias:
+
+```text
+/quit
+```
+
+resolves to `/exit`, but `/exit` remains canonical.
 
 Scope:
 
@@ -821,7 +821,7 @@ Scope:
 Root | Room | Dm | Thread
 ```
 
-`/quit` exits the REPL only. It must not delete workspace state, remove memberships, mark work complete, or invent a separate shutdown path. The handler should delegate to the existing runtime/application shutdown flow.
+`/exit` exits the REPL only. It must not delete workspace state, remove memberships, mark work complete, or invent a separate shutdown path. The handler should delegate to the existing runtime/application shutdown flow.
 
 ---
 
@@ -912,8 +912,8 @@ Initial target:
 | `/thread new` | ADD |
 | `/publish` | KEEP |
 | `/restart` | ADD |
-| `/quit` | KEEP/ADD as canonical REPL exit |
-| `/exit` | OPTIONAL alias to `/quit` |
+| `/exit` | KEEP/ADD as canonical REPL exit |
+| `/quit` | alias to `/exit` |
 | `/work` | KEEP, read-only |
 | `/work block` | REDUCE |
 | `/work ready` | REDUCE |
@@ -1108,7 +1108,7 @@ Cover:
 /publish result-1
 /publish result-1 --to payment-42
 /restart
-/quit
+/exit
 ```
 
 ### Context tests
@@ -1237,7 +1237,7 @@ Explicitly document:
 - [ ] `/publish` remains a manual convenience with deterministic target resolution.
 - [ ] `/publish <result> --to <target>` handles ambiguous/multi-target cases.
 - [ ] `/restart` is DM/Thread conversation-local.
-- [ ] `/quit` is canonical REPL exit and is registered/tested.
+- [ ] `/exit` is canonical REPL exit and is registered/tested.
 - [ ] Domain mutation is not unnecessarily exposed as REPL workflow.
 - [ ] No A2A-specific slash commands exist.
 - [ ] No agent-routing slash commands are introduced.

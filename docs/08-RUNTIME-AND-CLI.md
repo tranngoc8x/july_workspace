@@ -61,8 +61,8 @@ july dm cashpoint
 ```
 
 The Phase 3 command preserves the submitted line exactly except for the
-terminal newline. `/quit` or EOF exits. Permission choices are displayed as a
-numbered list; invalid, blank, EOF or interrupted input resolves explicitly to
+terminal newline. `/exit` (or its `/quit` alias) or EOF exits. Permission
+choices are displayed as a numbered list; invalid, blank, EOF or interrupted input resolves explicitly to
 `Cancelled`. Shutdown disconnects the current binding so the next process can
 resume it. A `Lost` binding is reported and is not replaced or replayed before
 Phase 7.
@@ -227,7 +227,7 @@ valid contexts, aliases and examples from the same metadata.
 /thread new <title> [--goal <goal>]   Room | Thread
 /publish <result> [--to <target>]     Thread
 /restart                              Dm | Thread
-/quit  (alias /exit)                  Root | Room | Dm | Thread
+/exit  (alias /quit)                  Root | Room | Dm | Thread
 ```
 
 `/thread new` creates a Thread in the current Room. It is deliberately not
@@ -242,7 +242,7 @@ dependency resolves, no link is an error, and several require an explicit
 and binding identifiers stay out of the REPL; low-level session operations
 remain in the administrative CLI.
 
-`/quit` is the canonical REPL exit and `/exit` is an alias. It leaves the REPL
+`/exit` is the canonical REPL exit and `/quit` is an alias. It leaves the REPL
 only: it deletes no workspace state, removes no membership and completes no
 work.
 

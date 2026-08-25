@@ -394,14 +394,16 @@ fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
 }
 
 #[test]
-fn repl_exit_is_an_alias_of_quit() {
-    let workspace = TestWorkspace::new();
+fn repl_exits_on_the_canonical_exit_and_its_quit_alias() {
+    for line in ["/exit\n", "/quit\n"] {
+        let workspace = TestWorkspace::new();
 
-    let output = workspace.repl("/exit\n");
+        let output = workspace.repl(line);
 
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).is_empty());
-    assert_eq!(stdout(&output), "> ");
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        assert!(stderr(&output).is_empty());
+        assert_eq!(stdout(&output), "> ");
+    }
 }
 
 #[test]
