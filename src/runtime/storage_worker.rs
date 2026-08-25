@@ -29,6 +29,12 @@ enum Command {
     GetRoom(RoomId, Reply<Option<Room>>),
     GetRoomByName(String, Reply<Option<Room>>),
     ListRooms(Reply<Vec<Room>>),
+    ListAgents(Reply<Vec<Agent>>),
+    CreateAgent(Box<Agent>, Reply<()>),
+    UpdateAgent(Box<Agent>, Reply<bool>),
+    ListWorkItems(ConversationId, Reply<Vec<WorkItem>>),
+    ListWorkResults(ConversationId, Reply<Vec<WorkResult>>),
+    ListPublishTargets(ConversationId, Reply<Vec<ConversationId>>),
     ListRoomMembers(RoomId, Reply<Vec<RoomMember>>),
     AddRoomMember(RoomId, AgentId, Option<String>, String, Reply<bool>),
     RemoveRoomMember(RoomId, AgentId, String, Reply<bool>),
@@ -689,6 +695,36 @@ impl CollaborationRuntime for StorageHandle {
         self.collaboration_request(Command::ListRooms).await
     }
 
+    async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
+        self.collaboration_request(Command::ListAgents).await
+    }
+
+    async fn create_agent(&mut self, agent: Agent) -> Result<(), CollaborationError> {
+        self.collaboration_request(|reply| Command::CreateAgent(Box::new(agent), reply))
+            .await
+    }
+
+    async fn update_agent(&mut self, agent: Agent) -> Result<bool, CollaborationError> {
+        self.collaboration_request(|reply| Command::UpdateAgent(Box::new(agent), reply))
+            .await
+    }
+
+    async fn list_work_items(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkItem>, CollaborationError> {
+        self.collaboration_request(|reply| Command::ListWorkItems(conversation_id, reply))
+            .await
+    }
+
+    async fn list_work_results(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkResult>, CollaborationError> {
+        self.collaboration_request(|reply| Command::ListWorkResults(conversation_id, reply))
+            .await
+    }
+
     async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError> {
         self.collaboration_request(|reply| Command::GetAgent(agent_id, reply))
             .await
@@ -824,6 +860,32 @@ impl CollaborationRuntime for StorageWorker {
 
     async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
         self.handle.list_rooms().await
+    }
+
+    async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
+        self.handle.list_agents().await
+    }
+
+    async fn create_agent(&mut self, agent: Agent) -> Result<(), CollaborationError> {
+        self.handle.create_agent(agent).await
+    }
+
+    async fn update_agent(&mut self, agent: Agent) -> Result<bool, CollaborationError> {
+        self.handle.update_agent(agent).await
+    }
+
+    async fn list_work_items(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkItem>, CollaborationError> {
+        self.handle.list_work_items(conversation_id).await
+    }
+
+    async fn list_work_results(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkResult>, CollaborationError> {
+        self.handle.list_work_results(conversation_id).await
     }
 
     async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError> {
@@ -1005,6 +1067,14 @@ impl PublishRuntime for StorageHandle {
             .await
             .map(|results| results.into_iter().map(PublishedResult::from).collect())
     }
+
+    async fn list_publish_targets(
+        &mut self,
+        source_conversation_id: ConversationId,
+    ) -> Result<Vec<ConversationId>, PublishError> {
+        self.publish_request(|reply| Command::ListPublishTargets(source_conversation_id, reply))
+            .await
+    }
 }
 
 impl PublishRuntime for StorageWorker {
@@ -1035,6 +1105,14 @@ impl PublishRuntime for StorageWorker {
         self.publish_request(|reply| Command::ListPublishedResults(target_conversation_id, reply))
             .await
             .map(|results| results.into_iter().map(PublishedResult::from).collect())
+    }
+
+    async fn list_publish_targets(
+        &mut self,
+        source_conversation_id: ConversationId,
+    ) -> Result<Vec<ConversationId>, PublishError> {
+        self.publish_request(|reply| Command::ListPublishTargets(source_conversation_id, reply))
+            .await
     }
 }
 
@@ -1077,6 +1155,24 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::GetRoomByName(name, reply) => {
                 let _ = reply.send(store.get_room_by_name(&name));
+            }
+            Command::ListAgents(reply) => {
+                let _ = reply.send(store.list_agents());
+            }
+            Command::CreateAgent(agent, reply) => {
+                let _ = reply.send(store.insert_agent(&agent));
+            }
+            Command::UpdateAgent(agent, reply) => {
+                let _ = reply.send(store.update_agent(&agent));
+            }
+            Command::ListWorkItems(conversation_id, reply) => {
+                let _ = reply.send(store.list_work_items(conversation_id));
+            }
+            Command::ListWorkResults(conversation_id, reply) => {
+                let _ = reply.send(store.list_work_results(conversation_id));
+            }
+            Command::ListPublishTargets(conversation_id, reply) => {
+                let _ = reply.send(store.list_downstream_conversations(conversation_id));
             }
             Command::ListRooms(reply) => {
                 let _ = reply.send(store.list_rooms());

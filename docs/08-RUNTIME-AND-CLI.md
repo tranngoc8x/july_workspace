@@ -33,9 +33,26 @@ No full TUI is required.
 ### Agents
 
 ```bash
-july agents
-july agent show cashpoint
+july agent add <name> --project <path> [--runtime <runtime>] [--adapter <adapter>] [--config <file>]
+july agent list
+july agent show <agent>
+july agent remove <agent>
 ```
+
+`july agent add` creates a persistent logical Agent identity bound to a
+project. It does **not** start an `AgentSession` and does **not** add the agent
+to any Room; those are separate operations. `--runtime` records a user-facing
+preference (`codex`, `claude`, …) as configuration, not identity, so changing it
+never creates a new logical agent. `--adapter` selects the transport
+(`acp` by default) and `--config` supplies that transport's connection details
+from a JSON file. Provider session IDs, process IDs and terminal identifiers are
+never part of the Agent model.
+
+`july agent remove` retires an identity by marking it inactive. Rooms, Threads
+and transcripts are left untouched.
+
+Runtime creation stays lazy: a session is created or resumed the first time
+`/dm <agent>` or `july thread open` needs one.
 
 ### DM
 
@@ -104,11 +121,19 @@ july work block <id>
 july work ready <id>
 ```
 
+These are administrative and recovery operations. Normal work state changes flow
+from the agent through the collaboration protocol and the application service;
+the REPL's `/work` is inspection only.
+
 ### Publish
 
 ```bash
 july publish <result-id> --to <conversation-id>
 ```
+
+The CLI form always names its target. The REPL form may omit it when exactly
+one downstream conversation is linked by a work dependency; see `/publish`
+below.
 
 ### Session
 
@@ -130,29 +155,117 @@ dm	<agent-id>	cashpoint
 > fix callback retry
 ```
 
-Slash commands:
+Slash commands are a presentation-layer interface. They are not the
+collaboration protocol: agents hand off, propose, challenge and decide through
+the collaboration layer, never through user-facing commands.
+
+### Context model
+
+There are four explicit interactive scopes: `Root`, `Room`, `Dm` and `Thread`.
+Every command declares the scopes it is valid in, and a command used outside
+them is rejected with a clear message rather than silently reinterpreted:
 
 ```text
-/dm <agent>
-/room <room>
-/thread <thread-id> --agent <agent>
-/back
-/members
-/status
-/publish <result-id>
-/quit
+> /work
+
+/work is unavailable in root context (available in: thread)
 ```
 
-`<thread-id>` is a canonical `ConversationId`, never a title, so
-`/thread <thread-id> --agent <agent>` addresses exactly the Thread that
-`july thread open` addresses. Entering a Thread from a Room context requires
-that Thread to belong to that Room.
+### Command registry
 
-`/members` lists the active members of the current Room or Thread and is
-unavailable at root and inside a DM. `/status` prints the current descriptor.
-`/publish <result-id>` targets the current Conversation and is rejected at root
-and in a Room context. `/back` pops one descriptor and restores the one below
-it. Any line that is not a slash command is sent to the live Conversation.
+`src/cli/registry.rs` is the single source of truth for interactive commands.
+Each entry carries its canonical name, aliases, kind, valid scopes, summary,
+usage and examples, and the parser, scope validation, help and tests all resolve
+through it. A command cannot be executable, documented or completed without
+being registered, and no command may exist in only one of those places.
+
+### Navigation
+
+```text
+/dm <agent>        Root | Room | Dm | Thread
+/room <room>       Root | Room | Dm | Thread
+/thread <thread>   Room | Thread
+/back              Root | Room | Dm | Thread
+```
+
+`<thread>` is a canonical `ConversationId`, never a title. `--agent <agent>`
+binds the turn explicitly; without it, the Thread's single active agent member
+is used, and zero or several candidates are reported instead of guessed.
+Entering a Thread requires it to belong to the current Room; from a DM, use
+`/room <name>` first.
+
+`/back` pops the navigation history and restores the previous context. It is UI
+state only: it never leaves a Room, drops a membership, closes a conversation,
+terminates a session, merges model context or mutates Work state. At root it
+reports a no-op.
+
+### Inspection
+
+```text
+/rooms      Root | Room | Dm | Thread
+/agents     Root | Room | Dm | Thread
+/status     Root | Room | Dm | Thread
+/help       Root | Room | Dm | Thread
+/members    Room | Thread
+/work       Thread
+/results    Thread
+```
+
+All of these are read-only. `/agents` lists logical agents and never mutates
+them: onboarding is `july agent add`. `/members` lists the active members of the
+current Room or Thread. `/work` lists the current Thread's work items and
+`/results` the results its work produced; work state is normally changed by the
+collaboration runtime, not by a REPL command.
+
+`/help` renders the commands valid in the current scope, grouped by kind, from
+the registry. `/help <command>` renders that command's name, summary, usage,
+valid contexts, aliases and examples from the same metadata.
+
+### Control
+
+```text
+/thread new <title> [--goal <goal>]   Room | Thread
+/publish <result> [--to <target>]     Thread
+/restart                              Dm | Thread
+/quit  (alias /exit)                  Root | Room | Dm | Thread
+```
+
+`/thread new` creates a Thread in the current Room. It is deliberately not
+option-heavy; advanced creation stays in `july thread create`.
+
+`/publish` target resolution is deterministic and never inferred from a
+transcript or a model: exactly one downstream conversation linked by a work
+dependency resolves, no link is an error, and several require an explicit
+`--to`.
+
+`/restart` restarts the current conversation's agent session in place. Session
+and binding identifiers stay out of the REPL; low-level session operations
+remain in the administrative CLI.
+
+`/quit` is the canonical REPL exit and `/exit` is an alias. It leaves the REPL
+only: it deletes no workspace state, removes no membership and completes no
+work.
+
+Any line that is not a registered command is sent to the live Conversation; at
+root or in a Room it is rejected as an invalid command.
+
+### Administrative CLI versus REPL
+
+`july room create …`, `july thread create …`, `july agent add …` and the
+membership mutations are the administrative and scripting interface. The REPL
+exposes only the common interactive operations. The two surfaces do not need
+identical command sets; the application layer remains the authoritative domain
+API, and a command is not removed merely because the REPL does not expose it.
+
+### Future agent transport
+
+The command layer operates on July concepts — Conversation, Room, Thread,
+Agent, Work, Result — and never on ACP, A2A, Codex, Claude Code or a terminal
+tool. Transport lives below the collaboration layer, behind the Agent Gateway,
+so `/agents`, `/dm`, Room membership and Thread collaboration do not depend on
+whether an agent is internal or external. No transport-specific slash command
+exists, and external-agent onboarding syntax belongs to the A2A
+interoperability plan, not here.
 
 Switching shell context must not merge underlying LLM session histories. Only
 the top descriptor is live; a cold descriptor holds no transcript or model

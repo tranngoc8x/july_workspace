@@ -158,9 +158,18 @@ impl TestWorkspace {
             created_at: NOW.into(),
             updated_at: NOW.into(),
         };
+        SqliteStore::open(&self.database)
+            .unwrap()
+            .insert_conversation(&source)
+            .unwrap();
+        self.seed_result_in(source.id)
+    }
+
+    /// An accepted Result on a new work item inside an existing Conversation.
+    fn seed_result_in(&self, conversation_id: ConversationId) -> ResultId {
         let work = WorkItem {
             id: WorkItemId::new(),
-            conversation_id: source.id,
+            conversation_id,
             title: "Publish result".into(),
             goal: None,
             status: WorkStatus::Open,
@@ -181,13 +190,23 @@ impl TestWorkspace {
             created_at: NOW.into(),
         };
         let mut store = SqliteStore::open(&self.database).unwrap();
-        store.insert_conversation(&source).unwrap();
         store.insert_work_item(&work).unwrap();
         store
             .transition_work(work.id, WorkStatus::Working, NOW)
             .unwrap();
         store.create_work_result(&result).unwrap();
         result.id
+    }
+
+    /// Link two Threads by a work dependency: the upstream Thread's work feeds
+    /// the downstream Thread's work, which is what `/publish` resolves.
+    fn link_threads(&self, upstream: ConversationId, downstream: ConversationId) {
+        let mut store = SqliteStore::open(&self.database).unwrap();
+        let upstream_work = store.list_work_items(upstream).unwrap()[0].id;
+        let downstream_work = store.list_work_items(downstream).unwrap()[0].id;
+        store
+            .add_work_dependency(upstream_work, downstream_work, NOW)
+            .unwrap();
     }
 
     fn messages(&self, conversation_id: ConversationId) -> Vec<(String, String)> {
@@ -310,8 +329,159 @@ fn repl_root_commands_are_nonfatal_and_do_not_mutate_rooms() {
     assert!(stdout(&output).contains("root\n"));
     assert_eq!(stderr(&output).matches("invalid command\n").count(), 1);
     assert!(stderr(&output).contains("already at root\n"));
-    assert!(stderr(&output).contains("members unavailable at root\n"));
+    assert!(
+        stderr(&output)
+            .contains("/members is unavailable in root context (available in: room, thread)\n")
+    );
     assert_eq!(workspace.rooms(), 0);
+}
+
+#[test]
+fn repl_help_is_context_aware_and_explains_one_command() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+
+    let output = workspace.repl(&format!(
+        "/help\n/help thread\n/help nope\n/room Operations\n/thread {settlement} --agent codex\n\
+         /help\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    let (root_help, thread_help) = stdout_output.split_once("room\t").unwrap();
+    // Root help offers navigation but not Thread-only inspection.
+    assert!(root_help.contains("/dm <agent>"));
+    assert!(!root_help.contains("/work"));
+    assert!(!root_help.contains("/members"));
+    // Thread help adds the Thread surface.
+    assert!(thread_help.contains("/work"));
+    assert!(thread_help.contains("/results"));
+    assert!(thread_help.contains("/publish <result> [--to <thread>]"));
+    // Detailed help comes from the same registry metadata.
+    assert!(stdout_output.contains("usage\n  /thread <thread> [--agent <agent>]"));
+    assert!(stdout_output.contains("contexts\n  room, thread"));
+    assert!(stderr(&output).contains("unknown command: nope\n"));
+}
+
+#[test]
+fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
+    let workspace = TestWorkspace::new();
+
+    let empty = workspace.repl("/agents\n/agents add cashpoint\n/quit\n");
+    assert!(empty.status.success(), "stderr: {}", stderr(&empty));
+    assert!(stderr(&empty).contains(
+        "no agents configured; add one with: \
+         july agent add <name> --project <path> --runtime <runtime>\n"
+    ));
+    // `/agents` never mutates: the add form is rejected, not interpreted.
+    assert_eq!(stderr(&empty).matches("invalid command\n").count(), 1);
+
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let listed = workspace.repl("/agents\n/quit\n");
+    assert!(stdout(&listed).contains(&format!("{}\tcodex\t", codex.id)));
+    // Listing an agent starts no session.
+    assert_eq!(
+        Connection::open(&workspace.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session_bindings", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn repl_exit_is_an_alias_of_quit() {
+    let workspace = TestWorkspace::new();
+
+    let output = workspace.repl("/exit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    assert_eq!(stdout(&output), "> ");
+}
+
+#[test]
+fn repl_thread_new_creates_a_thread_in_the_current_room() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+
+    let output = workspace.repl(
+        "/thread new \"Refund flow\"\n/room Operations\n\
+         /thread new \"Refund flow\" --goal \"Implement refund API\"\n/thread new\n/quit\n",
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output)
+            .contains("/thread new is unavailable in root context (available in: room, thread)\n")
+    );
+    assert_eq!(stderr(&output).matches("invalid command\n").count(), 1);
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let (title, goal, thread_room): (String, String, String) = connection
+        .query_row(
+            "SELECT title, goal, room_id FROM conversations WHERE type = 'thread'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "Refund flow");
+    assert_eq!(goal, "Implement refund API");
+    assert_eq!(thread_room, room.id.to_string());
+}
+
+#[test]
+fn repl_inspection_commands_report_workspace_state_without_mutating_it() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let result_id = workspace.seed_result_in(settlement);
+
+    let output = workspace.repl(&format!(
+        "/rooms\n/agents\n/work\n/room Operations\n/thread {settlement} --agent codex\n\
+         /work\n/results\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains(&format!("{}\tOperations\tactive\n", room.id)));
+    assert!(stdout_output.contains(&format!("{}\tcodex\t", codex.id)));
+    assert!(
+        stderr(&output).contains("/work is unavailable in root context (available in: thread)\n")
+    );
+    assert!(stdout_output.contains("\tSettlement\t"));
+    assert!(stdout_output.contains(&format!("{result_id}\t")));
+    // Inspection is read-only.
+    assert_eq!(workspace.rooms(), 1);
+    assert!(workspace.messages(settlement).is_empty());
+}
+
+#[test]
+fn repl_restart_rebinds_the_conversation_without_leaving_it() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("/dm codex\nhello\n1\n/restart\n/status\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    // `/restart` reports the restored context, so `/status` still shows the DM.
+    assert_eq!(stdout(&output).matches("\tcodex\t").count(), 2);
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let conversations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conversations, 1);
 }
 
 #[test]
@@ -478,7 +648,10 @@ fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
     let output = workspace.repl("/dm codex\nhello\n1\n/members\n/dm missing\n/status\n/quit\n");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert!(stderr(&output).contains("members unavailable in dm\n"));
+    assert!(
+        stderr(&output)
+            .contains("/members is unavailable in dm context (available in: room, thread)\n")
+    );
     assert!(stderr(&output).contains("agent missing does not exist\n"));
     assert!(stdout(&output).contains("dm\t"));
     assert!(stdout(&output).contains("\tcodex\t"));
@@ -535,8 +708,10 @@ fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
     let refunds = workspace.seed_thread(&room, "Refunds", &[&codex]);
 
     let output = workspace.repl(&format!(
-        "/room Operations\n/dm codex\ndm one\n1\n/thread {settlement} --agent codex\nthread one\n1\n\
-         /status\n/members\n/back\n/status\n/thread {refunds} --agent codex\nthread two\n1\n/back\n/quit\n"
+        // A Thread is entered from its Room: `/thread` is unavailable in a DM.
+        "/room Operations\n/dm codex\ndm one\n1\n/back\n/thread {settlement} --agent codex\n\
+         thread one\n1\n/status\n/members\n/back\n/status\n\
+         /thread {refunds} --agent codex\nthread two\n1\n/back\n/quit\n"
     ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
@@ -629,16 +804,22 @@ fn repl_thread_switch_failures_leave_the_previous_context_active() {
     let output = workspace.repl(&format!(
         "/room Operations\n/thread {settlement} --agent codex\n/status\n\
          /thread {settlement}\n/thread not-an-id --agent codex\n\
-         /thread {settlement} --agent missing\n/status\n/back\n\
-         /thread {settlement} --agent outsider\n/status\n/quit\n"
+         /thread {settlement} --agent missing\n/thread {settlement} --bogus codex\n/status\n\
+         /room Payments\n/thread {settlement} --agent outsider\n/status\n/back\n/status\n/quit\n"
     ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stderr_output = stderr(&output);
-    assert!(stderr_output.contains(&format!(
-        "thread {settlement} does not belong to room {}",
-        operations.id
-    )));
+    // Both the explicit and the deterministic `/thread` form check the Room.
+    assert_eq!(
+        stderr_output
+            .matches(&format!(
+                "thread {settlement} does not belong to room {}",
+                operations.id
+            ))
+            .count(),
+        2
+    );
     assert_eq!(stderr_output.matches("invalid command\n").count(), 1);
     assert!(stderr_output.contains("usage: july dm <agent>"));
     assert!(stderr_output.contains("agent missing does not exist"));
@@ -646,24 +827,25 @@ fn repl_thread_switch_failures_leave_the_previous_context_active() {
         "agent {} must be an active member of room",
         outsider.id
     )));
-    // Every failed switch kept the previous descriptor: Room, then Root.
+    // Every failed switch kept the previous descriptor.
     assert_eq!(
         stdout(&output)
             .matches(&format!("room\t{}\tOperations\n", operations.id))
             .count(),
-        3
+        5
     );
-    assert_eq!(stdout(&output).matches("root\n").count(), 2);
     assert!(workspace.messages(settlement).is_empty());
 }
 
 #[test]
-fn repl_publish_targets_the_current_conversation_only() {
+fn repl_publish_resolves_the_single_downstream_target() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("Operations");
     let codex = workspace.seed_acp_agent("codex", &[]);
     workspace.add_member(&room, &codex);
     let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let payments = workspace.seed_thread(&room, "Payments", &[&codex]);
+    workspace.link_threads(settlement, payments);
     let result_id = workspace.seed_result();
 
     let output = workspace.repl(&format!(
@@ -672,24 +854,25 @@ fn repl_publish_targets_the_current_conversation_only() {
     ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    assert_eq!(
+    assert!(
         stderr(&output)
-            .matches("publish requires a dm or thread context\n")
-            .count(),
-        2
+            .contains("/publish is unavailable in root context (available in: thread)\n")
+    );
+    assert!(
+        stderr(&output)
+            .contains("/publish is unavailable in room context (available in: thread)\n")
     );
     assert!(stderr(&output).contains("usage: july dm <agent>"));
     let published = stdout(&output)
         .lines()
-        .find(|line| {
-            line.starts_with(&result_id.to_string()) || line.contains(&result_id.to_string())
-        })
+        .find(|line| line.contains(&result_id.to_string()))
         .map(str::to_owned)
         .unwrap_or_else(|| panic!("missing publish output: {}", stdout(&output)));
     let fields: Vec<_> = published.split('\t').collect();
     assert_eq!(fields.len(), 5);
     assert_eq!(fields[1], result_id.to_string());
-    assert_eq!(fields[3], settlement.to_string());
+    // The target is the linked downstream Thread, never the current one.
+    assert_eq!(fields[3], payments.to_string());
 
     let connection = Connection::open(&workspace.database).unwrap();
     let (publishes, target): (i64, String) = connection
@@ -700,7 +883,52 @@ fn repl_publish_targets_the_current_conversation_only() {
         )
         .unwrap();
     assert_eq!(publishes, 1);
-    assert_eq!(target, settlement.to_string());
+    assert_eq!(target, payments.to_string());
+}
+
+#[test]
+fn repl_publish_reports_missing_targets_and_requires_to_when_ambiguous() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let settlement = workspace.seed_thread(&room, "Settlement", &[&codex]);
+    let payments = workspace.seed_thread(&room, "Payments", &[&codex]);
+    let refunds = workspace.seed_thread(&room, "Refunds", &[&codex]);
+    let unlinked = workspace.seed_thread(&room, "Unlinked", &[&codex]);
+    let result_id = workspace.seed_result();
+
+    // No downstream link at all.
+    let output = workspace.repl(&format!(
+        "/room Operations\n/thread {unlinked} --agent codex\n/publish {result_id}\n/quit\n"
+    ));
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains(&format!(
+        "conversation {unlinked} has no downstream publish target\n"
+    )));
+
+    // Two downstream links: ambiguous until `--to` names one.
+    workspace.link_threads(settlement, payments);
+    workspace.link_threads(settlement, refunds);
+    let output = workspace.repl(&format!(
+        "/room Operations\n/thread {settlement} --agent codex\n/publish {result_id}\n\
+         /publish {result_id} --to {refunds}\n/quit\n"
+    ));
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains(&format!(
+        "conversation {settlement} has 2 downstream publish targets; use --to <target>\n"
+    )));
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let (publishes, target): (i64, String) = connection
+        .query_row(
+            "SELECT COUNT(*), MAX(target_conversation_id) FROM publishes",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(publishes, 1);
+    assert_eq!(target, refunds.to_string());
 }
 
 #[test]
@@ -839,7 +1067,9 @@ fn repl_sigint_during_thread_permission_cancels_the_turn_and_keeps_the_context()
         .stdin
         .as_mut()
         .unwrap()
-        .write_all(format!("/thread {settlement} --agent codex\nhello\n").as_bytes())
+        .write_all(
+            format!("/room Operations\n/thread {settlement} --agent codex\nhello\n").as_bytes(),
+        )
         .unwrap();
     assert!(output.read_until(b"permission> ").ends_with("permission> "));
     assert!(

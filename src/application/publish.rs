@@ -44,6 +44,15 @@ pub enum PublishError {
     PublishIdConflict(PublishId),
     #[error("publish timestamp must not be blank")]
     InvalidTimestamp,
+    #[error("conversation {0} has no downstream publish target")]
+    NoTarget(ConversationId),
+    #[error(
+        "conversation {conversation} has {count} downstream publish targets; use --to <target>"
+    )]
+    AmbiguousTarget {
+        conversation: ConversationId,
+        count: usize,
+    },
     #[error("publish runtime failed: {0}")]
     Runtime(String),
 }
@@ -62,6 +71,13 @@ pub trait PublishRuntime {
         &mut self,
         target_conversation_id: ConversationId,
     ) -> Result<Vec<PublishedResult>, PublishError>;
+
+    /// Conversations linked downstream of `source_conversation_id` by a work
+    /// dependency. This is the only publish target resolution July performs.
+    async fn list_publish_targets(
+        &mut self,
+        source_conversation_id: ConversationId,
+    ) -> Result<Vec<ConversationId>, PublishError>;
 }
 
 pub struct PublishService<R> {
@@ -89,6 +105,27 @@ impl<R: PublishRuntime> PublishService<R> {
                 command.published_at,
             )
             .await
+    }
+
+    /// Deterministic target resolution: exactly one downstream conversation
+    /// resolves, none is an error, several require an explicit `--to`.
+    /// No inference from transcripts, and never a model call.
+    pub async fn resolve_target(
+        &mut self,
+        source_conversation_id: ConversationId,
+    ) -> Result<ConversationId, PublishError> {
+        let targets = self
+            .runtime
+            .list_publish_targets(source_conversation_id)
+            .await?;
+        match targets.as_slice() {
+            [target] => Ok(*target),
+            [] => Err(PublishError::NoTarget(source_conversation_id)),
+            _ => Err(PublishError::AmbiguousTarget {
+                conversation: source_conversation_id,
+                count: targets.len(),
+            }),
+        }
     }
 
     pub async fn list_for_target(

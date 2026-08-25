@@ -1,9 +1,9 @@
 use super::StoreError;
 use crate::domain::{
-    Agent, Checkpoint, Conversation, ConversationMember, Decision, DomainError, Handoff, Memory,
-    Message, MessageDelivery, PermissionDecision, PermissionOption, PermissionOutcome, Proposal,
-    ProposalResponse, Publish, Room, RoomMember, SessionBinding, SessionRecovery, WorkDependency,
-    WorkItem, WorkResult,
+    Agent, Checkpoint, Conversation, ConversationId, ConversationMember, Decision, DomainError,
+    Handoff, Memory, Message, MessageDelivery, PermissionDecision, PermissionOption,
+    PermissionOutcome, Proposal, ProposalResponse, Publish, Room, RoomMember, SessionBinding,
+    SessionRecovery, WorkDependency, WorkItem, WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -37,6 +37,11 @@ fn json_value(value: String) -> Result<Value, StoreError> {
 
 fn string_vec(value: String) -> Result<Vec<String>, StoreError> {
     Ok(serde_json::from_str(&value)?)
+}
+
+/// A single-column projection of `conversations.id`.
+pub(super) fn conversation_id(row: &Row<'_>) -> Result<ConversationId, StoreError> {
+    id(row.get(0)?)
 }
 
 pub(super) fn agent(row: &Row<'_>) -> Result<Agent, StoreError> {

@@ -1,9 +1,9 @@
 use crate::application::{
-    AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind, ChatPermissionRequestId,
-    CollaborationError, CollaborationService, CreateRoom, CreateThread, DirectMessageError,
-    DirectMessageRuntime, DirectMessageService, MembershipChange, MembershipState,
-    OpenThreadForAgent, PublishError, PublishResult, PublishService, RemoveRoomMember,
-    RemoveThreadMember, RoomRef, ThreadChatRuntime, ThreadChatService,
+    AddAgent, AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind,
+    ChatPermissionRequestId, CollaborationError, CollaborationService, CreateRoom, CreateThread,
+    DirectMessageError, DirectMessageRuntime, DirectMessageService, MembershipChange,
+    MembershipState, OpenThreadForAgent, PublishError, PublishResult, PublishService,
+    RemoveRoomMember, RemoveThreadMember, RoomRef, ThreadChatRuntime, ThreadChatService,
 };
 use crate::domain::{
     AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, PublishId, ResultId,
@@ -26,8 +26,14 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
 
+pub mod registry;
+
+use registry::CommandScope;
+
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
+const NO_AGENTS: &str = "no agents configured; add one with: \
+                         july agent add <name> --project <path> --runtime <runtime>";
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -98,6 +104,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         Command::Version { json } => run_version(json),
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
+        Command::Agent { operation, .. } => run_agent(operation, json).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
         Command::Publish {
@@ -133,6 +140,7 @@ impl CliError {
                 CollaborationError::AgentNotFound(_) => "agent_not_found",
                 CollaborationError::RoomIdConflict(_) => "room_id_conflict",
                 CollaborationError::RoomNameConflict(_) => "room_name_conflict",
+                CollaborationError::AgentNameConflict(_) => "agent_name_conflict",
                 CollaborationError::RoomInactive(_) => "room_inactive",
                 CollaborationError::AgentInactive(_) => "agent_inactive",
                 CollaborationError::RoomRemovalBlocked { .. } => "room_removal_blocked",
@@ -152,6 +160,8 @@ impl CliError {
                 PublishError::TargetNotFound(_) => "target_not_found",
                 PublishError::PublishIdConflict(_) => "publish_id_conflict",
                 PublishError::InvalidTimestamp => "invalid_timestamp",
+                PublishError::NoTarget(_) => "publish_target_missing",
+                PublishError::AmbiguousTarget { .. } => "publish_target_ambiguous",
                 PublishError::Runtime(_) => "runtime_error",
             },
             Self::MissingHome
@@ -175,6 +185,10 @@ enum Command {
     ThreadOpen {
         thread_id: ConversationId,
         agent: AgentRef,
+    },
+    Agent {
+        operation: AgentOperation,
+        json: bool,
     },
     Room {
         operation: RoomOperation,
@@ -202,12 +216,22 @@ enum ReplContext {
     },
     Thread {
         conversation_id: ConversationId,
+        room_id: RoomId,
         agent_id: AgentId,
         agent_name: String,
     },
 }
 
 impl ReplContext {
+    fn scope(&self) -> CommandScope {
+        match self {
+            Self::Root => CommandScope::Root,
+            Self::Room(_) => CommandScope::Room,
+            Self::Dm { .. } => CommandScope::Dm,
+            Self::Thread { .. } => CommandScope::Thread,
+        }
+    }
+
     /// Publish targets a Conversation; a Room is not one.
     fn conversation_id(&self) -> Option<ConversationId> {
         match self {
@@ -218,6 +242,14 @@ impl ReplContext {
             | Self::Thread {
                 conversation_id, ..
             } => Some(*conversation_id),
+        }
+    }
+
+    /// The Room a Thread is created in; a Thread inherits its parent Room.
+    fn room_id(&self) -> Option<RoomId> {
+        match self {
+            Self::Room(room_id) | Self::Thread { room_id, .. } => Some(*room_id),
+            Self::Root | Self::Dm { .. } => None,
         }
     }
 }
@@ -351,11 +383,26 @@ impl Command {
         matches!(
             self,
             Self::Version { json: true }
+                | Self::Agent { json: true, .. }
                 | Self::Room { json: true, .. }
                 | Self::Thread { json: true, .. }
                 | Self::Publish { json: true, .. }
         )
     }
+}
+
+/// Agent lifecycle is administrative: it configures identity, never sessions.
+enum AgentOperation {
+    Add {
+        name: String,
+        project: String,
+        runtime: Option<String>,
+        transport: String,
+        config: Option<PathBuf>,
+    },
+    List,
+    Show(AgentRef),
+    Remove(AgentRef),
 }
 
 enum RoomOperation {
@@ -401,6 +448,7 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
             [_, agent] if !json => Ok(Command::Dm(positional(agent)?)),
             _ => Err(CliError::Usage),
         },
+        Some("agent") => parse_agent(args, json),
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
         Some("publish") => parse_publish(args, json),
@@ -510,6 +558,65 @@ fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
         args.retain(|arg| arg != "--json");
     }
     Ok(count == 1)
+}
+
+fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+    let operation = match args.as_slice() {
+        [_, command] if command == "list" => AgentOperation::List,
+        [_, command, agent] if command == "show" => AgentOperation::Show(agent_ref(agent)?),
+        [_, command, agent] if command == "remove" => AgentOperation::Remove(agent_ref(agent)?),
+        [_, command, name, rest @ ..] if command == "add" => {
+            let (project, runtime, transport, config) = parse_agent_add(rest)?;
+            AgentOperation::Add {
+                name: positional(name)?,
+                project,
+                runtime,
+                transport,
+                config,
+            }
+        }
+        _ if matches!(
+            args.get(1).map(String::as_str),
+            Some("add" | "list" | "show" | "remove")
+        ) =>
+        {
+            return Err(CliError::Usage);
+        }
+        _ => return Err(CliError::InvalidCommand),
+    };
+    Ok(Command::Agent { operation, json })
+}
+
+/// `--project` is required; `--runtime` is a preference, `--adapter` picks the
+/// transport, and `--config` supplies its connection details.
+fn parse_agent_add(
+    args: &[String],
+) -> Result<(String, Option<String>, String, Option<PathBuf>), CliError> {
+    let mut project = None;
+    let mut runtime = None;
+    let mut transport = None;
+    let mut config = None;
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
+            return Err(CliError::Usage);
+        };
+        match args[index].as_str() {
+            "--project" if project.is_none() => project = Some(value.clone()),
+            "--runtime" if runtime.is_none() => runtime = Some(value.clone()),
+            "--adapter" if transport.is_none() => transport = Some(value.clone()),
+            "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            _ => return Err(CliError::Usage),
+        }
+        index += 2;
+    }
+    let project = project.ok_or(CliError::Usage)?;
+    Ok((
+        project,
+        runtime,
+        transport.unwrap_or_else(|| "acp".into()),
+        config,
+    ))
 }
 
 fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
@@ -675,14 +782,161 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             close_repl_context(live).await?;
             return Ok(());
         };
-        match line.as_str() {
-            "/quit" => {
+        let scope = contexts.last().unwrap().scope();
+        let Some((spec, arguments)) = registry::resolve(&line) else {
+            // Not a registered command: chat sends it, other contexts reject it.
+            if line.trim().is_empty() {
+                continue;
+            }
+            if matches!(
+                contexts.last(),
+                Some(ReplContext::Dm { .. } | ReplContext::Thread { .. })
+            ) {
+                let chat = live.as_mut().expect("active context has a live service");
+                if let Err(error) = chat.send(line, timestamp()).await {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                drain_repl_turn(chat, &mut input).await?;
+            } else {
+                repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+            }
+            continue;
+        };
+        if !spec.available_in(scope) {
+            repl_stderr(format_args!("{}\n", spec.scope_error(scope)))?;
+            continue;
+        }
+        let arguments = arguments.to_owned();
+        let arguments = arguments.as_str();
+        match spec.name {
+            "/quit" if arguments.is_empty() => {
                 close_repl_context(live).await?;
                 return Ok(());
             }
-            "/status" => print_repl_status(service, workspace, contexts.last().unwrap()).await?,
+            "/help" if arguments.is_empty() => {
+                repl_stdout(format_args!("{}", registry::help(scope)))?
+            }
+            "/help" => match registry::find(arguments) {
+                Some(spec) => repl_stdout(format_args!("{}", registry::help_command(spec)))?,
+                None => repl_stderr(format_args!("unknown command: {arguments}\n"))?,
+            },
+            "/status" if arguments.is_empty() => {
+                print_repl_status(service, workspace, contexts.last().unwrap()).await?
+            }
+            "/rooms" if arguments.is_empty() => match service.list_rooms().await {
+                Ok(rooms) => {
+                    for room in rooms {
+                        repl_stdout(format_args!(
+                            "{}\t{}\t{}\n",
+                            room.id, room.name, room.status
+                        ))?;
+                    }
+                }
+                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+            },
+            "/agents" if arguments.is_empty() => match service.list_agents().await {
+                Ok(agents) if agents.is_empty() => repl_stderr(format_args!("{NO_AGENTS}\n"))?,
+                Ok(agents) => {
+                    for agent in agents {
+                        repl_stdout(format_args!(
+                            "{}\t{}\t{}\t{}\t{}\n",
+                            agent.id,
+                            agent.name,
+                            agent.project_root,
+                            agent.transport_type,
+                            agent.status
+                        ))?;
+                    }
+                }
+                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+            },
+            "/work" if arguments.is_empty() => {
+                let conversation_id = contexts
+                    .last()
+                    .unwrap()
+                    .conversation_id()
+                    .expect("thread scope owns a conversation");
+                match service.list_work_items(conversation_id).await {
+                    Ok(work_items) => {
+                        for work in work_items {
+                            repl_stdout(format_args!(
+                                "{}\t{}\t{}\t{}\n",
+                                work.id,
+                                work.status,
+                                work.title,
+                                work.owner_agent_id
+                                    .map(|agent| agent.to_string())
+                                    .unwrap_or_default(),
+                            ))?;
+                        }
+                    }
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
+            "/results" if arguments.is_empty() => {
+                let conversation_id = contexts
+                    .last()
+                    .unwrap()
+                    .conversation_id()
+                    .expect("thread scope owns a conversation");
+                match service.list_work_results(conversation_id).await {
+                    Ok(results) => {
+                        for result in results {
+                            repl_stdout(format_args!(
+                                "{}\t{}\t{}\t{}\n",
+                                result.id, result.work_id, result.status, result.summary,
+                            ))?;
+                        }
+                    }
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
+            "/restart" if arguments.is_empty() => {
+                if let Err(error) = close_repl_context(live).await {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                if let Err(error) = restore_repl_context(service, workspace, &contexts, live).await
+                {
+                    repl_stderr(format_args!("{error}\n"))?;
+                    continue;
+                }
+                print_repl_status(service, workspace, contexts.last().unwrap()).await?
+            }
+            "/thread new" if !arguments.is_empty() => {
+                let room_id = contexts
+                    .last()
+                    .unwrap()
+                    .room_id()
+                    .expect("room and thread scopes own a room");
+                match parse_thread_new(arguments) {
+                    Ok((title, goal)) => {
+                        match service
+                            .create_thread(CreateThread {
+                                thread_id: ConversationId::new(),
+                                primary_work_id: WorkItemId::new(),
+                                room: RoomRef::Id(room_id),
+                                title,
+                                goal,
+                                user_id: LOCAL_USER_ID.into(),
+                                initial_agents: Vec::new(),
+                                created_at: timestamp(),
+                            })
+                            .await
+                        {
+                            Ok(thread) => repl_stdout(format_args!(
+                                "thread\t{}\t{}\n",
+                                thread.thread_id, thread.primary_work_id
+                            ))?,
+                            Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                }
+            }
             "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
-            "/back" => {
+            "/back" if arguments.is_empty() => {
                 let previous = contexts.last().unwrap().clone();
                 if let Err(error) = close_repl_context(live).await {
                     repl_stderr(format_args!("{error}\n"))?;
@@ -705,8 +959,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 print_repl_status(service, workspace, contexts.last().unwrap()).await?;
             }
-            "/members" => match contexts.last().unwrap() {
-                ReplContext::Root => repl_stderr(format_args!("members unavailable at root\n"))?,
+            "/members" if arguments.is_empty() => match contexts.last().unwrap() {
                 ReplContext::Room(room_id) => {
                     match service.list_room_members(RoomRef::Id(*room_id)).await {
                         Ok(members) => {
@@ -741,41 +994,63 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                     Err(error) => repl_stderr(format_args!("{error}\n"))?,
                 },
-                ReplContext::Dm { .. } => repl_stderr(format_args!("members unavailable in dm\n"))?,
-            },
-            _ if line.trim().is_empty() => {}
-            _ if let Some(reference) = line.strip_prefix("/room ")
-                && !reference.is_empty() =>
-            {
-                match room_ref(reference) {
-                    Ok(reference) => match service.resolve_room(reference).await {
-                        Ok(room) => {
-                            if let Err(error) = close_repl_context(live).await {
-                                repl_stderr(format_args!("{error}\n"))?;
-                                continue;
-                            }
-                            repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
-                            contexts.push(ReplContext::Room(room.id));
-                        }
-                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
-                    },
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                ReplContext::Root | ReplContext::Dm { .. } => {
+                    unreachable!("registry scopes /members to room and thread")
                 }
-            }
-            _ if let Some(reference) = line.strip_prefix("/publish ")
-                && !reference.trim().is_empty() =>
-            {
-                let Some(target_conversation_id) = contexts.last().unwrap().conversation_id()
-                else {
-                    repl_stderr(format_args!("publish requires a dm or thread context\n"))?;
-                    continue;
+            },
+            "/room" if !arguments.is_empty() => match room_ref(arguments) {
+                Ok(reference) => match service.resolve_room(reference).await {
+                    Ok(room) => {
+                        if let Err(error) = close_repl_context(live).await {
+                            repl_stderr(format_args!("{error}\n"))?;
+                            continue;
+                        }
+                        repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
+                        contexts.push(ReplContext::Room(room.id));
+                    }
+                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                },
+                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+            },
+            "/publish" if !arguments.is_empty() => {
+                let source_conversation_id = contexts
+                    .last()
+                    .unwrap()
+                    .conversation_id()
+                    .expect("thread scope owns a conversation");
+                let fields: Vec<_> = arguments.split_whitespace().collect();
+                let (result, target) = match fields.as_slice() {
+                    [result] => (*result, None),
+                    [result, flag, target] if *flag == "--to" => (*result, Some(*target)),
+                    _ => {
+                        repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                        continue;
+                    }
                 };
-                let result_id = match result_id(reference) {
+                let result_id = match result_id(result) {
                     Ok(result_id) => result_id,
                     Err(error) => {
                         repl_stderr(format_args!("{error}\n"))?;
                         continue;
                     }
+                };
+                // Deterministic only: an explicit `--to`, or the single
+                // downstream conversation linked by a work dependency.
+                let target_conversation_id = match target {
+                    Some(target) => match thread_id(target) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            repl_stderr(format_args!("{error}\n"))?;
+                            continue;
+                        }
+                    },
+                    None => match publish.resolve_target(source_conversation_id).await {
+                        Ok(target) => target,
+                        Err(error) => {
+                            repl_stderr(format_args!("{error}\n"))?;
+                            continue;
+                        }
+                    },
                 };
                 match publish
                     .publish(PublishResult {
@@ -797,18 +1072,16 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Err(error) => repl_stderr(format_args!("{error}\n"))?,
                 }
             }
-            _ if let Some(reference) = line.strip_prefix("/thread ")
-                && !reference.trim().is_empty() =>
-            {
-                let fields: Vec<_> = reference.split_whitespace().collect();
-                let [thread, flag, agent] = fields.as_slice() else {
-                    repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
-                    continue;
+            "/thread" if !arguments.is_empty() => {
+                let fields: Vec<_> = arguments.split_whitespace().collect();
+                let (thread, agent) = match fields.as_slice() {
+                    [thread] => (*thread, None),
+                    [thread, flag, agent] if *flag == "--agent" => (*thread, Some(*agent)),
+                    _ => {
+                        repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                        continue;
+                    }
                 };
-                if *flag != "--agent" {
-                    repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
-                    continue;
-                }
                 let thread_id = match thread_id(thread) {
                     Ok(thread_id) => thread_id,
                     Err(error) => {
@@ -816,27 +1089,20 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         continue;
                     }
                 };
-                let agent = match agent_ref(agent) {
-                    Ok(reference) => match service.resolve_agent(reference).await {
-                        Ok(agent) => agent,
-                        Err(error) => {
-                            repl_stderr(format_args!("{error}\n"))?;
-                            continue;
-                        }
-                    },
+                let agent = match resolve_thread_agent(service, thread_id, agent).await {
+                    Ok(agent) => agent,
                     Err(error) => {
                         repl_stderr(format_args!("{error}\n"))?;
                         continue;
                     }
                 };
-                // A Thread entered from a Room must belong to that Room.
-                let room_id = match contexts.last() {
-                    Some(ReplContext::Room(room_id)) => Some(*room_id),
-                    _ => None,
-                };
-                if let Some(room_id) = room_id
-                    && let Err(error) = require_thread_in_room(service, room_id, thread_id).await
-                {
+                // A Thread is always entered from its Room.
+                let room_id = contexts
+                    .last()
+                    .unwrap()
+                    .room_id()
+                    .expect("room and thread scopes own a room");
+                if let Err(error) = require_thread_in_room(service, room_id, thread_id).await {
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
@@ -851,7 +1117,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_stderr(format_args!("{error}\n"))?;
                     continue;
                 }
-                match open_repl_thread(workspace, &agent, thread_id).await {
+                match open_repl_thread(workspace, &agent, thread_id, room_id).await {
                     Ok((context, chat)) => {
                         contexts.push(context);
                         *live = Some(chat);
@@ -870,10 +1136,8 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                 }
             }
-            _ if let Some(reference) = line.strip_prefix("/dm ")
-                && !reference.is_empty() =>
-            {
-                let agent = match agent_ref(reference) {
+            "/dm" if !arguments.is_empty() => {
+                let agent = match agent_ref(arguments) {
                     Ok(reference) => match service.resolve_agent(reference).await {
                         Ok(agent) => agent,
                         Err(error) => {
@@ -916,21 +1180,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                 }
             }
-            _ if is_known_repl_command(&line) => {
-                repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?
-            }
-            _ if matches!(
-                contexts.last(),
-                Some(ReplContext::Dm { .. } | ReplContext::Thread { .. })
-            ) =>
-            {
-                let chat = live.as_mut().expect("active context has a live service");
-                if let Err(error) = chat.send(line, timestamp()).await {
-                    repl_stderr(format_args!("{error}\n"))?;
-                    continue;
-                }
-                drain_repl_turn(chat, &mut input).await?;
-            }
+            // A registered command with arguments it does not accept.
             _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
         }
     }
@@ -979,6 +1229,7 @@ async fn open_repl_thread(
     workspace: &WorkspaceRuntime<AcpTransport>,
     agent: &crate::domain::Agent,
     thread_id: ConversationId,
+    room_id: RoomId,
 ) -> Result<(ReplContext, ReplChat), CliError> {
     let mut chat = ThreadChatService::new(open_thread_runtime(workspace, agent.id)?);
     let opened = chat
@@ -994,6 +1245,7 @@ async fn open_repl_thread(
     Ok((
         ReplContext::Thread {
             conversation_id: opened.thread_id,
+            room_id,
             agent_id: opened.agent_id,
             agent_name: agent.name.clone(),
         },
@@ -1018,21 +1270,82 @@ async fn close_repl_context(live: &mut Option<ReplChat>) -> Result<(), CliError>
     Ok(())
 }
 
-fn is_known_repl_command(line: &str) -> bool {
-    line.starts_with('/')
-        && matches!(
-            line.split_whitespace().next(),
-            Some(
-                "/dm"
-                    | "/room"
-                    | "/thread"
-                    | "/back"
-                    | "/members"
-                    | "/status"
-                    | "/publish"
-                    | "/quit"
-            )
-        )
+/// Split REPL arguments on whitespace, honouring double-quoted spans so a
+/// thread title may contain spaces.
+fn repl_arguments(input: &str) -> Result<Vec<String>, CliError> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for character in input.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            _ if character.is_whitespace() && !quoted => {
+                if started {
+                    arguments.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            _ => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if quoted {
+        return Err(CliError::InvalidCommand);
+    }
+    if started {
+        arguments.push(current);
+    }
+    Ok(arguments)
+}
+
+/// `/thread new <title> [--goal <goal>]`. Deliberately not option-heavy;
+/// advanced creation stays in `july thread create`.
+fn parse_thread_new(arguments: &str) -> Result<(String, Option<String>), CliError> {
+    let arguments = repl_arguments(arguments)?;
+    let (title, rest) = arguments.split_first().ok_or(CliError::InvalidCommand)?;
+    if title.trim().is_empty() || title.starts_with("--") {
+        return Err(CliError::InvalidCommand);
+    }
+    let goal = match rest {
+        [] => None,
+        [flag, goal] if flag == "--goal" && !goal.trim().is_empty() => Some(goal.clone()),
+        _ => return Err(CliError::InvalidCommand),
+    };
+    Ok((title.clone(), goal))
+}
+
+/// Resolve the agent a Thread turn is bound to. An explicit `--agent` wins;
+/// otherwise the Thread's single active agent member is used. Zero or several
+/// candidates are reported instead of guessed.
+async fn resolve_thread_agent<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    thread_id: ConversationId,
+    agent: Option<&str>,
+) -> Result<crate::domain::Agent, CliError> {
+    if let Some(agent) = agent {
+        return Ok(service.resolve_agent(agent_ref(agent)?).await?);
+    }
+    let members: Vec<_> = service
+        .list_thread_members(thread_id)
+        .await?
+        .into_iter()
+        .filter(|member| member.left_at.is_none() && member.member_type == MemberType::Agent)
+        .collect();
+    let [member] = members.as_slice() else {
+        return Err(CollaborationError::InvalidCommand(format!(
+            "thread {thread_id} has {} active agent members; use --agent <agent>",
+            members.len()
+        ))
+        .into());
+    };
+    let agent_id = AgentId::from_str(&member.member_id).map_err(|_| CliError::InvalidCommand)?;
+    Ok(service.resolve_agent(AgentRef::Id(agent_id)).await?)
 }
 
 async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
@@ -1048,11 +1361,12 @@ async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
         }
         Some(ReplContext::Thread {
             conversation_id,
+            room_id,
             agent_id,
             ..
         }) => {
             let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
-            open_repl_thread(workspace, &agent, *conversation_id).await?
+            open_repl_thread(workspace, &agent, *conversation_id, *room_id).await?
         }
         _ => return Ok(()),
     };
@@ -1156,6 +1470,7 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
             conversation_id,
             agent_id,
             agent_name,
+            ..
         } => {
             let binding = workspace
                 .storage()
@@ -1350,6 +1665,128 @@ async fn run_publish(
             shutdown: shutdown.to_string(),
         }),
     }
+}
+
+async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), CliError> {
+    let database = database_path()?;
+    if let Some(parent) = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    let output = async {
+        let output = match operation {
+            AgentOperation::Add {
+                name,
+                project,
+                runtime,
+                transport,
+                config,
+            } => {
+                let transport_config = match config {
+                    Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    None => json!({}),
+                };
+                // Identity only: no AgentSession is started, no Room joined.
+                let agent = service
+                    .add_agent(AddAgent {
+                        agent_id: AgentId::new(),
+                        name,
+                        project_root: project,
+                        transport_type: transport,
+                        transport_config,
+                        runtime,
+                        created_at: timestamp(),
+                    })
+                    .await?;
+                Some(render_agent(&agent, json_output))
+            }
+            AgentOperation::List => {
+                let agents = service.list_agents().await?;
+                if json_output {
+                    Some(json!(agents.iter().map(agent_json).collect::<Vec<_>>()).to_string())
+                } else {
+                    let output = agents
+                        .iter()
+                        .map(|agent| render_agent(agent, false))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!output.is_empty()).then_some(output)
+                }
+            }
+            AgentOperation::Show(reference) => {
+                let agent = service.resolve_agent(reference).await?;
+                Some(render_agent(&agent, json_output))
+            }
+            AgentOperation::Remove(reference) => {
+                let agent = service.remove_agent(reference, timestamp()).await?;
+                Some(render_agent(&agent, json_output))
+            }
+        };
+        Ok::<_, CliError>(output)
+    }
+    .await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (output, shutdown) {
+        (Ok(Some(output)), Ok(())) => {
+            println!("{output}");
+            Ok(())
+        }
+        (Ok(None), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+/// The runtime preference an agent was onboarded with, if any.
+fn agent_runtime(agent: &crate::domain::Agent) -> String {
+    agent
+        .metadata
+        .get("runtime")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn agent_json(agent: &crate::domain::Agent) -> serde_json::Value {
+    json!({
+        "agent_id": agent.id.to_string(),
+        "name": agent.name,
+        "project_root": agent.project_root,
+        "transport_type": agent.transport_type,
+        "runtime": agent_runtime(agent),
+        "status": agent.status,
+        "created_at": agent.created_at,
+        "updated_at": agent.updated_at,
+    })
+}
+
+fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
+    if json_output {
+        return agent_json(agent).to_string();
+    }
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}",
+        agent.id,
+        agent.name,
+        agent.project_root,
+        agent.transport_type,
+        agent_runtime(agent),
+        agent.status,
+    )
 }
 
 async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), CliError> {

@@ -172,6 +172,17 @@ impl SqliteStore {
         )
     }
 
+    pub fn list_agents(&self) -> Result<Vec<Agent>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, name, project_root, transport_type, transport_config_json, status,
+                    metadata_json, created_at, updated_at
+             FROM agents ORDER BY name, id",
+            [],
+            records::agent,
+        )
+    }
+
     pub fn update_agent(&self, agent: &Agent) -> Result<bool, StoreError> {
         agent.validate()?;
         let transport_config = serde_json::to_string(&agent.transport_config)?;
@@ -1191,6 +1202,61 @@ impl SqliteStore {
 
     pub fn get_work_item(&self, id: WorkItemId) -> Result<Option<WorkItem>, StoreError> {
         get_work_item(&self.connection, id)
+    }
+
+    pub fn list_work_items(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkItem>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, conversation_id, title, goal, status, owner_agent_id,
+                    is_primary, created_at, updated_at, completed_at
+             FROM work_items WHERE conversation_id = ?1
+             ORDER BY is_primary DESC, created_at, id",
+            params![conversation_id.to_string()],
+            records::work_item,
+        )
+    }
+
+    /// Results produced by the work of one Conversation.
+    pub fn list_work_results(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkResult>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT r.id, r.work_id, r.status, r.summary, r.outputs_json, r.evidence_json,
+                    r.supersedes_result_id, r.created_at
+             FROM work_results r
+             JOIN work_items w ON w.id = r.work_id
+             WHERE w.conversation_id = ?1
+             ORDER BY r.created_at, r.id",
+            params![conversation_id.to_string()],
+            records::work_result,
+        )
+    }
+
+    /// Conversations that depend on this one's work; the deterministic
+    /// `/publish` targets. Zero means no link, more than one means ambiguous.
+    pub fn list_downstream_conversations(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<ConversationId>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT DISTINCT downstream.conversation_id
+             FROM work_items upstream
+             JOIN work_dependencies dependency
+               ON dependency.upstream_work_id = upstream.id
+             JOIN work_items downstream
+               ON downstream.id = dependency.downstream_work_id
+             WHERE upstream.conversation_id = ?1
+               AND downstream.conversation_id <> ?1
+             ORDER BY downstream.conversation_id",
+            params![conversation_id.to_string()],
+            records::conversation_id,
+        )
     }
 
     pub fn assign_work_owner(

@@ -1,6 +1,7 @@
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, MessageId,
     Room, RoomId, RoomMember, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId,
+    WorkResult,
 };
 use thiserror::Error;
 
@@ -49,6 +50,19 @@ pub struct RemoveRoomMember {
     pub room: RoomRef,
     pub agent: AgentRef,
     pub changed_at: String,
+}
+
+/// Agent onboarding: identity plus its project binding. Runtime preference is
+/// configuration, not identity, so it is stored as metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddAgent {
+    pub agent_id: AgentId,
+    pub name: String,
+    pub project_root: String,
+    pub transport_type: String,
+    pub transport_config: serde_json::Value,
+    pub runtime: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,6 +160,8 @@ pub enum CollaborationError {
     RoomIdConflict(RoomId),
     #[error("room name {0} already exists")]
     RoomNameConflict(String),
+    #[error("agent name {0} already exists")]
+    AgentNameConflict(String),
     #[error("thread id {0} already exists")]
     ThreadIdConflict(ConversationId),
     #[error("primary work id {0} already exists")]
@@ -219,6 +235,17 @@ pub trait CollaborationRuntime {
     async fn get_room_by_name(&mut self, name: String) -> Result<Option<Room>, CollaborationError>;
     async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError>;
     async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError>;
+    async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError>;
+    async fn create_agent(&mut self, agent: Agent) -> Result<(), CollaborationError>;
+    async fn update_agent(&mut self, agent: Agent) -> Result<bool, CollaborationError>;
+    async fn list_work_items(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkItem>, CollaborationError>;
+    async fn list_work_results(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkResult>, CollaborationError>;
     async fn get_agent_by_name(
         &mut self,
         name: String,
@@ -298,6 +325,24 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
 
     pub async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
         self.runtime.list_rooms().await
+    }
+
+    pub async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
+        self.runtime.list_agents().await
+    }
+
+    pub async fn list_work_items(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkItem>, CollaborationError> {
+        self.runtime.list_work_items(conversation_id).await
+    }
+
+    pub async fn list_work_results(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<WorkResult>, CollaborationError> {
+        self.runtime.list_work_results(conversation_id).await
     }
 
     pub async fn list_room_members(
@@ -413,5 +458,53 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
             AgentRef::Name(name) => (self.runtime.get_agent_by_name(name.clone()).await?, name),
         };
         found.ok_or(CollaborationError::AgentNotFound(display))
+    }
+
+    /// Onboard a project-owned agent. This creates a persistent logical Agent
+    /// identity bound to a project; it starts no AgentSession and grants no
+    /// Room membership.
+    pub async fn add_agent(&mut self, command: AddAgent) -> Result<Agent, CollaborationError> {
+        if self
+            .runtime
+            .get_agent_by_name(command.name.clone())
+            .await?
+            .is_some()
+        {
+            return Err(CollaborationError::AgentNameConflict(command.name));
+        }
+        let metadata = match &command.runtime {
+            Some(runtime) => serde_json::json!({ "runtime": runtime }),
+            None => serde_json::json!({}),
+        };
+        let agent = Agent {
+            id: command.agent_id,
+            name: command.name,
+            project_root: command.project_root,
+            transport_type: command.transport_type,
+            transport_config: command.transport_config,
+            status: "active".into(),
+            metadata,
+            created_at: command.created_at.clone(),
+            updated_at: command.created_at,
+        };
+        agent
+            .validate()
+            .map_err(|error| CollaborationError::InvalidCommand(error.to_string()))?;
+        self.runtime.create_agent(agent.clone()).await?;
+        Ok(agent)
+    }
+
+    /// Retire an agent identity. Rooms, Threads, and transcripts are left
+    /// untouched; only the agent stops being active.
+    pub async fn remove_agent(
+        &mut self,
+        reference: AgentRef,
+        changed_at: String,
+    ) -> Result<Agent, CollaborationError> {
+        let mut agent = self.resolve_agent(reference).await?;
+        agent.status = "inactive".into();
+        agent.updated_at = changed_at;
+        self.runtime.update_agent(agent.clone()).await?;
+        Ok(agent)
     }
 }
