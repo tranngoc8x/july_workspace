@@ -1,31 +1,23 @@
-# JULY WORKSPACE — AGENT INTEROPERABILITY PREPARATION PLAN
+# JULY WORKSPACE — A2A INTEROPERABILITY UPGRADE PLAN
 
 ## 1. Mục tiêu
 
-Chuẩn bị architecture hiện tại để tương lai có thể thêm A2A hoặc protocol khác mà không phải rewrite Task Manager.
+Bổ sung khả năng để July Workspace kết nối và cộng tác với các agent bên ngoài thông qua A2A protocol.
 
-Phase này:
+A2A chỉ là một interoperability adapter của July.
 
-> KHÔNG implement A2A.
+Nguyên tắc kiến trúc:
 
-Không cần:
+> Task Manager owns collaboration state.
+> A2A transports collaboration across workspace boundaries.
 
-- A2A SDK
-- A2A Server
-- A2A Client
-- Agent Card
-- remote discovery
-- remote authentication
-- A2A Task
-- network transport
+July Task Manager tiếp tục là source of truth.
 
-Mục tiêu duy nhất:
-
-> Tạo đúng abstraction boundary ngay từ bây giờ.
+A2A Task không thay thế July Task.
 
 ---
 
-# 2. Architecture cần đạt sau phase này
+# 2. Kiến trúc mục tiêu
 
 ```text
                      JULY WORKSPACE
@@ -37,700 +29,475 @@ Mục tiêu duy nhất:
                           ▼
                     Task Manager
                           │
-                          ▼
-                  Agent Runtime API
+                 Collaboration Layer
                           │
-                   Adapter Boundary
-                          │
-             ┌────────────┼────────────┐
-             ▼            ▼            ▼
-          current       current       future
-          runtime       runtime
-                                      A2A
+              ┌───────────┼───────────┐
+              │           │           │
+             ACP         SDK         A2A
+              │           │           │
+              ▼           ▼           ▼
+        Internal Agent Internal   External Agent
 ```
 
-Task Manager tuyệt đối không phụ thuộc runtime cụ thể.
+A2A chỉ xuất hiện tại Agent Runtime / Adapter boundary.
+
+Không đưa A2A concepts vào domain core nếu không cần thiết.
 
 ---
 
-# 3. Khóa domain primitives
+# 3. Nguyên tắc bắt buộc
 
-Core collaboration model của July chỉ dùng:
-
-```text
-Task
-Message
-Result
-Artifact
-```
-
-Không thêm A2A primitives vào core.
-
-Không tạo:
-
-```text
-A2ATask
-A2AMessage
-AgentCard
-```
-
-trong domain layer.
-
----
-
-# 4. Khóa Task ownership model
-
-Task cần thể hiện rõ:
-
-```text
-Task
-{
-    id
-    room_id
-    thread_id
-
-    parent_task_id
-
-    requester_agent_id
-    owner_agent_id
-
-    status
-
-    dependencies
-
-    created_at
-    updated_at
-}
-```
-
-Quan trọng nhất:
-
-```text
-requester_agent_id
-owner_agent_id
-```
-
-Không sử dụng runtime/session làm ownership.
-
-Không:
-
-```text
-owner_session_id
-owner_process_id
-owner_claude_session
-```
-
-Phase 4 chỉ tạo primary Work cùng Thread để khóa aggregate boundary. Work này
-chưa có `owner_agent_id`; requester/owner semantics và Work lifecycle vẫn được
-khóa ở Phase 6. Không dùng membership hoặc runtime session làm ownership tạm.
-
----
-
-# 5. Tách runtime identity khỏi Agent identity
-
-Agent:
-
-```text
-Agent
-{
-    id
-    project_id
-    name
-}
-```
-
-Runtime:
-
-```text
-AgentRuntime
-{
-    agent_id
-    adapter
-    runtime_ref
-}
-```
-
-Ví dụ hiện tại:
-
-```text
-Agent:
-    cashpoint
-
-Runtime:
-    adapter = acp
-    runtime_ref = ...
-```
-
-Sau này có thể là:
-
-```text
-Agent:
-    external-pay
-
-Runtime:
-    adapter = a2a
-    runtime_ref = ...
-```
-
-Task Manager không thay đổi.
-
----
-
-# 6. Tạo Agent Adapter interface
-
-Đây là thay đổi quan trọng nhất của plan.
-
-Task Manager không được gọi trực tiếp:
-
-```text
-Claude
-Codex
-ACP
-CLI
-process
-session
-```
-
-Task Manager chỉ gọi một internal interface.
-
-Ví dụ conceptual interface:
-
-```text
-AgentAdapter
-
-start(...)
-resume(...)
-send(...)
-cancel(...)
-status(...)
-```
-
-Tên method cụ thể có thể thay đổi theo implementation.
-
-Điều quan trọng là dependency direction:
-
-```text
-Task Manager
-     ↓
-AgentAdapter
-     ↓
-Runtime implementation
-```
-
-Không được:
-
-```text
-Task Manager
-     ↓
-ACP-specific code
-```
-
----
-
-# 7. Chuẩn hóa runtime response
-
-Runtime không trả object riêng của provider trực tiếp cho Task Manager.
-
-Normalize về một internal response.
+## 3.1 July Task là canonical
 
 Ví dụ:
 
 ```text
-AgentExecutionResult
+JulyTask
 {
-    status
-    messages
-    result
-    artifacts
-    runtime_ref
+    id: "task-123"
+    owner_agent_id: "pay"
+    requester_agent_id: "cashpoint"
+    status: "working"
 }
 ```
 
-Task Manager chỉ hiểu internal model này.
-
----
-
-# 8. Chuẩn hóa runtime error
-
-Không để exception của provider leak lên domain layer.
-
-Normalize tối thiểu:
+Nếu chạy qua A2A:
 
 ```text
-AgentUnavailable
-ExecutionFailed
-Timeout
-Canceled
-InvalidResponse
-```
-
-Sau này A2A có thể map lỗi của nó về cùng error model.
-
----
-
-# 9. Tách runtime binding khỏi Task
-
-Không nhét runtime-specific fields trực tiếp vào Task.
-
-Không:
-
-```text
-Task
+RuntimeBinding
 {
-    claude_session_id
-    codex_thread_id
-    acp_session
+    task_id: "task-123"
+    adapter: "a2a"
+    remote_task_id: "remote-task-892"
 }
 ```
 
-Thay bằng:
+`remote_task_id` không được trở thành primary identity của task trong July.
+
+---
+
+## 3.2 Không leak A2A vào Task Manager
+
+Task Manager không được chứa logic như:
 
 ```text
-TaskRuntimeBinding
+if protocol == A2A ...
+```
+
+Thay vào đó:
+
+```text
+Task Manager
+    ↓
+Agent Adapter interface
+    ↓
+A2A Adapter
+```
+
+Tất cả protocol-specific logic nằm trong adapter.
+
+---
+
+## 3.3 Results cross boundaries, transcripts don't
+
+External agent có thể trả:
+
+- Message
+- Result
+- Artifact
+- Status
+
+Nhưng private runtime transcript của external agent không trở thành context mặc định của agent khác.
+
+---
+
+## 3.4 Agent runtime independence
+
+Agent gọi agent khác không cần biết:
+
+- remote URL
+- protocol version
+- authentication method
+- model
+- framework
+- session ID
+- provider
+
+Agent chỉ cần biết:
+
+```text
+target_agent = "pay"
+```
+
+July chịu trách nhiệm resolution.
+
+---
+
+# 4. Workstream A — A2A Agent Adapter
+
+Implement một adapter mới:
+
+```text
+AgentAdapter
+    ├── ACPAdapter
+    ├── SDKAdapter
+    └── A2AAdapter
+```
+
+A2AAdapter chịu trách nhiệm:
+
+- connect remote agent
+- send messages
+- create/continue remote tasks
+- receive status
+- receive artifacts
+- normalize errors
+- map remote task state về July state
+
+Task Manager không trực tiếp gọi A2A SDK/API.
+
+---
+
+# 5. Workstream B — Agent Card / Discovery
+
+Bổ sung metadata cho external agents.
+
+Ví dụ logical model:
+
+```text
+AgentDefinition
 {
-    task_id
-    agent_id
+    id
+    name
+    project
     adapter
-    runtime_ref
+    capabilities
+    connection
 }
 ```
 
-Điều này giúp tương lai thêm:
+External A2A agent:
 
 ```text
-remote_task_id
+agent:
+  id: external-pay
+  adapter: a2a
+
+connection:
+  endpoint: ...
 ```
 
-mà không thay đổi Task schema.
+Agent Card của A2A được adapter đọc và normalize thành internal `AgentDefinition`.
+
+Task Manager chỉ nhìn thấy internal representation.
 
 ---
 
-# 10. Message phải độc lập transport
+# 6. Workstream C — Task Mapping
 
-Internal Message:
+Implement mapping:
+
+```text
+July Task
+    ↕
+A2A Task
+```
+
+Mapping cần lưu:
+
+```text
+task_id
+adapter
+remote_agent_id
+remote_task_id
+remote_context_id
+created_at
+updated_at
+```
+
+Không đưa các field này trực tiếp vào core Task nếu có thể tránh.
+
+Sử dụng runtime binding / external binding riêng.
+
+---
+
+# 7. Workstream D — Message Mapping
+
+Mapping:
+
+```text
+July Message
+      ↕
+A2A Message
+```
+
+Internal message cần giữ semantics độc lập protocol:
 
 ```text
 Message
 {
     id
     task_id
-
-    from_agent_id
-    to_agent_id
-
+    from_agent
+    to_agent
     content
     created_at
 }
 ```
 
-Không thêm:
-
-```text
-acp_message
-claude_message
-a2a_message
-```
-
-vào domain model.
-
-Adapter chịu trách nhiệm chuyển đổi.
+A2AAdapter chịu trách nhiệm serialization/deserialization.
 
 ---
 
-# 11. Result boundary
+# 8. Workstream E — Result & Artifact Mapping
 
-Khóa invariant:
-
-> Results cross boundaries, transcripts don't.
-
-Result cần là object riêng khỏi runtime transcript.
-
-Ví dụ:
+Mapping:
 
 ```text
-Result
-{
-    task_id
-    summary
-    artifacts
-    decisions
-    evidence
-}
+A2A Artifact
+      ↓
+July Artifact
 ```
 
-Agent khác chỉ nhận những thứ được publish qua collaboration boundary.
-
-Không tự động inject toàn bộ session transcript của agent owner.
-
----
-
-# 12. Artifact model
-
-Artifact nên có identity riêng.
-
-Ví dụ:
+và:
 
 ```text
-Artifact
-{
-    id
-    task_id
-    producer_agent_id
-    type
-    reference
-    metadata
-}
+A2A task completion
+      ↓
+July Result
 ```
 
-Không phụ thuộc artifact nằm:
-
-- local filesystem
-- database
-- remote A2A agent
-- future object store
-
-Artifact reference nên đủ abstraction để thay backend sau này.
-
----
-
-# 13. Agent Registry boundary
-
-Task Manager nên resolve:
-
-```text
-agent_id
-```
-
-thông qua Agent Registry/Resolver.
+Result được publish về parent task/thread.
 
 Ví dụ:
 
 ```text
 cashpoint
-pay
-gateway
-```
-
-Task Manager không tự hard-code cách chạy từng agent.
-
-Flow:
-
-```text
-Task
- ↓
-owner_agent_id
- ↓
-Agent Registry
- ↓
-Agent Runtime configuration
- ↓
-Adapter
-```
-
----
-
-# 14. Dependency flow
-
-Cross-agent collaboration phải trở thành dependency giữa tasks.
-
-Ví dụ:
-
-```text
-Task A
-owner: cashpoint
-
-    ↓ needs
-
-Task B
-owner: pay
-```
-
-Khi Task B hoàn thành:
-
-```text
-Result B
-    ↓
+    │
+ Task #123
+    │
+    ▼
 Task Manager
-    ↓
-dependency resolved
-    ↓
-Task A resumes
+    │
+ A2A Adapter
+    │
+    ▼
+External pay agent
+    │
+ Artifact
+    ▼
+A2A Adapter
+    │
+ Result
+    ▼
+Task #123
+    │
+    ▼
+cashpoint
 ```
-
-Điều này cần hoạt động hoàn toàn không cần A2A.
-
-Sau này Task B có chạy qua A2A hay không cũng không ảnh hưởng flow này.
 
 ---
 
-# 15. Conversation vs Task
+# 9. Workstream F — Lifecycle Mapping
 
-Không tạo communication subsystem riêng.
-
-Message thuộc collaboration context/task.
+Xây mapping rõ ràng giữa remote state và July state.
 
 Ví dụ:
 
 ```text
-Task #123
-│
-├── Message cashpoint → pay
-├── Message pay → cashpoint
-│
-└── Result
+remote submitted    → pending
+remote working      → working
+remote completed    → completed
+remote failed       → failed
+remote canceled     → canceled
 ```
 
-Task Manager tiếp tục là communication backbone.
+Không expose trực tiếp protocol-specific states vào toàn bộ July.
+
+Unknown state phải được xử lý an toàn.
 
 ---
 
-# 16. Persistence
+# 10. Workstream G — Error Handling
 
-Persistence layer cần lưu đủ:
+Các lỗi remote cần normalize:
 
 ```text
-Task
-Message
-Result
-Artifact
-TaskRuntimeBinding
+AgentUnavailable
+AuthenticationFailed
+RemoteTaskFailed
+ProtocolError
+Timeout
+UnsupportedCapability
+```
+
+Task Manager nhận domain error.
+
+Không nhận raw transport exception.
+
+---
+
+# 11. Workstream H — Persistence & Recovery
+
+July cần có khả năng restart mà không mất mapping:
+
+```text
+July Task
+↔
+Remote A2A Task
 ```
 
 Sau restart:
 
+1. load task
+2. load runtime binding
+3. reconnect adapter
+4. query/resume remote task nếu hỗ trợ
+5. reconcile trạng thái
+6. tiếp tục workflow
+
+---
+
+# 12. Workstream I — Capability Validation
+
+Trước khi dispatch:
+
 ```text
 Task Manager
     ↓
-load task
+Agent Registry
     ↓
-load binding
-    ↓
-resolve adapter
-    ↓
-resume runtime
+capabilities
 ```
 
-Task không được phụ thuộc process memory.
+Nếu agent không hỗ trợ capability cần thiết:
+
+```text
+UnsupportedCapability
+```
+
+Không dispatch rồi mới phát hiện nếu metadata đã đủ để quyết định trước.
 
 ---
 
-# 17. Add architectural extension point
+# 13. Workstream J — Security Boundary
 
-Document architecture phải ghi rõ:
+External agent phải được xem là trust boundary khác.
 
-```text
-Agent Adapter
-    ├── current adapters
-    └── future interoperability adapters
-```
+Không gửi mặc định:
 
-Có thể ghi A2A như ví dụ:
+- full thread transcript
+- private agent transcript
+- toàn bộ project context
+- credentials
+- unrelated artifacts
 
-```text
-future:
-    A2AAdapter
-```
+Chỉ gửi context cần thiết cho task.
 
-Nhưng không implement.
+Principle:
 
----
-
-# 18. Thêm architecture invariant tests
-
-Nếu project hiện tại có architecture/unit tests, thêm guardrails để tránh regression.
-
-Ví dụ cần detect:
-
-- Task Manager import trực tiếp ACP implementation.
-- Task chứa provider-specific session fields.
-- Agent identity phụ thuộc runtime identity.
-- transcript được publish như Result.
-- cross-agent task bypass Task Manager.
-
-Không nhất thiết phải viết static analyzer phức tạp.
-
-Có thể bắt đầu bằng unit/integration tests.
+> Minimum required collaboration context.
 
 ---
 
-# 19. Test scenario bắt buộc
+# 14. Testing
 
-## Scenario 1 — Agent A giao việc Agent B
+## Unit tests
+
+- Task ↔ A2A Task mapping
+- Message mapping
+- Artifact mapping
+- status mapping
+- error normalization
+- capability parsing
+
+## Integration tests
 
 ```text
-cashpoint
-    ↓
-Task Manager
-    ↓
-child task owner=pay
-    ↓
-pay runtime
-    ↓
+July
+ ↓
+A2A Adapter
+ ↓
+Mock A2A Agent
+```
+
+Test:
+
+- create task
+- message exchange
+- completed task
+- failed task
+- artifact returned
+- timeout
+- reconnect
+
+## Cross-agent test
+
+```text
+Internal Agent A
+      ↓
+July Task Manager
+      ↓
+A2A
+      ↓
+External Agent B
+      ↓
 Result
-    ↓
-cashpoint task resumes
+      ↓
+Agent A
 ```
 
-Không agent nào gọi runtime của agent còn lại trực tiếp.
+---
+
+# 15. Không làm trong phase này
+
+Không biến July thành:
+
+- generic A2A server framework
+- A2A gateway product
+- distributed agent mesh
+- service discovery platform
+- protocol proxy
+
+Không support tất cả A2A features chỉ vì protocol có chúng.
+
+Chỉ implement những gì July collaboration model thực sự cần.
 
 ---
 
-## Scenario 2 — runtime replacement
+# 16. Definition of Done
 
-Cùng một Agent:
+Phase hoàn thành khi:
 
-```text
-pay
-```
-
-đổi runtime adapter A → adapter B.
-
-Task Manager không cần sửa logic.
-
----
-
-## Scenario 3 — restart
-
-Trong lúc child task đang working:
-
-```text
-July stops
-   ↓
-restart
-   ↓
-load TaskRuntimeBinding
-   ↓
-resume/reconcile runtime
-```
-
-Không mất ownership/dependency.
+1. Một external A2A agent có thể đăng ký vào July.
+2. July có thể dispatch một Task tới agent đó.
+3. Message có thể đi qua adapter.
+4. Remote task status được map về July.
+5. Artifact/result được đưa trở lại July Thread.
+6. Restart July không làm mất remote task binding.
+7. Agent nội bộ không cần biết task được xử lý qua A2A.
+8. Task Manager không chứa A2A-specific business logic.
+9. Transcript isolation vẫn được giữ.
+10. Existing ACP/SDK/internal agents hoạt động như trước.
 
 ---
 
-## Scenario 4 — transcript isolation
+# 17. Architecture invariant
 
-Agent B làm task bằng nhiều internal messages/tool calls.
-
-Agent A cuối cùng chỉ nhận:
-
-```text
-explicit shared messages
-+
-Result
-+
-Artifacts
-```
-
-Không nhận private transcript.
-
----
-
-# 20. Không làm trong phase này
-
-Không:
-
-- implement A2A
-- research sâu A2A transport
-- expose July thành A2A server
-- remote agent discovery
-- authentication system cho external agents
-- protocol negotiation
-- distributed orchestration
-- message broker
-- agent mesh
-
-Nếu một thay đổi chỉ phục vụ A2A mà không cải thiện abstraction hiện tại:
-
-> defer.
-
----
-
-# 21. Deliverables
-
-Phase này cần tạo/hoàn thiện:
-
-1. Agent Adapter abstraction.
-2. Runtime-independent Agent identity.
-3. TaskRuntimeBinding.
-4. Internal Message model.
-5. Internal Result model.
-6. Internal Artifact model.
-7. Runtime response normalization.
-8. Runtime error normalization.
-9. Agent Registry/Resolver boundary.
-10. Cross-agent task dependency flow.
-11. Transcript isolation rules.
-12. Architecture documentation.
-13. Tests cho adapter independence.
-
----
-
-# 22. Definition of Done
-
-Plan được coi là hoàn thành khi:
-
-1. Task Manager không biết agent đang chạy bằng Claude, Codex, ACP hay runtime nào khác.
-2. Agent ownership dùng `agent_id`, không dùng session/process.
-3. Runtime-specific identifiers nằm ngoài Task.
-4. Cross-agent work đi qua Task Manager.
-5. Cross-agent dependency hoạt động.
-6. Message/Result/Artifact có internal representation.
-7. Runtime errors được normalize.
-8. Runtime có thể thay adapter mà Task Manager không đổi.
-9. Private transcript không vượt agent boundary.
-10. Không có A2A runtime dependency nào được thêm.
-11. Architecture có extension point rõ ràng cho future A2A adapter.
-
----
-
-# 23. Architectural note cần thêm ngay
-
-> External agent interoperability is intentionally deferred.
->
-> July's Task Manager remains the canonical owner of collaboration state.
->
-> Agent execution must pass through a runtime adapter boundary so protocols such as A2A can be introduced later without changing the Task Manager, task ownership model, dependency model, or result propagation semantics.
->
-> Results and explicitly shared messages may cross agent boundaries; private runtime transcripts do not.
-
----
-
-# 24. Kết quả mong muốn
-
-Trước phase:
+Sau khi hoàn thành phase:
 
 ```text
 Task Manager
-    ↓
-runtime-specific implementation
-```
-
-Sau phase:
-
-```text
-Task Manager
-    ↓
+     │
+     ▼
 Agent Adapter
-    ↓
-runtime
+     │
+     ├── Internal
+     ├── ACP
+     ├── SDK
+     └── A2A
 ```
 
-Và phase tiếp theo chỉ cần:
+A2A là một khả năng mới của July.
 
-```text
-Agent Adapter
-    ↓
-A2A Adapter   ← add
-```
-
-thay vì:
-
-```text
-rewrite Task Manager
-rewrite Task
-rewrite agent ownership
-rewrite dependencies
-rewrite messaging
-```
-
-Đó là mục tiêu quan trọng nhất của phase chuẩn bị này.
+Nó không trở thành nền móng mới của July.
