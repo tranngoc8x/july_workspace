@@ -86,14 +86,23 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
         }
         self.active = false;
 
-        let screen = execute!(self.writer, Show, LeaveAlternateScreen);
+        let show = execute!(self.writer, Show);
+        let leave = execute!(self.writer, LeaveAlternateScreen);
         let raw = self.raw_mode.disable();
-        match (screen, raw) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(screen), Err(raw)) => Err(io::Error::other(format!(
-                "screen restore failed: {screen}; raw-mode restore failed: {raw}"
-            ))),
+        let mut errors = Vec::new();
+        if let Err(error) = show {
+            errors.push(format!("show cursor failed: {error}"));
+        }
+        if let Err(error) = leave {
+            errors.push(format!("leave alternate screen failed: {error}"));
+        }
+        if let Err(error) = raw {
+            errors.push(format!("disable raw mode failed: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
         }
     }
 }
@@ -304,6 +313,24 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct FailingRestoreWriter(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for FailingRestoreWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            if bytes == b"\x1b[?25l" || bytes == b"\x1b[?25h" || bytes == b"\x1b[?1049l" {
+                Err(io::Error::other("screen write failed"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn setup(disable_error: bool) -> (SharedWriter, FakeRawMode) {
         let calls = Rc::new(RefCell::new(Vec::new()));
         (
@@ -343,6 +370,31 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("operation failed"), "{message}");
         assert!(message.contains("restore failed"), "{message}");
+    }
+
+    #[test]
+    fn partial_init_and_cursor_restore_failures_still_leave_screen_and_disable_raw_mode() {
+        let writer = FailingRestoreWriter::default();
+        let output = writer.0.clone();
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let raw_mode = FakeRawMode {
+            calls: calls.clone(),
+            disable_error: true,
+        };
+
+        let error = run_with_terminal(writer, raw_mode, |_| Ok(())).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("screen write failed"), "{message}");
+        assert!(
+            message.contains("leave alternate screen failed"),
+            "{message}"
+        );
+        assert!(message.contains("restore failed"), "{message}");
+        let output = output.borrow();
+        assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
+        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
+        assert_eq!(*calls.borrow(), ["enable", "disable"]);
     }
 
     #[test]

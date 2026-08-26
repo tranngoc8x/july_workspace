@@ -86,11 +86,35 @@ fn pty_sighup_restores_terminal() {
     assert_restored(child, Some(format!("SIGHUP child {pid}")));
 }
 
+#[test]
+fn dropping_pty_child_kills_and_reaps_it() {
+    let pid = {
+        let mut child = spawn_pty("inactive");
+        child.wait_for(ENTER_SCREEN);
+        child.child.id() as libc::pid_t
+    };
+
+    let mut status = 0;
+    let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if waited == 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &mut status, 0);
+        }
+    }
+    assert_eq!(waited, -1, "dropped PTY child was not reaped");
+    assert_eq!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
 struct PtyChild {
     child: Child,
     master: File,
     initial_termios: libc::termios,
     output: Vec<u8>,
+    reaped: bool,
 }
 
 impl PtyChild {
@@ -141,6 +165,7 @@ impl PtyChild {
         let status = loop {
             self.read_once();
             if let Some(status) = self.child.try_wait().unwrap() {
+                self.reaped = true;
                 break status;
             }
             assert!(Instant::now() < deadline, "child did not exit");
@@ -158,7 +183,36 @@ impl PtyChild {
             "tcgetattr failed: {}",
             io::Error::last_os_error()
         );
-        (status, self.output, termios)
+        (status, std::mem::take(&mut self.output), termios)
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        match self.child.try_wait() {
+            Ok(Some(_)) => {
+                self.reaped = true;
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(_) => return,
+            }
+        }
     }
 }
 
@@ -220,6 +274,7 @@ fn spawn_pty(mode: &str) -> PtyChild {
         master,
         initial_termios,
         output: Vec::new(),
+        reaped: false,
     }
 }
 
