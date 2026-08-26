@@ -15,6 +15,9 @@ pub mod adapter;
 /// Minimal terminal presentation for the current roadmap phase.
 pub mod cli;
 
+/// Full-screen terminal ownership and restoration.
+pub mod tui;
+
 /// Long-lived process and session lifecycle ownership.
 pub mod runtime;
 
