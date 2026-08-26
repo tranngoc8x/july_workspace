@@ -12,7 +12,7 @@ use crate::domain::{
 };
 use crate::runtime::{
     AgentDirectMessageRuntime, AgentThreadRuntime, DirectMessageBootstrapError, StorageWorker,
-    WorkspaceRuntime, open_acp_direct_message, register_acp_agent,
+    WorkspaceRuntime, open_acp_direct_message, parse_acp_config, register_acp_agent,
 };
 use crate::transport::AcpTransport;
 use chrono::{SecondsFormat, Utc};
@@ -1794,8 +1794,15 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
             } => {
                 let transport_config = match (adapter, config) {
                     (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
-                    (None, Some(path)) => serde_json::from_str(&std::fs::read_to_string(path)?)
-                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    (None, Some(path)) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&std::fs::read_to_string(path)?)
+                                .map_err(|error| CliError::Runtime(error.to_string()))?;
+                        if transport == "acp" {
+                            parse_acp_config(&value)?;
+                        }
+                        value
+                    }
                     (None, None) if transport == "acp" => return Err(CliError::MissingAdapter),
                     (None, None) => json!({}),
                     (Some(_), Some(_)) => return Err(CliError::Usage),
@@ -1843,8 +1850,13 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 let name = service.resolve_agent(agent.clone()).await?.name;
                 let transport_config = match (adapter, config) {
                     (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
-                    (None, Some(path)) => serde_json::from_str(&std::fs::read_to_string(path)?)
-                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    (None, Some(path)) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&std::fs::read_to_string(path)?)
+                                .map_err(|error| CliError::Runtime(error.to_string()))?;
+                        parse_acp_config(&value)?;
+                        value
+                    }
                     _ => return Err(CliError::AgentUsage),
                 };
                 let agent = service

@@ -204,7 +204,15 @@ fn agent_list_show_and_remove_render_human_and_json() {
     let config = workspace.root.join("codex.json");
     std::fs::write(
         &config,
-        json!({ "executable": "/usr/bin/codex", "arguments": ["acp"] }).to_string(),
+        json!({
+            "executable": "/usr/bin/codex",
+            "arguments": ["acp"],
+            "environment": {},
+            "state_directory": "/work/state/codex",
+            "expected_agent_name": "Codex",
+            "expected_agent_version": "1.0.0",
+        })
+        .to_string(),
     )
     .unwrap();
     let cashpoint = workspace.run(&[
@@ -401,8 +409,19 @@ fn agent_update_replaces_the_persisted_config_through_the_cli() {
     let workspace = TestWorkspace::new();
     let old_config = workspace.root.join("old.json");
     let new_config = workspace.root.join("new.json");
-    std::fs::write(&old_config, json!({ "executable": "/old/bin" }).to_string()).unwrap();
-    std::fs::write(&new_config, json!({ "executable": "/new/bin" }).to_string()).unwrap();
+    let base_config = |executable: &str| {
+        json!({
+            "executable": executable,
+            "arguments": [],
+            "environment": {},
+            "state_directory": "/work/state/cashpoint",
+            "expected_agent_name": "Codex",
+            "expected_agent_version": "1.0.0",
+        })
+        .to_string()
+    };
+    std::fs::write(&old_config, base_config("/old/bin")).unwrap();
+    std::fs::write(&new_config, base_config("/new/bin")).unwrap();
 
     let added = workspace.run(&[
         "agent",
@@ -449,5 +468,85 @@ fn agent_update_replaces_the_persisted_config_through_the_cli() {
     assert_eq!(
         serde_json::from_str::<Value>(&config).unwrap()["executable"],
         "/new/bin"
+    );
+}
+
+#[test]
+fn agent_add_rejects_an_unparseable_acp_config_and_persists_nothing() {
+    let workspace = TestWorkspace::new();
+    let config = workspace.root.join("bad.json");
+    std::fs::write(&config, json!({ "executable": "" }).to_string()).unwrap();
+
+    let output = workspace.run(&[
+        "agent",
+        "add",
+        "victim",
+        "--project",
+        "/tmp",
+        "--transport",
+        "acp",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("field `executable` must be a non-empty string"));
+    assert_eq!(workspace.count("SELECT COUNT(*) FROM agents"), 0);
+}
+
+#[test]
+fn agent_update_rejects_an_unparseable_acp_config_and_leaves_the_stored_config_unchanged() {
+    let workspace = TestWorkspace::new();
+    let good_config = workspace.root.join("good.json");
+    let bad_config = workspace.root.join("bad.json");
+    std::fs::write(
+        &good_config,
+        json!({
+            "executable": "/old/bin",
+            "arguments": [],
+            "environment": {},
+            "state_directory": "/work/state/cashpoint",
+            "expected_agent_name": "Codex",
+            "expected_agent_version": "1.0.0",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(&bad_config, json!({ "executable": "" }).to_string()).unwrap();
+
+    let added = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--transport",
+        "acp",
+        "--config",
+        good_config.to_str().unwrap(),
+    ]);
+    assert!(added.status.success(), "stderr: {}", stderr(&added));
+
+    let updated = workspace.run(&[
+        "agent",
+        "update",
+        "cashpoint",
+        "--config",
+        bad_config.to_str().unwrap(),
+    ]);
+    assert!(!updated.status.success());
+    assert!(stderr(&updated).contains("field `executable` must be a non-empty string"));
+
+    let config: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT transport_config_json FROM agents WHERE name = 'cashpoint'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&config).unwrap()["executable"],
+        "/old/bin"
     );
 }

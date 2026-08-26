@@ -9,7 +9,6 @@ mod storage_worker;
 mod thread;
 mod workspace;
 
-#[cfg(test)]
 pub(crate) use direct_message::parse_acp_config;
 pub(crate) use direct_message::register_acp_agent;
 pub use direct_message::{
