@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 
 // ponytail: no caller yet - Task 8 (onboarding) wires this up next. Remove
 // once that lands and the dead_code lint finds a real caller on its own.
+mod init;
 #[allow(dead_code)]
 mod keys;
 pub mod registry;
