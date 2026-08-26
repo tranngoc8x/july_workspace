@@ -464,23 +464,18 @@ fn validate_handshake(
     config: &AcpAgentConfig,
     initialized: &agent_client_protocol::schema::v1::InitializeResponse,
 ) -> Result<(), TransportError> {
-    if initialized.protocol_version != ProtocolVersion::V1 {
-        return Err(TransportError::UnsupportedProtocol {
-            expected: 1,
-            actual: initialized.protocol_version.as_u16(),
-        });
-    }
-    let info =
-        initialized
-            .agent_info
-            .as_ref()
-            .ok_or_else(|| TransportError::UnexpectedAgentIdentity {
+    let info = checked_agent_info(initialized).map_err(|error| match error {
+        TransportError::UnexpectedAgentIdentity { actual, .. } => {
+            TransportError::UnexpectedAgentIdentity {
                 expected: format!(
                     "{} {}",
                     config.expected_agent_name, config.expected_agent_version
                 ),
-                actual: "missing agentInfo".into(),
-            })?;
+                actual,
+            }
+        }
+        other => other,
+    })?;
     let actual = format!("{} {}", info.name, info.version);
     let expected = format!(
         "{} {}",
@@ -1025,14 +1020,10 @@ pub async fn probe_agent_identity(
             },
         );
 
-    match tokio::time::timeout(PROBE_TIMEOUT, async {
-        let handshake = tokio::spawn(connection);
-        let identity = identity.await;
-        handshake.abort();
-        identity
-    })
-    .await
-    {
+    let handshake = tokio::spawn(connection);
+    let result = tokio::time::timeout(PROBE_TIMEOUT, identity).await;
+    handshake.abort();
+    match result {
         Ok(Ok(identity)) => identity,
         Ok(Err(_)) => Err(TransportError::ChannelClosed),
         Err(_) => Err(TransportError::InvalidConfiguration(
@@ -1041,23 +1032,31 @@ pub async fn probe_agent_identity(
     }
 }
 
-fn read_identity(
-    initialized: agent_client_protocol::schema::v1::InitializeResponse,
-) -> Result<AgentIdentity, TransportError> {
+/// Kiểm tra protocol version và sự có mặt của `agentInfo` - dùng chung bởi
+/// `validate_handshake` (so khớp tên/version đã biết) và `read_identity`
+/// (chỉ đọc, chưa biết tên/version để so khớp).
+fn checked_agent_info(
+    initialized: &agent_client_protocol::schema::v1::InitializeResponse,
+) -> Result<&agent_client_protocol::schema::v1::Implementation, TransportError> {
     if initialized.protocol_version != ProtocolVersion::V1 {
         return Err(TransportError::UnsupportedProtocol {
             expected: 1,
             actual: initialized.protocol_version.as_u16(),
         });
     }
-    let info =
-        initialized
-            .agent_info
-            .as_ref()
-            .ok_or_else(|| TransportError::UnexpectedAgentIdentity {
-                expected: "agentInfo".into(),
-                actual: "missing agentInfo".into(),
-            })?;
+    initialized
+        .agent_info
+        .as_ref()
+        .ok_or_else(|| TransportError::UnexpectedAgentIdentity {
+            expected: "agentInfo".into(),
+            actual: "missing agentInfo".into(),
+        })
+}
+
+fn read_identity(
+    initialized: agent_client_protocol::schema::v1::InitializeResponse,
+) -> Result<AgentIdentity, TransportError> {
+    let info = checked_agent_info(&initialized)?;
     Ok(AgentIdentity {
         name: info.name.clone(),
         version: info.version.clone(),
