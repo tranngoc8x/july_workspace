@@ -309,6 +309,30 @@ fn agent_add_rejects_adapter_and_config_together() {
 }
 
 #[test]
+fn agent_add_option_errors_show_catalog_and_custom_transport_usage() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--adapter",
+        "codex",
+        "--config",
+        "config.json",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(
+        "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]"
+    ));
+    assert!(stderr(&output).contains(
+        "usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]"
+    ));
+}
+
+#[test]
 fn agent_add_rejects_adapter_and_explicit_transport_together() {
     let workspace = TestWorkspace::new();
     let output = workspace.run(&[

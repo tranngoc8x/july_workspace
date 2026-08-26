@@ -36,8 +36,10 @@ use registry::CommandScope;
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
 const INIT_USAGE: &str = "usage: july init [--adapters <ids>]      cài ACP adapter";
+const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]\n\
+                          usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]";
 const NO_AGENTS: &str = "no agents configured; add one with: \
-                         july agent add <name> --project <path> --runtime <runtime>";
+                         july agent add <name> --project <path> --adapter <id>";
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -61,6 +63,8 @@ pub enum CliError {
     NoAdapterSelected,
     #[error("{INIT_USAGE}")]
     InitUsage,
+    #[error("{AGENT_USAGE}")]
+    AgentUsage,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -146,7 +150,11 @@ impl CliError {
 
     fn error_code(&self) -> &'static str {
         match self {
-            Self::Usage | Self::InitUsage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
+            Self::Usage
+            | Self::InitUsage
+            | Self::AgentUsage
+            | Self::InvalidAgentName
+            | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
             Self::Adapter(_) => "adapter",
             Self::MissingAdapter => "missing_adapter",
@@ -607,8 +615,12 @@ fn remove_json(args: &mut Vec<String>) -> Result<bool, CliError> {
 fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
     let operation = match args.as_slice() {
         [_, command] if command == "list" => AgentOperation::List,
-        [_, command, agent] if command == "show" => AgentOperation::Show(agent_ref(agent)?),
-        [_, command, agent] if command == "remove" => AgentOperation::Remove(agent_ref(agent)?),
+        [_, command, agent] if command == "show" => {
+            AgentOperation::Show(agent_ref(agent).map_err(|_| CliError::AgentUsage)?)
+        }
+        [_, command, agent] if command == "remove" => {
+            AgentOperation::Remove(agent_ref(agent).map_err(|_| CliError::AgentUsage)?)
+        }
         [_, command, name, rest @ ..] if command == "add" => {
             let AgentAddArgs {
                 project,
@@ -618,7 +630,7 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
                 config,
             } = parse_agent_add(rest)?;
             AgentOperation::Add {
-                name: positional(name)?,
+                name: positional(name).map_err(|_| CliError::AgentUsage)?,
                 project,
                 runtime,
                 transport,
@@ -631,7 +643,7 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
             Some("add" | "list" | "show" | "remove")
         ) =>
         {
-            return Err(CliError::Usage);
+            return Err(CliError::AgentUsage);
         }
         _ => return Err(CliError::InvalidCommand),
     };
@@ -650,7 +662,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
     let mut index = 0;
     while index < args.len() {
         let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
-            return Err(CliError::Usage);
+            return Err(CliError::AgentUsage);
         };
         match args[index].as_str() {
             "--project" if project.is_none() => project = Some(value.clone()),
@@ -658,14 +670,14 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
             "--transport" if transport.is_none() => transport = Some(value.clone()),
             "--adapter" if adapter.is_none() => adapter = Some(value.clone()),
             "--config" if config.is_none() => config = Some(PathBuf::from(value)),
-            _ => return Err(CliError::Usage),
+            _ => return Err(CliError::AgentUsage),
         }
         index += 2;
     }
     if adapter.is_some() && (transport.is_some() || config.is_some()) {
-        return Err(CliError::Usage);
+        return Err(CliError::AgentUsage);
     }
-    let project = project.ok_or(CliError::Usage)?;
+    let project = project.ok_or(CliError::AgentUsage)?;
     Ok(AgentAddArgs {
         project,
         runtime,

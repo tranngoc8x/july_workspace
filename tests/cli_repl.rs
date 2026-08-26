@@ -374,7 +374,7 @@ fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
     assert!(empty.status.success(), "stderr: {}", stderr(&empty));
     assert!(stderr(&empty).contains(
         "no agents configured; add one with: \
-         july agent add <name> --project <path> --runtime <runtime>\n"
+         july agent add <name> --project <path> --adapter <id>\n"
     ));
     // `/agents` never mutates: the add form is rejected, not interpreted.
     assert_eq!(stderr(&empty).matches("invalid command\n").count(), 1);
