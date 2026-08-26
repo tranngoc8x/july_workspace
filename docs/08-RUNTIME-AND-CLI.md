@@ -30,6 +30,17 @@ No full TUI is required.
 
 ## Core commands
 
+### Adapter onboarding
+
+```bash
+july init [--adapters <ids>]
+```
+
+`july init` chọn và cài ACP adapter vào `~/.july/adapters`, xác minh ACP
+handshake, rồi ghi danh tính đã xác minh vào `identities.json`. Màn hình chọn
+tương tác chỉ chạy trên Unix; automation hoặc stdin không phải terminal dùng
+`--adapters codex,claude` để chọn rõ adapter cần cài.
+
 ### Agents
 
 ```bash

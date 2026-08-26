@@ -26,10 +26,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
 
-// ponytail: no caller yet - Task 8 (onboarding) wires this up next. Remove
-// once that lands and the dead_code lint finds a real caller on its own.
 mod init;
-#[allow(dead_code)]
 mod keys;
 pub mod registry;
 
@@ -37,6 +34,7 @@ use registry::CommandScope;
 
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
+const INIT_USAGE: &str = "usage: july init [--adapters <ids>]      cài ACP adapter";
 const NO_AGENTS: &str = "no agents configured; add one with: \
                          july agent add <name> --project <path> --runtime <runtime>";
 
@@ -52,6 +50,12 @@ pub enum CliError {
     InvalidUtf8,
     #[error("invalid command")]
     InvalidCommand,
+    #[error(transparent)]
+    Adapter(#[from] crate::adapter::AdapterError),
+    #[error("chưa chọn adapter nào; chọn ít nhất một để july có thể chạy agent")]
+    NoAdapterSelected,
+    #[error("{INIT_USAGE}")]
+    InitUsage,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -107,6 +111,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let result = match command {
         Command::Repl => run_repl().await,
         Command::Version { json } => run_version(json),
+        Command::Init { adapters } => init::run_init(adapters).await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Agent { operation, .. } => run_agent(operation, json).await,
@@ -136,8 +141,10 @@ impl CliError {
 
     fn error_code(&self) -> &'static str {
         match self {
-            Self::Usage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
+            Self::Usage | Self::InitUsage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
+            Self::Adapter(_) => "adapter",
+            Self::NoAdapterSelected => "no_adapter_selected",
             Self::Io(_) => "io_error",
             Self::Runtime(_) | Self::Bootstrap(_) | Self::DirectMessage(_) => "runtime_error",
             Self::Collaboration(error) => match error {
@@ -185,6 +192,9 @@ enum Command {
     Repl,
     Version {
         json: bool,
+    },
+    Init {
+        adapters: Option<Vec<String>>,
     },
     Dm(String),
     ThreadOpen {
@@ -453,6 +463,7 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
             [_, agent] if !json => Ok(Command::Dm(positional(agent)?)),
             _ => Err(CliError::Usage),
         },
+        Some("init") => parse_init(args, json),
         Some("agent") => parse_agent(args, json),
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
@@ -462,6 +473,19 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some(_) => Err(CliError::InvalidCommand),
         None if json => Err(CliError::Usage),
         None => Ok(Command::Repl),
+    }
+}
+
+fn parse_init(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+    if json {
+        return Err(CliError::InitUsage);
+    }
+    match args.as_slice() {
+        [_] => Ok(Command::Init { adapters: None }),
+        [_, flag, list] if flag == "--adapters" => Ok(Command::Init {
+            adapters: Some(list.split(',').map(str::to_owned).collect()),
+        }),
+        _ => Err(CliError::InitUsage),
     }
 }
 

@@ -1,17 +1,20 @@
 //! Màn hình onboarding cài ACP adapter.
 
-use crate::adapter::{AdapterSpec, Tier};
+use super::CliError;
+use super::keys::{Key, RawMode, decode};
+use crate::adapter::{
+    ADAPTERS, AdapterIdentity, AdapterSpec, AdapterStore, PackageInstaller, SystemInstaller, Tier,
+};
+use crate::transport::probe_agent_identity;
+use std::io::{Read, Write};
 
 /// Trạng thái con trỏ và các ô tick của màn hình onboarding.
-// ponytail: no caller yet - Task 8 (onboarding screen) drives this next.
-#[allow(dead_code)]
 pub(crate) struct Selection {
     items: Vec<&'static AdapterSpec>,
     checked: Vec<bool>,
     cursor: usize,
 }
 
-#[allow(dead_code)]
 impl Selection {
     /// Adapter `Core` được tick sẵn; con trỏ đứng ở dòng đầu.
     pub(crate) fn new(items: Vec<&'static AdapterSpec>) -> Self {
@@ -60,6 +63,155 @@ impl Selection {
             .filter_map(|(spec, checked)| checked.then_some(*spec))
             .collect()
     }
+}
+
+/// Chạy màn hình onboarding, hoặc đi đường không tương tác khi được chỉ định.
+pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliError> {
+    let store = AdapterStore::open_default()?;
+    let chosen = match adapters {
+        Some(ids) => resolve_ids(&ids)?,
+        None => match RawMode::enable()? {
+            Some(guard) => {
+                let chosen = interactive_select(&guard, &store)?;
+                drop(guard);
+                let Some(chosen) = chosen else {
+                    return Ok(());
+                };
+                chosen
+            }
+            None => {
+                println!(
+                    "stdin không phải terminal, dùng mặc định: codex, claude.\n\\
+                     Chỉ định khác bằng july init --adapters <ids>"
+                );
+                resolve_ids(&["codex".into(), "claude".into()])?
+            }
+        },
+    };
+    if chosen.is_empty() {
+        return Err(CliError::NoAdapterSelected);
+    }
+
+    let installer = SystemInstaller;
+    let mut failures = Vec::new();
+    for spec in chosen {
+        println!("Đang cài {} ({} {})", spec.id, spec.package, spec.version);
+        if let Err(error) = installer.install(spec, &store.adapters_root()) {
+            println!("  thất bại: {error}");
+            failures.push(spec.id);
+            continue;
+        }
+        let bin = store.bin_path(spec);
+        match probe_agent_identity(&bin, &[]).await {
+            Ok(identity) => {
+                println!("  đã xác minh: {} {}", identity.name, identity.version);
+                store.record_identity(
+                    spec.id,
+                    AdapterIdentity {
+                        name: identity.name,
+                        version: identity.version,
+                        bin,
+                    },
+                )?;
+            }
+            Err(error) => {
+                println!("  cài xong nhưng không xác minh được danh tính: {error}");
+                failures.push(spec.id);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!("Xong. Tạo agent bằng: july agent add <tên> --project <đường dẫn> --adapter <id>");
+        return Ok(());
+    }
+    Err(CliError::Runtime(format!(
+        "các adapter sau chưa dùng được: {}. Chạy lại july init để thử tiếp",
+        failures.join(", ")
+    )))
+}
+
+fn resolve_ids(ids: &[String]) -> Result<Vec<&'static AdapterSpec>, CliError> {
+    ids.iter()
+        .map(|id| {
+            crate::adapter::find(id.trim()).ok_or_else(|| {
+                CliError::Adapter(crate::adapter::AdapterError::UnknownAdapter(id.clone()))
+            })
+        })
+        .collect()
+}
+
+/// `None` means the user cancelled; an empty selection means Enter on no ticks.
+fn interactive_select(
+    _guard: &RawMode,
+    store: &AdapterStore,
+) -> Result<Option<Vec<&'static AdapterSpec>>, CliError> {
+    let mut selection = Selection::new(ADAPTERS.iter().collect());
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 16];
+    let mut stdin = std::io::stdin();
+    let mut first = true;
+
+    loop {
+        render(&selection, store, first)?;
+        first = false;
+        let read = stdin.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        while let Some((key, used)) = decode(&buffer) {
+            buffer.drain(..used);
+            match key {
+                Key::Up => selection.up(),
+                Key::Down => selection.down(),
+                Key::Space => selection.toggle(),
+                Key::Enter => return Ok(Some(selection.chosen())),
+                Key::Quit | Key::Interrupt => return Ok(None),
+                Key::Other => {}
+            }
+        }
+    }
+}
+
+fn render(selection: &Selection, store: &AdapterStore, first: bool) -> Result<(), CliError> {
+    let mut out = std::io::stdout();
+    if !first {
+        write!(out, "\x1b[{}A", selection.items().len() + 4)?;
+    }
+    write!(
+        out,
+        "\rJuly cần ít nhất một ACP adapter. Chọn adapter để cài:\r\n\r\n"
+    )?;
+    for (index, spec) in selection.items().iter().enumerate() {
+        let pointer = if index == selection.cursor() {
+            "❯"
+        } else {
+            " "
+        };
+        let tick = if selection.is_checked(index) {
+            "x"
+        } else {
+            " "
+        };
+        let state = match store.installed_version(spec) {
+            Some(version) if version == spec.version => format!(" (đã cài {version})"),
+            Some(version) => format!(" (đã cài {version} → có {})", spec.version),
+            None => String::new(),
+        };
+        write!(
+            out,
+            "  {pointer} [{tick}] {:<13}{}{}\r\n",
+            spec.id, spec.summary, state
+        )?;
+    }
+    write!(
+        out,
+        "\r\n  ↑↓ di chuyển · space chọn/bỏ · enter xác nhận · q thoát\r\n"
+    )?;
+    write!(out, "  Đã chọn: {} adapter\r\n", selection.chosen().len())?;
+    out.flush()?;
+    Ok(())
 }
 
 #[cfg(test)]
