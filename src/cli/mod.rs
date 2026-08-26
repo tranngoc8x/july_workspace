@@ -1,3 +1,4 @@
+use crate::adapter::AdapterStore;
 use crate::application::{
     AddAgent, AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind,
     ChatPermissionRequestId, CollaborationError, CollaborationService, CreateRoom, CreateThread,
@@ -52,6 +53,10 @@ pub enum CliError {
     InvalidCommand,
     #[error(transparent)]
     Adapter(#[from] crate::adapter::AdapterError),
+    #[error(
+        "agent dùng transport acp cần --adapter <id> hoặc --config <file>; chạy july init để xem adapter đã cài"
+    )]
+    MissingAdapter,
     #[error("chưa chọn adapter nào; chọn ít nhất một để july có thể chạy agent")]
     NoAdapterSelected,
     #[error("{INIT_USAGE}")]
@@ -144,6 +149,7 @@ impl CliError {
             Self::Usage | Self::InitUsage | Self::InvalidAgentName | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
             Self::Adapter(_) => "adapter",
+            Self::MissingAdapter => "missing_adapter",
             Self::NoAdapterSelected => "no_adapter_selected",
             Self::Io(_) => "io_error",
             Self::Runtime(_) | Self::Bootstrap(_) | Self::DirectMessage(_) => "runtime_error",
@@ -413,11 +419,20 @@ enum AgentOperation {
         project: String,
         runtime: Option<String>,
         transport: String,
+        adapter: Option<String>,
         config: Option<PathBuf>,
     },
     List,
     Show(AgentRef),
     Remove(AgentRef),
+}
+
+struct AgentAddArgs {
+    project: String,
+    runtime: Option<String>,
+    transport: String,
+    adapter: Option<String>,
+    config: Option<PathBuf>,
 }
 
 enum RoomOperation {
@@ -595,12 +610,19 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
         [_, command, agent] if command == "show" => AgentOperation::Show(agent_ref(agent)?),
         [_, command, agent] if command == "remove" => AgentOperation::Remove(agent_ref(agent)?),
         [_, command, name, rest @ ..] if command == "add" => {
-            let (project, runtime, transport, config) = parse_agent_add(rest)?;
+            let AgentAddArgs {
+                project,
+                runtime,
+                transport,
+                adapter,
+                config,
+            } = parse_agent_add(rest)?;
             AgentOperation::Add {
                 name: positional(name)?,
                 project,
                 runtime,
                 transport,
+                adapter,
                 config,
             }
         }
@@ -616,14 +638,14 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
     Ok(Command::Agent { operation, json })
 }
 
-/// `--project` is required; `--runtime` is a preference, `--adapter` picks the
-/// transport, and `--config` supplies its connection details.
-fn parse_agent_add(
-    args: &[String],
-) -> Result<(String, Option<String>, String, Option<PathBuf>), CliError> {
+/// `--project` is required; `--runtime` is a preference. `--adapter` generates
+/// an ACP config from the catalog, while `--transport` plus `--config` is the
+/// custom transport escape hatch.
+fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
     let mut project = None;
     let mut runtime = None;
     let mut transport = None;
+    let mut adapter = None;
     let mut config = None;
     let mut index = 0;
     while index < args.len() {
@@ -633,19 +655,24 @@ fn parse_agent_add(
         match args[index].as_str() {
             "--project" if project.is_none() => project = Some(value.clone()),
             "--runtime" if runtime.is_none() => runtime = Some(value.clone()),
-            "--adapter" if transport.is_none() => transport = Some(value.clone()),
+            "--transport" if transport.is_none() => transport = Some(value.clone()),
+            "--adapter" if adapter.is_none() => adapter = Some(value.clone()),
             "--config" if config.is_none() => config = Some(PathBuf::from(value)),
             _ => return Err(CliError::Usage),
         }
         index += 2;
     }
+    if adapter.is_some() && (transport.is_some() || config.is_some()) {
+        return Err(CliError::Usage);
+    }
     let project = project.ok_or(CliError::Usage)?;
-    Ok((
+    Ok(AgentAddArgs {
         project,
         runtime,
-        transport.unwrap_or_else(|| "acp".into()),
+        transport: transport.unwrap_or_else(|| "acp".into()),
+        adapter,
         config,
-    ))
+    })
 }
 
 fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
@@ -1714,12 +1741,16 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 project,
                 runtime,
                 transport,
+                adapter,
                 config,
             } => {
-                let transport_config = match config {
-                    Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?)
+                let transport_config = match (adapter, config) {
+                    (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
+                    (None, Some(path)) => serde_json::from_str(&std::fs::read_to_string(path)?)
                         .map_err(|error| CliError::Runtime(error.to_string()))?,
-                    None => json!({}),
+                    (None, None) if transport == "acp" => return Err(CliError::MissingAdapter),
+                    (None, None) => json!({}),
+                    (Some(_), Some(_)) => return Err(CliError::Usage),
                 };
                 // Identity only: no AgentSession is started, no Room joined.
                 let agent = service

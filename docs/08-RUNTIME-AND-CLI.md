@@ -44,7 +44,8 @@ tương tác chỉ chạy trên Unix; automation hoặc stdin không phải term
 ### Agents
 
 ```bash
-july agent add <name> --project <path> [--runtime <runtime>] [--adapter <adapter>] [--config <file>]
+july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]
+july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]
 july agent list
 july agent show <agent>
 july agent remove <agent>
@@ -55,9 +56,11 @@ project. It does **not** start an `AgentSession` and does **not** add the agent
 to any Room; those are separate operations. `--runtime` records a user-facing
 preference (`codex`, `claude`, …) as configuration, not identity, so changing it
 never creates a new logical agent. `--adapter` selects the transport
-(`acp` by default) and `--config` supplies that transport's connection details
-from a JSON file. Provider session IDs, process IDs and terminal identifiers are
-never part of the Agent model.
+catalog entry and generates the ACP connection details from its verified
+identity. `--adapter` cannot be combined with `--transport` or `--config`.
+For a custom transport, use `--transport` with `--config <file>`; the JSON file
+supplies that transport's connection details. Provider session IDs, process IDs
+and terminal identifiers are never part of the Agent model.
 
 `july agent remove` retires an identity by marking it inactive. Rooms, Threads
 and transcripts are left untouched.
