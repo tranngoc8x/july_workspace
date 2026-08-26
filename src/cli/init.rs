@@ -177,7 +177,7 @@ fn interactive_select(
 fn render(selection: &Selection, store: &AdapterStore, first: bool) -> Result<(), CliError> {
     let mut out = std::io::stdout();
     if !first {
-        write!(out, "\x1b[{}A", selection.items().len() + 4)?;
+        write!(out, "\x1b[{}A", redraw_rows(selection.items().len()))?;
     }
     write!(
         out,
@@ -212,6 +212,10 @@ fn render(selection: &Selection, store: &AdapterStore, first: bool) -> Result<()
     write!(out, "  Đã chọn: {} adapter\r\n", selection.chosen().len())?;
     out.flush()?;
     Ok(())
+}
+
+fn redraw_rows(items: usize) -> usize {
+    items + 5
 }
 
 #[cfg(test)]
@@ -284,5 +288,10 @@ mod tests {
 
         assert!(selection.chosen().is_empty());
         assert!(find("codex").is_some(), "danh mục không bị thay đổi");
+    }
+
+    #[test]
+    fn redraw_moves_back_over_every_rendered_row() {
+        assert_eq!(redraw_rows(catalog().len()), catalog().len() + 5);
     }
 }
