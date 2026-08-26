@@ -773,6 +773,7 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "chrono",
+ "libc",
  "rusqlite",
  "serde_json",
  "thiserror",

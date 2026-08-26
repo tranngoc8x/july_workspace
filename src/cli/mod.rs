@@ -26,6 +26,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
 
+pub mod keys;
 pub mod registry;
 
 use registry::CommandScope;
