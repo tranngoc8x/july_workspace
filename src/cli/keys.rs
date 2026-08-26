@@ -22,7 +22,7 @@ pub fn decode(bytes: &[u8]) -> Option<(Key, usize)> {
         [0x1b, b'[', b'A', ..] => Some((Key::Up, 3)),
         [0x1b, b'[', b'B', ..] => Some((Key::Down, 3)),
         [0x1b, b'[', _, ..] => Some((Key::Other, 3)),
-        [0x1b, ..] => Some((Key::Other, bytes.len())),
+        [0x1b, _, ..] => Some((Key::Other, 2)),
         [b' ', ..] => Some((Key::Space, 1)),
         [b'\r' | b'\n', ..] => Some((Key::Enter, 1)),
         [0x03, ..] => Some((Key::Interrupt, 1)),
@@ -106,5 +106,10 @@ mod tests {
     fn maps_an_unhandled_byte_to_other() {
         assert_eq!(decode(b"x"), Some((Key::Other, 1)));
         assert_eq!(decode(b"\x1b[C"), Some((Key::Other, 3)));
+    }
+
+    #[test]
+    fn an_escape_prefix_consumes_only_itself_and_the_next_byte() {
+        assert_eq!(decode(b"\x1bAq"), Some((Key::Other, 2)));
     }
 }

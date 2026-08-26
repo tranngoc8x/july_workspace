@@ -26,7 +26,10 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::mpsc;
 
-pub mod keys;
+// ponytail: no caller yet - Task 8 (onboarding) wires this up next. Remove
+// once that lands and the dead_code lint finds a real caller on its own.
+#[allow(dead_code)]
+mod keys;
 pub mod registry;
 
 use registry::CommandScope;
