@@ -258,7 +258,7 @@ Start with the developer's current macOS target, then add other targets when rel
 Do not add initially:
 - Axum/web server;
 - Tauri/desktop UI;
-- Ratatui/full TUI;
+- Ratatui/full TUI before Phase 10, where it is now explicitly approved;
 - actor framework;
 - SQL ORM;
 - Redis/message broker;

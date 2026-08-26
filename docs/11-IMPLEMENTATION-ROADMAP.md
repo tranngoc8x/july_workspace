@@ -463,6 +463,42 @@ DoD:
 
 ---
 
+## Phase 10 — Interactive TUI — Planned
+
+Status: approved design; implementation not started.
+
+Replace only the no-argument REPL on an interactive terminal with a Ratatui
+shell. Preserve the Phase 8 runtime, context isolation, command grammar,
+non-TTY REPL, named interactive commands, finite CLI output, and JSON contract.
+
+Implement:
+
+- stable application-owned scrollback plus one mutable streamed Markdown tail;
+- multiline input, resize, manual scroll, and follow-tail behavior;
+- existing Root, Room, DM, and Thread navigation;
+- exclusive permission modal and cancel-once active-turn behavior;
+- terminal restoration on every normal and error return path.
+
+Do not:
+
+- repaint streamed ANSI text directly to stdout;
+- add a daemon, GUI, mouse workflow, theme/plugin system, or new command grammar;
+- change ACP, storage, recovery, or session-ownership contracts;
+- move standalone `july dm` or `july thread open` into the TUI.
+
+DoD:
+
+- streamed paragraphs, quotes, lists, and fenced code render progressively
+  without exposing raw fence markers;
+- scrolling and permission prompts remain stable while deltas arrive;
+- cancellation, failure, resize, and exit leave a usable/restored terminal;
+- Phase 8 compatibility and full Rust gates remain green.
+
+Detailed design and slice DAG:
+`docs/superpowers/specs/2026-08-26-phase-10-interactive-tui-design.md`.
+
+---
+
 ## Cross-phase metrics
 
 ### DM overhead
