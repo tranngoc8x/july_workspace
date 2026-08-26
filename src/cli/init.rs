@@ -81,7 +81,7 @@ pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliErr
             }
             None => {
                 println!(
-                    "stdin không phải terminal, dùng mặc định: codex, claude.\n\\
+                    "stdin không phải terminal, dùng mặc định: codex, claude.\n\
                      Chỉ định khác bằng july init --adapters <ids>"
                 );
                 resolve_ids(&["codex".into(), "claude".into()])?

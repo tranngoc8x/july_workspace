@@ -39,7 +39,9 @@ july init [--adapters <ids>]
 `july init` chọn và cài ACP adapter vào `~/.july/adapters`, xác minh ACP
 handshake, rồi ghi danh tính đã xác minh vào `identities.json`. Màn hình chọn
 tương tác chỉ chạy trên Unix; automation hoặc stdin không phải terminal dùng
-`--adapters codex,claude` để chọn rõ adapter cần cài.
+`--adapters codex,claude` để chọn rõ adapter cần cài. Khi không chỉ định
+`--adapters` và stdin không phải terminal, `july init` tự cài mặc định
+`codex` và `claude`.
 
 ### Agents
 
@@ -71,6 +73,13 @@ hatch. It keeps the same logical agent and its unrelated fields intact.
 `july agent remove` retires an identity by marking it inactive. Rooms, Threads
 and transcripts are left untouched; it does not free the agent name. Use
 `july agent update` to fix a wrong transport configuration.
+
+Nâng cấp một adapter (ví dụ chạy lại `july init` để cài bản mới hơn) **không**
+tự cập nhật các agent đã tạo từ adapter đó trước đây. `transport_config` đã
+lưu vẫn giữ `expected_agent_version` cũ; nếu version đó không còn khớp với
+adapter thật, `july dm <agent>` sẽ thất bại ngay ở bước handshake ACP. Sau khi
+nâng cấp adapter, chạy `july agent update <agent> --adapter <id>` cho từng
+agent dùng adapter đó để đồng bộ lại cấu hình.
 
 Runtime creation stays lazy: a session is created or resumed the first time
 `/dm <agent>` or `july thread open` needs one.

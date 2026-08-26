@@ -43,6 +43,7 @@ impl TestWorkspace {
 
     fn verify_adapter(&self, id: &str, name: &str, version: &str) -> PathBuf {
         let executable = self.root.join(format!("{id}-acp"));
+        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
         let identities = self.home.join("adapters/identities.json");
         std::fs::create_dir_all(identities.parent().unwrap()).unwrap();
         std::fs::write(
@@ -548,5 +549,93 @@ fn agent_update_rejects_an_unparseable_acp_config_and_leaves_the_stored_config_u
     assert_eq!(
         serde_json::from_str::<Value>(&config).unwrap()["executable"],
         "/old/bin"
+    );
+}
+
+#[test]
+fn agent_add_rejects_a_verified_adapter_whose_binary_was_removed() {
+    let workspace = TestWorkspace::new();
+    let executable = workspace.verify_adapter("codex", "Codex", "1.0.0");
+    std::fs::remove_file(&executable).unwrap();
+
+    let output = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--adapter",
+        "codex",
+        "--json",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("chưa được cài"));
+    assert_eq!(workspace.count("SELECT COUNT(*) FROM agents"), 0);
+}
+
+#[test]
+fn agent_add_rejects_an_agent_name_that_escapes_the_state_directory() {
+    let workspace = TestWorkspace::new();
+    workspace.verify_adapter("codex", "Codex", "1.0.0");
+
+    let output = workspace.run(&[
+        "agent",
+        "add",
+        "../../tmp/escape",
+        "--project",
+        "/work/cashpoint",
+        "--adapter",
+        "codex",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("không hợp lệ"));
+    assert_eq!(workspace.count("SELECT COUNT(*) FROM agents"), 0);
+    assert!(!workspace.home.join("tmp/escape").exists());
+}
+
+#[test]
+fn agent_update_through_config_keeps_a_custom_transport_type() {
+    let workspace = TestWorkspace::new();
+    let config = workspace.root.join("custom.json");
+    std::fs::write(&config, json!({ "host": "localhost" }).to_string()).unwrap();
+
+    let added = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--transport",
+        "custom",
+        "--config",
+        config.to_str().unwrap(),
+    ]);
+    assert!(added.status.success(), "stderr: {}", stderr(&added));
+
+    let new_config = workspace.root.join("custom-2.json");
+    std::fs::write(&new_config, json!({ "host": "example.com" }).to_string()).unwrap();
+    let updated = workspace.run(&[
+        "agent",
+        "update",
+        "cashpoint",
+        "--config",
+        new_config.to_str().unwrap(),
+    ]);
+    assert!(updated.status.success(), "stderr: {}", stderr(&updated));
+
+    let (transport_type, config): (String, String) = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT transport_type, transport_config_json FROM agents WHERE name = 'cashpoint'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(transport_type, "custom");
+    assert_eq!(
+        serde_json::from_str::<Value>(&config).unwrap()["host"],
+        "example.com"
     );
 }

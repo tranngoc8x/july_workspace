@@ -1805,7 +1805,7 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                     }
                     (None, None) if transport == "acp" => return Err(CliError::MissingAdapter),
                     (None, None) => json!({}),
-                    (Some(_), Some(_)) => return Err(CliError::Usage),
+                    (Some(_), Some(_)) => return Err(CliError::AgentUsage),
                 };
                 // Identity only: no AgentSession is started, no Room joined.
                 let agent = service
@@ -1847,20 +1847,26 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 adapter,
                 config,
             } => {
-                let name = service.resolve_agent(agent.clone()).await?.name;
-                let transport_config = match (adapter, config) {
-                    (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
+                let resolved = service.resolve_agent(agent.clone()).await?;
+                let name = resolved.name;
+                let (transport_type, transport_config) = match (adapter, config) {
+                    (Some(id), None) => (
+                        "acp".to_string(),
+                        AdapterStore::open_default()?.config_for(&id, &name)?,
+                    ),
                     (None, Some(path)) => {
                         let value: serde_json::Value =
                             serde_json::from_str(&std::fs::read_to_string(path)?)
                                 .map_err(|error| CliError::Runtime(error.to_string()))?;
-                        parse_acp_config(&value)?;
-                        value
+                        if resolved.transport_type == "acp" {
+                            parse_acp_config(&value)?;
+                        }
+                        (resolved.transport_type, value)
                     }
                     _ => return Err(CliError::AgentUsage),
                 };
                 let agent = service
-                    .set_agent_transport(agent, "acp".into(), transport_config, timestamp())
+                    .set_agent_transport(agent, transport_type, transport_config, timestamp())
                     .await?;
                 Some(render_agent(&agent, json_output))
             }

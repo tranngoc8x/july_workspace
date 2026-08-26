@@ -19,12 +19,14 @@ pub struct AdapterIdentity {
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
-    #[error("environment variable HOME is not set")]
+    #[error("biến môi trường HOME chưa được thiết lập")]
     MissingHome,
     #[error("adapter `{0}` không có trong danh mục; xem `july init` để biết danh sách")]
     UnknownAdapter(String),
     #[error("adapter `{id}` chưa được cài; chạy `july init` để cài")]
     NotInstalled { id: String },
+    #[error("tên agent `{0}` không hợp lệ: không được chứa `/` hay `..`")]
+    InvalidAgentName(String),
     #[error("adapter `{id}` đã cài nhưng chưa xác minh được danh tính; chạy lại `july init`")]
     NotVerified { id: String },
     #[error("không tìm thấy `{tool}` trên PATH; cài `{tool}` rồi chạy lại `july init`")]
@@ -244,6 +246,11 @@ impl AdapterStore {
                 .ok_or_else(|| AdapterError::NotVerified {
                     id: spec.id.to_owned(),
                 })?;
+        if !identity.bin.is_file() {
+            return Err(AdapterError::NotInstalled {
+                id: spec.id.to_owned(),
+            });
+        }
         let state = ensure_state_directory(&self.state_root(), agent_name)?;
         Ok(serde_json::json!({
             "executable": identity.bin.to_string_lossy(),
@@ -258,6 +265,9 @@ impl AdapterStore {
 
 /// Thư mục state của một agent, july tự tạo trước khi adapter chạy.
 pub fn ensure_state_directory(root: &Path, agent_name: &str) -> Result<PathBuf, AdapterError> {
+    if agent_name.contains('/') || agent_name.contains('\\') || agent_name.contains("..") {
+        return Err(AdapterError::InvalidAgentName(agent_name.to_owned()));
+    }
     let directory = root.join(agent_name);
     std::fs::create_dir_all(&directory)?;
     Ok(directory)
@@ -470,10 +480,29 @@ mod tests {
     }
 
     #[test]
+    fn config_for_rejects_an_adapter_whose_binary_is_missing() {
+        let store = AdapterStore::new(scratch());
+        store.record_identity("codex", identity()).expect("record");
+
+        assert!(matches!(
+            store.config_for("codex", "cashpoint"),
+            Err(AdapterError::NotInstalled { id }) if id == "codex"
+        ));
+    }
+
+    #[test]
     fn config_for_is_accepted_by_the_runtime_parser() {
         let home = scratch();
         let store = AdapterStore::new(home.clone());
-        store.record_identity("codex", identity()).expect("record");
+        let bin = home.join("node_modules/.bin/codex-acp");
+        std::fs::create_dir_all(bin.parent().unwrap()).expect("bin dir");
+        std::fs::write(&bin, "#!/bin/sh\n").expect("fake executable");
+        let identity = AdapterIdentity {
+            name: "codex-acp".into(),
+            version: "1.6.2".into(),
+            bin: bin.clone(),
+        };
+        store.record_identity("codex", identity).expect("record");
 
         let config = store
             .config_for("codex", "cashpoint")
@@ -481,7 +510,7 @@ mod tests {
 
         // Đây là hợp đồng bị vỡ trước đây: nơi ghi và nơi đọc phải khớp nhau.
         let parsed = crate::runtime::parse_acp_config(&config).expect("runtime accepts the config");
-        assert_eq!(parsed.executable, identity().bin);
+        assert_eq!(parsed.executable, bin);
         assert_eq!(parsed.expected_agent_name, "codex-acp");
         assert_eq!(parsed.expected_agent_version, "1.6.2");
         assert_eq!(parsed.state_directory, home.join("state/cashpoint"));
@@ -491,5 +520,20 @@ mod tests {
             parsed.state_directory.is_dir(),
             "state directory phải được tạo trước khi adapter chạy"
         );
+    }
+
+    #[test]
+    fn ensure_state_directory_rejects_a_path_traversing_agent_name() {
+        let root = scratch();
+
+        assert!(matches!(
+            ensure_state_directory(&root, "../../tmp/x"),
+            Err(AdapterError::InvalidAgentName(name)) if name == "../../tmp/x"
+        ));
+        assert!(matches!(
+            ensure_state_directory(&root, "sub/dir"),
+            Err(AdapterError::InvalidAgentName(_))
+        ));
+        assert!(!root.join("../../tmp/x").exists());
     }
 }
