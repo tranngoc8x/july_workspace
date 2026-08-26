@@ -378,7 +378,9 @@ pub(crate) async fn register_acp_agent(
     Ok(())
 }
 
-fn parse_acp_config(value: &Value) -> Result<AcpAgentConfig, DirectMessageBootstrapError> {
+pub(crate) fn parse_acp_config(
+    value: &Value,
+) -> Result<AcpAgentConfig, DirectMessageBootstrapError> {
     const FIELDS: [&str; 6] = [
         "executable",
         "arguments",

@@ -2,9 +2,20 @@
 
 use super::{AdapterSpec, Installer};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+const IDENTITIES: &str = "identities.json";
+
+/// Danh tính thật của một adapter, ghi lại sau khi `july init` xác minh handshake.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdapterIdentity {
+    pub name: String,
+    pub version: String,
+    pub bin: PathBuf,
+}
 
 #[derive(Debug, Error)]
 pub enum AdapterError {
@@ -103,6 +114,86 @@ impl AdapterStore {
                 Some(parts.next()?.to_owned())
             })
             .next()
+    }
+
+    fn identities_path(&self) -> PathBuf {
+        self.adapters_root().join(IDENTITIES)
+    }
+
+    /// Các adapter đã cài và đã xác minh handshake. File thiếu coi như rỗng.
+    pub fn identities(&self) -> Result<BTreeMap<String, AdapterIdentity>, AdapterError> {
+        let Ok(raw) = std::fs::read_to_string(self.identities_path()) else {
+            return Ok(BTreeMap::new());
+        };
+        let parsed: Value = serde_json::from_str(&raw)?;
+        let mut identities = BTreeMap::new();
+        for (id, entry) in parsed.as_object().into_iter().flatten() {
+            let field = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+            let (Some(name), Some(version), Some(bin)) =
+                (field("name"), field("version"), field("bin"))
+            else {
+                continue;
+            };
+            identities.insert(
+                id.clone(),
+                AdapterIdentity {
+                    name,
+                    version,
+                    bin: PathBuf::from(bin),
+                },
+            );
+        }
+        Ok(identities)
+    }
+
+    /// Ghi danh tính một adapter, giữ nguyên các adapter đã có.
+    pub fn record_identity(&self, id: &str, identity: AdapterIdentity) -> Result<(), AdapterError> {
+        let mut identities = self.identities()?;
+        identities.insert(id.to_owned(), identity);
+        let document = Value::Object(
+            identities
+                .into_iter()
+                .map(|(id, identity)| {
+                    (
+                        id,
+                        serde_json::json!({
+                            "name": identity.name,
+                            "version": identity.version,
+                            "bin": identity.bin.to_string_lossy(),
+                        }),
+                    )
+                })
+                .collect(),
+        );
+        std::fs::create_dir_all(self.adapters_root())?;
+        std::fs::write(
+            self.identities_path(),
+            format!("{}\n", serde_json::to_string_pretty(&document)?),
+        )?;
+        Ok(())
+    }
+
+    /// `transport_config` đầy đủ cho một agent dùng adapter `id`.
+    ///
+    /// Danh mục là nguồn sự thật về id hợp lệ; `identities.json` chỉ được tin
+    /// sau khi id đã có trong danh mục.
+    pub fn config_for(&self, id: &str, agent_name: &str) -> Result<Value, AdapterError> {
+        let spec = super::find(id).ok_or_else(|| AdapterError::UnknownAdapter(id.to_owned()))?;
+        let identity =
+            self.identities()?
+                .remove(spec.id)
+                .ok_or_else(|| AdapterError::NotVerified {
+                    id: spec.id.to_owned(),
+                })?;
+        let state = ensure_state_directory(&self.state_root(), agent_name)?;
+        Ok(serde_json::json!({
+            "executable": identity.bin.to_string_lossy(),
+            "arguments": Vec::<String>::new(),
+            "environment": serde_json::Map::new(),
+            "state_directory": state.to_string_lossy(),
+            "expected_agent_name": identity.name,
+            "expected_agent_version": identity.version,
+        }))
     }
 }
 
@@ -207,5 +298,91 @@ mod tests {
         std::fs::write(manifest.join("package.json"), "{ not json").expect("write manifest");
 
         assert_eq!(store.installed_version(spec), None);
+    }
+
+    fn identity() -> AdapterIdentity {
+        AdapterIdentity {
+            name: "codex-acp".into(),
+            version: "1.6.2".into(),
+            bin: PathBuf::from("/opt/july/adapters/node_modules/.bin/codex-acp"),
+        }
+    }
+
+    #[test]
+    fn identities_start_empty_and_survive_a_round_trip() {
+        let store = AdapterStore::new(scratch());
+        assert!(store.identities().expect("empty identities").is_empty());
+
+        store
+            .record_identity("codex", identity())
+            .expect("record identity");
+
+        let stored = store.identities().expect("identities");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored["codex"].name, "codex-acp");
+        assert_eq!(stored["codex"].version, "1.6.2");
+    }
+
+    #[test]
+    fn recording_a_second_adapter_keeps_the_first() {
+        let store = AdapterStore::new(scratch());
+        store.record_identity("codex", identity()).expect("first");
+        store
+            .record_identity(
+                "claude",
+                AdapterIdentity {
+                    name: "claude-agent-acp".into(),
+                    version: "0.70.0".into(),
+                    bin: PathBuf::from("/opt/july/adapters/node_modules/.bin/claude-agent-acp"),
+                },
+            )
+            .expect("second");
+
+        let stored = store.identities().expect("identities");
+        assert_eq!(stored.len(), 2);
+    }
+
+    #[test]
+    fn config_for_rejects_an_unknown_adapter() {
+        let store = AdapterStore::new(scratch());
+
+        assert!(matches!(
+            store.config_for("nope", "cashpoint"),
+            Err(AdapterError::UnknownAdapter(id)) if id == "nope"
+        ));
+    }
+
+    #[test]
+    fn config_for_rejects_an_adapter_that_was_never_verified() {
+        let store = AdapterStore::new(scratch());
+
+        assert!(matches!(
+            store.config_for("codex", "cashpoint"),
+            Err(AdapterError::NotVerified { id }) if id == "codex"
+        ));
+    }
+
+    #[test]
+    fn config_for_is_accepted_by_the_runtime_parser() {
+        let home = scratch();
+        let store = AdapterStore::new(home.clone());
+        store.record_identity("codex", identity()).expect("record");
+
+        let config = store
+            .config_for("codex", "cashpoint")
+            .expect("config generated");
+
+        // Đây là hợp đồng bị vỡ trước đây: nơi ghi và nơi đọc phải khớp nhau.
+        let parsed = crate::runtime::parse_acp_config(&config).expect("runtime accepts the config");
+        assert_eq!(parsed.executable, identity().bin);
+        assert_eq!(parsed.expected_agent_name, "codex-acp");
+        assert_eq!(parsed.expected_agent_version, "1.6.2");
+        assert_eq!(parsed.state_directory, home.join("state/cashpoint"));
+        assert!(parsed.arguments.is_empty());
+        assert!(parsed.environment.is_empty());
+        assert!(
+            parsed.state_directory.is_dir(),
+            "state directory phải được tạo trước khi adapter chạy"
+        );
     }
 }
