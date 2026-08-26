@@ -4,4 +4,7 @@ mod catalog;
 mod store;
 
 pub use catalog::{ADAPTERS, AdapterSpec, Installer, Tier, find};
-pub use store::{AdapterError, AdapterStore, ensure_state_directory};
+pub use store::{
+    AdapterError, AdapterIdentity, AdapterStore, PackageInstaller, SystemInstaller,
+    ensure_state_directory, install_command,
+};

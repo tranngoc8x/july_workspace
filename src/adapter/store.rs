@@ -48,6 +48,65 @@ pub struct AdapterStore {
     home: PathBuf,
 }
 
+/// Trình cài và tham số cho một adapter. Tách riêng để test được không cần mạng.
+pub fn install_command(spec: &AdapterSpec, root: &Path) -> (&'static str, Vec<String>) {
+    let root = root.to_string_lossy().into_owned();
+    match spec.installer {
+        Installer::Npm => (
+            "npm",
+            vec![
+                "install".into(),
+                "--prefix".into(),
+                root,
+                format!("{}@{}", spec.package, spec.version),
+            ],
+        ),
+        Installer::Cargo => (
+            "cargo",
+            vec![
+                "install".into(),
+                spec.package.into(),
+                "--version".into(),
+                spec.version.into(),
+                "--root".into(),
+                root,
+            ],
+        ),
+    }
+}
+
+/// Chạy trình cài thật. Test dùng implementation khác để không đụng mạng.
+pub trait PackageInstaller {
+    fn install(&self, spec: &AdapterSpec, root: &Path) -> Result<(), AdapterError>;
+}
+
+pub struct SystemInstaller;
+
+impl PackageInstaller for SystemInstaller {
+    fn install(&self, spec: &AdapterSpec, root: &Path) -> Result<(), AdapterError> {
+        let (tool, arguments) = install_command(spec, root);
+        std::fs::create_dir_all(root)?;
+        let status = std::process::Command::new(tool)
+            .args(&arguments)
+            .status()
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::NotFound => AdapterError::ToolMissing { tool },
+                _ => AdapterError::Io(error),
+            })?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(AdapterError::InstallFailed {
+            id: spec.id.to_owned(),
+            tool,
+            status: status
+                .code()
+                .map(|code| format!("mã {code}"))
+                .unwrap_or_else(|| "tín hiệu dừng".into()),
+        })
+    }
+}
+
 impl AdapterStore {
     pub fn new(home: PathBuf) -> Self {
         Self { home }
@@ -298,6 +357,54 @@ mod tests {
         std::fs::write(manifest.join("package.json"), "{ not json").expect("write manifest");
 
         assert_eq!(store.installed_version(spec), None);
+    }
+
+    #[test]
+    fn npm_install_targets_the_july_prefix_with_a_pinned_version() {
+        let spec = find("codex").expect("codex");
+        let (tool, arguments) = install_command(spec, Path::new("/opt/july/adapters"));
+
+        assert_eq!(tool, "npm");
+        assert_eq!(
+            arguments,
+            vec![
+                "install".to_string(),
+                "--prefix".to_string(),
+                "/opt/july/adapters".to_string(),
+                "@agentclientprotocol/codex-acp@1.6.2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_install_targets_the_july_root_with_a_pinned_version() {
+        let spec = find("claude-rust").expect("claude-rust");
+        let (tool, arguments) = install_command(spec, Path::new("/opt/july/adapters"));
+
+        assert_eq!(tool, "cargo");
+        assert_eq!(
+            arguments,
+            vec![
+                "install".to_string(),
+                "claude-code-acp-rs".to_string(),
+                "--version".to_string(),
+                "0.1.22".to_string(),
+                "--root".to_string(),
+                "/opt/july/adapters".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_install_command_uses_a_moving_version_specifier() {
+        for spec in crate::adapter::ADAPTERS {
+            let (_, arguments) = install_command(spec, Path::new("/opt/july/adapters"));
+            assert!(
+                !arguments.iter().any(|argument| argument.contains("latest")),
+                "{} dùng version di động",
+                spec.id
+            );
+        }
     }
 
     fn identity() -> AdapterIdentity {
