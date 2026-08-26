@@ -46,6 +46,8 @@ tương tác chỉ chạy trên Unix; automation hoặc stdin không phải term
 ```bash
 july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]
 july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]
+july agent update <agent> --adapter <id>
+july agent update <agent> --config <file>
 july agent list
 july agent show <agent>
 july agent remove <agent>
@@ -62,8 +64,13 @@ For a custom transport, use `--transport` with `--config <file>`; the JSON file
 supplies that transport's connection details. Provider session IDs, process IDs
 and terminal identifiers are never part of the Agent model.
 
+`july agent update` replaces an existing agent's ACP `transport_config` in
+place, either from a verified adapter or from the custom JSON config escape
+hatch. It keeps the same logical agent and its unrelated fields intact.
+
 `july agent remove` retires an identity by marking it inactive. Rooms, Threads
-and transcripts are left untouched.
+and transcripts are left untouched; it does not free the agent name. Use
+`july agent update` to fix a wrong transport configuration.
 
 Runtime creation stays lazy: a session is created or resumed the first time
 `/dm <agent>` or `july thread open` needs one.

@@ -367,3 +367,87 @@ fn agent_add_rejects_an_adapter_that_was_never_verified() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("chạy lại `july init`"));
 }
+
+#[test]
+fn agent_update_rejects_an_unknown_agent_with_a_meaningful_json_error() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&[
+        "agent",
+        "update",
+        "khong-ton-tai",
+        "--adapter",
+        "codex",
+        "--json",
+    ]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("\"code\":\"agent_not_found\""));
+    assert!(stderr(&output).contains("khong-ton-tai"));
+}
+
+#[test]
+fn agent_update_requires_an_adapter_or_a_config_with_agent_usage() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&["agent", "update", "cashpoint", "--json"]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("\"code\":\"usage\""));
+    assert!(stderr(&output).contains("usage: july agent update <agent> --adapter <id>"));
+    assert!(stderr(&output).contains("usage: july agent update <agent> --config <file>"));
+}
+
+#[test]
+fn agent_update_replaces_the_persisted_config_through_the_cli() {
+    let workspace = TestWorkspace::new();
+    let old_config = workspace.root.join("old.json");
+    let new_config = workspace.root.join("new.json");
+    std::fs::write(&old_config, json!({ "executable": "/old/bin" }).to_string()).unwrap();
+    std::fs::write(&new_config, json!({ "executable": "/new/bin" }).to_string()).unwrap();
+
+    let added = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--runtime",
+        "codex",
+        "--transport",
+        "acp",
+        "--config",
+        old_config.to_str().unwrap(),
+    ]);
+    assert!(added.status.success(), "stderr: {}", stderr(&added));
+    let id: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT id FROM agents WHERE name = 'cashpoint'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let updated = workspace.run(&[
+        "agent",
+        "update",
+        "cashpoint",
+        "--config",
+        new_config.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(updated.status.success(), "stderr: {}", stderr(&updated));
+
+    let (updated_id, config): (String, String) = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT id, transport_config_json FROM agents WHERE name = 'cashpoint'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(updated_id, id);
+    assert_eq!(
+        serde_json::from_str::<Value>(&config).unwrap()["executable"],
+        "/new/bin"
+    );
+}

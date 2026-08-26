@@ -37,7 +37,9 @@ const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
 const INIT_USAGE: &str = "usage: july init [--adapters <ids>]      cài ACP adapter";
 const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]\n\
-                          usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]";
+                          usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]\n\
+                          usage: july agent update <agent> --adapter <id>\n\
+                          usage: july agent update <agent> --config <file>";
 const NO_AGENTS: &str = "no agents configured; add one with: \
                          july agent add <name> --project <path> --adapter <id>";
 
@@ -433,6 +435,11 @@ enum AgentOperation {
     List,
     Show(AgentRef),
     Remove(AgentRef),
+    Update {
+        agent: AgentRef,
+        adapter: Option<String>,
+        config: Option<PathBuf>,
+    },
 }
 
 struct AgentAddArgs {
@@ -621,6 +628,14 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
         [_, command, agent] if command == "remove" => {
             AgentOperation::Remove(agent_ref(agent).map_err(|_| CliError::AgentUsage)?)
         }
+        [_, command, agent, rest @ ..] if command == "update" => {
+            let (adapter, config) = parse_agent_update(rest)?;
+            AgentOperation::Update {
+                agent: agent_ref(agent).map_err(|_| CliError::AgentUsage)?,
+                adapter,
+                config,
+            }
+        }
         [_, command, name, rest @ ..] if command == "add" => {
             let AgentAddArgs {
                 project,
@@ -640,7 +655,7 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
         }
         _ if matches!(
             args.get(1).map(String::as_str),
-            Some("add" | "list" | "show" | "remove")
+            Some("add" | "list" | "show" | "remove" | "update")
         ) =>
         {
             return Err(CliError::AgentUsage);
@@ -685,6 +700,27 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
         adapter,
         config,
     })
+}
+
+fn parse_agent_update(args: &[String]) -> Result<(Option<String>, Option<PathBuf>), CliError> {
+    let mut adapter = None;
+    let mut config = None;
+    let mut index = 0;
+    while index < args.len() {
+        let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
+            return Err(CliError::AgentUsage);
+        };
+        match args[index].as_str() {
+            "--adapter" if adapter.is_none() => adapter = Some(value.clone()),
+            "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            _ => return Err(CliError::AgentUsage),
+        }
+        index += 2;
+    }
+    match (&adapter, &config) {
+        (None, None) | (Some(_), Some(_)) => Err(CliError::AgentUsage),
+        _ => Ok((adapter, config)),
+    }
 }
 
 fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
@@ -1797,6 +1833,23 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
             }
             AgentOperation::Remove(reference) => {
                 let agent = service.remove_agent(reference, timestamp()).await?;
+                Some(render_agent(&agent, json_output))
+            }
+            AgentOperation::Update {
+                agent,
+                adapter,
+                config,
+            } => {
+                let name = service.resolve_agent(agent.clone()).await?.name;
+                let transport_config = match (adapter, config) {
+                    (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
+                    (None, Some(path)) => serde_json::from_str(&std::fs::read_to_string(path)?)
+                        .map_err(|error| CliError::Runtime(error.to_string()))?,
+                    _ => return Err(CliError::AgentUsage),
+                };
+                let agent = service
+                    .set_agent_transport(agent, "acp".into(), transport_config, timestamp())
+                    .await?;
                 Some(render_agent(&agent, json_output))
             }
         };
