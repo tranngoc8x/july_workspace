@@ -1,7 +1,7 @@
 use super::{
-    AcpAgentConfig, AgentConnection, AgentTransport, CreateSession, PermissionRequest,
-    PermissionRequestId, PermissionResponse, ResumeSession, SendMessage, SessionCreated,
-    SessionRef, SessionResumed, TransportError, TransportEvent, TransportEvents,
+    AcpAgentConfig, AgentConnection, AgentIdentity, AgentTransport, CreateSession,
+    PermissionRequest, PermissionRequestId, PermissionResponse, ResumeSession, SendMessage,
+    SessionCreated, SessionRef, SessionResumed, TransportError, TransportEvent, TransportEvents,
     TransportFailureKind,
 };
 use crate::domain::{AgentId, PermissionOption, PermissionOutcome};
@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
     SessionUpdate, SetSessionModeRequest, TextContent, ToolCallStatus,
 };
 use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -971,4 +971,95 @@ fn sdk_failure_kind(error: &agent_client_protocol::Error) -> TransportFailureKin
     } else {
         TransportFailureKind::Protocol
     }
+}
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Spawn adapter, gửi `initialize`, đọc danh tính nó tự khai, rồi dừng.
+///
+/// Dùng ở `july init` để `expected_agent_name` và `expected_agent_version`
+/// trong `AcpAgentConfig` là giá trị thật chứ không phải phỏng đoán.
+pub async fn probe_agent_identity(
+    executable: &Path,
+    arguments: &[String],
+) -> Result<AgentIdentity, TransportError> {
+    if !executable.is_absolute() {
+        return Err(TransportError::InvalidConfiguration(
+            "ACP executable must be an absolute path",
+        ));
+    }
+    if !executable.is_file() {
+        return Err(TransportError::InvalidConfiguration(
+            "ACP executable must exist and be a file",
+        ));
+    }
+
+    let sdk_config = agent_client_protocol::AcpAgentConfig::new(executable)
+        .args(arguments.to_vec())
+        .envs(BTreeMap::<String, String>::new());
+    let (identified, identity) = oneshot::channel();
+
+    let connection = agent_client_protocol::Client
+        .builder()
+        .on_receive_notification(
+            async move |_: SessionNotification, _connection| Ok(()),
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async move |_: RequestPermissionRequest, responder, _connection| {
+                responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            AcpAgent::new(sdk_config),
+            async move |connection: ConnectionTo<Agent>| {
+                let result = connection
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await;
+                let _ = identified.send(result.map_err(map_sdk_error).and_then(read_identity));
+                Ok(())
+            },
+        );
+
+    match tokio::time::timeout(PROBE_TIMEOUT, async {
+        let handshake = tokio::spawn(connection);
+        let identity = identity.await;
+        handshake.abort();
+        identity
+    })
+    .await
+    {
+        Ok(Ok(identity)) => identity,
+        Ok(Err(_)) => Err(TransportError::ChannelClosed),
+        Err(_) => Err(TransportError::InvalidConfiguration(
+            "adapter không trả lời initialize trong 30 giây",
+        )),
+    }
+}
+
+fn read_identity(
+    initialized: agent_client_protocol::schema::v1::InitializeResponse,
+) -> Result<AgentIdentity, TransportError> {
+    if initialized.protocol_version != ProtocolVersion::V1 {
+        return Err(TransportError::UnsupportedProtocol {
+            expected: 1,
+            actual: initialized.protocol_version.as_u16(),
+        });
+    }
+    let info =
+        initialized
+            .agent_info
+            .as_ref()
+            .ok_or_else(|| TransportError::UnexpectedAgentIdentity {
+                expected: "agentInfo".into(),
+                actual: "missing agentInfo".into(),
+            })?;
+    Ok(AgentIdentity {
+        name: info.name.clone(),
+        version: info.version.clone(),
+    })
 }

@@ -10,10 +10,17 @@ use std::future::Future;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-pub use acp::AcpTransport;
+pub use acp::{AcpTransport, probe_agent_identity};
 pub use error::TransportError;
 
 const TEXT_EVENT_MAX_BYTES: usize = 64 * 1024;
+
+/// Danh tính một adapter tự khai trong phản hồi `initialize`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentIdentity {
+    pub name: String,
+    pub version: String,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentConnection {
