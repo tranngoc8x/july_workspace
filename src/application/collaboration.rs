@@ -507,4 +507,23 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
         self.runtime.update_agent(agent.clone()).await?;
         Ok(agent)
     }
+
+    /// Replace an existing agent's transport without changing its identity.
+    pub async fn set_agent_transport(
+        &mut self,
+        reference: AgentRef,
+        transport_type: String,
+        transport_config: serde_json::Value,
+        changed_at: String,
+    ) -> Result<Agent, CollaborationError> {
+        let mut agent = self.resolve_agent(reference).await?;
+        agent.transport_type = transport_type;
+        agent.transport_config = transport_config;
+        agent.updated_at = changed_at;
+        agent
+            .validate()
+            .map_err(|error| CollaborationError::InvalidCommand(error.to_string()))?;
+        self.runtime.update_agent(agent.clone()).await?;
+        Ok(agent)
+    }
 }

@@ -1,6 +1,6 @@
 use july_workspace::application::{
-    AddRoomMember, AddThreadMember, CollaborationError, CollaborationService, CreateRoom,
-    CreateThread, MembershipState, RemoveRoomMember, RemoveThreadMember, RoomRef,
+    AddAgent, AddRoomMember, AddThreadMember, AgentRef, CollaborationError, CollaborationService,
+    CreateRoom, CreateThread, MembershipState, RemoveRoomMember, RemoveThreadMember, RoomRef,
 };
 use july_workspace::domain::{Agent, AgentId, ConversationId, MemberType, RoomId, WorkItemId};
 use july_workspace::runtime::StorageWorker;
@@ -57,6 +57,60 @@ fn seed_agent(path: &Path, name: &str) -> Agent {
 
 fn service(path: &Path) -> CollaborationService<StorageWorker> {
     CollaborationService::new(StorageWorker::open(path).unwrap())
+}
+
+#[tokio::test]
+async fn setting_the_transport_replaces_the_stored_config_in_place() {
+    let database = TestDatabase::new();
+    let mut service = service(database.path());
+    let agent_id = AgentId::new();
+    service
+        .add_agent(AddAgent {
+            agent_id,
+            name: "cashpoint".into(),
+            project_root: "/workspace/cashpoint".into(),
+            transport_type: "acp".into(),
+            transport_config: json!({ "executable": "/old/bin" }),
+            runtime: Some("codex".into()),
+            created_at: CREATED.into(),
+        })
+        .await
+        .expect("agent added");
+
+    let updated = service
+        .set_agent_transport(
+            AgentRef::Name("cashpoint".into()),
+            "acp".into(),
+            json!({ "executable": "/new/bin" }),
+            LEFT.into(),
+        )
+        .await
+        .expect("transport replaced");
+
+    assert_eq!(updated.id, agent_id, "same agent, not a new record");
+    assert_eq!(updated.transport_config["executable"], "/new/bin");
+    assert_eq!(updated.updated_at, LEFT);
+    assert_eq!(updated.project_root, "/workspace/cashpoint");
+    assert_eq!(updated.status, "active");
+    assert_eq!(updated.metadata, json!({ "runtime": "codex" }));
+    assert_eq!(updated.created_at, CREATED);
+
+    let reloaded = service
+        .resolve_agent(AgentRef::Name("cashpoint".into()))
+        .await
+        .expect("agent reloaded");
+    assert_eq!(reloaded.id, agent_id);
+    assert_eq!(reloaded.transport_config["executable"], "/new/bin");
+    assert_eq!(reloaded.updated_at, LEFT);
+    assert_eq!(reloaded.project_root, "/workspace/cashpoint");
+    assert_eq!(reloaded.status, "active");
+    assert_eq!(reloaded.metadata, json!({ "runtime": "codex" }));
+    assert_eq!(reloaded.created_at, CREATED);
+    assert_eq!(
+        service.list_agents().await.expect("agents listed").len(),
+        1,
+        "the update replaces the existing record"
+    );
 }
 
 #[tokio::test]
