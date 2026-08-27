@@ -139,4 +139,26 @@ mod tests {
             "3"
         );
     }
+
+    #[test]
+    fn narrow_spaced_words_follow_paragraph_wrap_geometry() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 12,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "aaaaa a aaaaa a aaaaa a bbbbb b bbbbb b bbbbb b ccccc c ccccc c ccccc c".into(),
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        for x in 0..5 {
+            assert_eq!(buffer.cell((x, 1)).unwrap().symbol(), "b");
+        }
+        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "b");
+    }
 }
