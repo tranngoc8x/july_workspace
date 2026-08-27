@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::text::Line;
 use ratatui_textarea::TextArea;
 
 use crate::application::{ChatEvent, ChatFailureKind};
@@ -151,6 +152,23 @@ impl App {
         &self.stream
     }
 
+    pub(crate) fn transcript(&self) -> String {
+        let mut transcript = self.completed_lines.join("\n");
+        if !self.stream.is_empty() {
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            transcript.push_str(&self.stream);
+        }
+        transcript
+    }
+
+    pub(crate) fn transcript_scroll(&self) -> u16 {
+        self.max_scroll_offset()
+            .saturating_sub(self.scroll_offset)
+            .min(u16::MAX.into()) as u16
+    }
+
     pub fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
@@ -184,7 +202,7 @@ impl App {
                 Vec::new()
             }
             AppEvent::ChatBatch(events) => {
-                for event in events.into_iter().take(CHAT_BATCH_LIMIT) {
+                for event in events {
                     self.reduce_chat(event);
                 }
                 Vec::new()
@@ -210,10 +228,11 @@ impl App {
             KeyCode::PageUp => {
                 self.follow_tail = false;
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.clamp_scroll();
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.follow_tail = self.scroll_offset == 0;
+                self.clamp_scroll();
             }
             KeyCode::End => {
                 self.scroll_offset = 0;
@@ -228,7 +247,7 @@ impl App {
     }
 
     fn submit(&mut self) -> Vec<AppCommand> {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.turn_active {
             return Vec::new();
         }
 
@@ -308,12 +327,23 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
-        self.scroll_offset = self
-            .scroll_offset
-            .min(self.completed_lines.len() + usize::from(!self.stream.is_empty()));
+        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
         if self.scroll_offset == 0 {
             self.follow_tail = true;
         }
+    }
+
+    fn max_scroll_offset(&self) -> usize {
+        self.wrapped_row_count()
+            .saturating_sub(usize::from(self.viewport.height.saturating_sub(5)).max(1))
+    }
+
+    fn wrapped_row_count(&self) -> usize {
+        let width = usize::from(self.viewport.width.max(1));
+        self.transcript()
+            .split('\n')
+            .map(|line| Line::from(line).width().max(1).div_ceil(width))
+            .sum()
     }
 }
 
@@ -339,9 +369,14 @@ mod tests {
 
     use super::*;
     use crate::application::{ChatEvent, ChatFailureKind};
+    use crate::domain::{MemberType, Message};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
     }
 
     #[test]
@@ -364,6 +399,22 @@ mod tests {
     }
 
     #[test]
+    fn alt_enter_keeps_a_newline_in_the_exact_submitted_text() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Key(key(KeyCode::Char('a'))));
+        app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('b'))));
+
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::Submit {
+                context: ContextId::root(),
+                text: "a\nb".into(),
+            }]
+        );
+    }
+
+    #[test]
     fn viewport_scroll_disables_follow_tail_until_end_and_resize_clamps_it() {
         let mut app = App::new(Context::root());
 
@@ -374,8 +425,8 @@ mod tests {
         app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
 
         assert_eq!(app.viewport(), Viewport::new(80, 24));
-        assert_eq!(app.scroll_offset(), 1);
-        assert!(!app.follow_tail());
+        assert_eq!(app.scroll_offset(), 0);
+        assert!(app.follow_tail());
 
         app.reduce(AppEvent::Resize {
             width: 40,
@@ -412,6 +463,22 @@ mod tests {
 
         assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
         assert_eq!(app.input(), "two");
+    }
+
+    #[test]
+    fn acknowledged_submit_stays_single_flight_until_a_terminal_chat_event() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Key(key(KeyCode::Char('o'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Submitted,
+        });
+        app.reduce(AppEvent::Key(key(KeyCode::Char('n'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+
+        assert_eq!(app.input(), "n");
+        assert!(app.turn_active());
     }
 
     #[test]
@@ -465,6 +532,28 @@ mod tests {
     }
 
     #[test]
+    fn completion_and_disconnect_freeze_each_received_stream() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("first".into())));
+        app.reduce(AppEvent::Chat(ChatEvent::MessageCompleted(Message {
+            id: Default::default(),
+            conversation_id: Default::default(),
+            sender_type: MemberType::Agent,
+            sender_id: "agent".into(),
+            body: "first".into(),
+            reply_to: None,
+            metadata: serde_json::json!({}),
+            created_at: "now".into(),
+        })));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("second".into())));
+        app.reduce(AppEvent::Chat(ChatEvent::Disconnected("offline".into())));
+
+        assert!(!app.turn_active());
+        assert_eq!(app.completed_lines(), ["first", "second", "error: offline"]);
+    }
+
+    #[test]
     fn terminal_event_wins_over_a_bounded_chat_batch() {
         let mut chat = VecDeque::from_iter(
             (0..CHAT_BATCH_LIMIT + 1).map(|_| ChatEvent::TextDelta("x".into())),
@@ -482,5 +571,51 @@ mod tests {
         };
         assert_eq!(batch.len(), CHAT_BATCH_LIMIT);
         assert_eq!(chat.len(), 1);
+    }
+
+    #[test]
+    fn reducer_never_drops_an_oversized_chat_batch() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::ChatBatch(
+            (0..CHAT_BATCH_LIMIT + 1)
+                .map(|_| ChatEvent::TextDelta("x".into()))
+                .collect(),
+        ));
+
+        assert_eq!(app.stream(), "x".repeat(CHAT_BATCH_LIMIT + 1));
+    }
+
+    #[test]
+    fn scrolling_clamps_against_wrapped_rows_not_message_count() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 4,
+            height: 7,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "1234567890123456".into(),
+        )));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+
+        assert_eq!(app.scroll_offset(), 2);
+        assert!(!app.follow_tail());
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_top_wrapped_row() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 4,
+            height: 7,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "1234567890123456".into(),
+        )));
+        for _ in 0..10 {
+            app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        }
+
+        assert_eq!(app.scroll_offset(), 2);
     }
 }

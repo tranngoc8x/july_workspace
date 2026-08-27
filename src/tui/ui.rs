@@ -24,17 +24,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(Paragraph::new(status), areas[0]);
 
-    let mut transcript = app.completed_lines().join("\n");
-    if !app.stream().is_empty() {
-        if !transcript.is_empty() {
-            transcript.push('\n');
-        }
-        transcript.push_str(app.stream());
-    }
     frame.render_widget(
-        Paragraph::new(transcript)
+        Paragraph::new(app.transcript())
             .wrap(Wrap { trim: false })
-            .scroll((app.scroll_offset().min(u16::MAX.into()) as u16, 0)),
+            .scroll((app.transcript_scroll(), 0)),
         areas[1],
     );
 
@@ -53,7 +46,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use crate::tui::app::{App, Context};
+    use crate::application::ChatEvent;
+    use crate::tui::app::{App, AppEvent, Context};
 
     use super::render;
 
@@ -66,5 +60,55 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "J");
+    }
+
+    #[test]
+    fn tall_transcript_follows_the_actual_tail() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
+            "5"
+        );
+    }
+
+    #[test]
+    fn page_up_from_a_tall_transcript_renders_earlier_wrapped_rows() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
+            "3"
+        );
     }
 }
