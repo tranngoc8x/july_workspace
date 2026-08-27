@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(status), areas[0]);
 
     frame.render_widget(
-        Paragraph::new(app.transcript())
+        Paragraph::new(app.transcript_text())
             .wrap(Wrap { trim: false })
             .scroll((app.transcript_scroll(), 0)),
         areas[1],
@@ -51,6 +51,8 @@ mod tests {
 
     use super::render;
 
+    const TALL_MARKDOWN: &str = "0  \n1  \n2  \n3  \n4  \n5  \n6  \n7  \n8  \n9";
+
     #[test]
     fn tiny_terminal_render_is_bounded_and_keeps_the_july_label() {
         let app = App::new(Context::root());
@@ -69,9 +71,7 @@ mod tests {
             width: 20,
             height: 10,
         });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
-        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
 
@@ -90,9 +90,7 @@ mod tests {
             width: 20,
             height: 10,
         });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
-        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::PageUp,
@@ -119,9 +117,7 @@ mod tests {
             width: 20,
             height: 10,
         });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
-        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         for _ in 0..2 {
             app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
@@ -129,7 +125,7 @@ mod tests {
                 crossterm::event::KeyModifiers::NONE,
             )));
         }
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("\n10\n11".into())));
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("  \n10  \n11".into())));
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -171,5 +167,53 @@ mod tests {
             terminal.backend().buffer().cell((6, 1)).unwrap().symbol(),
             "3"
         );
+    }
+
+    #[test]
+    fn markdown_render_hides_fences_and_formats_quotes() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 60,
+            height: 20,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "> quoted\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!rendered.contains("```"));
+        assert!(rendered.contains("quoted"));
+        assert!(rendered.contains("fn main() {}"));
+        assert!(rendered.contains('┌'));
+        assert!(rendered.contains('│'));
+        for cell in ["A", "B", "1", "2"] {
+            assert!(rendered.contains(cell));
+        }
+        let quote = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "q")
+            .unwrap();
+        assert_ne!(quote.style(), ratatui::style::Style::default());
+        let code = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .find(|cell| cell.symbol() == "f")
+            .unwrap();
+        assert_ne!(code.style(), ratatui::style::Style::default());
     }
 }

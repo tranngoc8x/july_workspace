@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub mod app;
+mod markdown;
 pub mod ui;
 
 use app::{App, Context};

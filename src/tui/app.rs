@@ -2,9 +2,11 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::text::Text;
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::TextArea;
 
+use super::markdown::MarkdownStream;
 use crate::application::{ChatEvent, ChatFailureKind};
 
 pub const CHAT_BATCH_LIMIT: usize = 32;
@@ -101,8 +103,7 @@ pub struct App {
     context: Context,
     input: TextArea<'static>,
     viewport: Viewport,
-    completed_lines: Vec<String>,
-    stream: String,
+    markdown: MarkdownStream,
     scroll_offset: usize,
     follow_tail: bool,
     pending: Option<ContextId>,
@@ -117,8 +118,7 @@ impl App {
             context,
             input: TextArea::default(),
             viewport: Viewport::new(0, 0),
-            completed_lines: Vec::new(),
-            stream: String::new(),
+            markdown: MarkdownStream::default(),
             scroll_offset: 0,
             follow_tail: true,
             pending: None,
@@ -144,23 +144,12 @@ impl App {
         self.viewport
     }
 
-    pub fn completed_lines(&self) -> &[String] {
-        &self.completed_lines
-    }
-
     pub fn stream(&self) -> &str {
-        &self.stream
+        self.markdown.tail()
     }
 
-    pub(crate) fn transcript(&self) -> String {
-        let mut transcript = self.completed_lines.join("\n");
-        if !self.stream.is_empty() {
-            if !transcript.is_empty() {
-                transcript.push('\n');
-            }
-            transcript.push_str(&self.stream);
-        }
-        transcript
+    pub(crate) fn transcript_text(&self) -> Text<'static> {
+        self.markdown.text()
     }
 
     pub(crate) fn transcript_scroll(&self) -> u16 {
@@ -299,9 +288,13 @@ impl App {
         }
         let new_max_scroll = self.max_scroll_offset();
         if !was_following_tail {
-            self.scroll_offset = self
-                .scroll_offset
-                .saturating_add(new_max_scroll.saturating_sub(old_max_scroll));
+            self.scroll_offset = if new_max_scroll >= old_max_scroll {
+                self.scroll_offset
+                    .saturating_add(new_max_scroll - old_max_scroll)
+            } else {
+                self.scroll_offset
+                    .saturating_sub(old_max_scroll - new_max_scroll)
+            };
         }
         self.clamp_scroll(new_max_scroll);
     }
@@ -309,7 +302,7 @@ impl App {
     fn reduce_chat(&mut self, event: ChatEvent) {
         match event {
             ChatEvent::TextDelta(text) => {
-                self.stream.push_str(&text);
+                self.markdown.push(&text);
                 self.turn_active = true;
             }
             ChatEvent::MessageCompleted(_) => self.freeze_stream(),
@@ -319,13 +312,13 @@ impl App {
             }
             ChatEvent::TurnFailed(failure) => {
                 self.freeze_stream();
-                self.completed_lines
-                    .push(format!("error: {}", failure_label(failure)));
+                self.markdown
+                    .push_plain(format!("error: {}", failure_label(failure)));
                 self.turn_active = false;
             }
             ChatEvent::Disconnected(reason) => {
                 self.freeze_stream();
-                self.completed_lines.push(format!("error: {reason}"));
+                self.markdown.push_plain(format!("error: {reason}"));
                 self.turn_active = false;
             }
             ChatEvent::PermissionRequested { .. } => {}
@@ -333,9 +326,7 @@ impl App {
     }
 
     fn freeze_stream(&mut self) {
-        if !self.stream.is_empty() {
-            self.completed_lines.push(std::mem::take(&mut self.stream));
-        }
+        self.markdown.finish();
     }
 
     fn clamp_scroll(&mut self, max_scroll: usize) {
@@ -351,7 +342,7 @@ impl App {
     }
 
     fn wrapped_row_count(&self) -> usize {
-        Paragraph::new(self.transcript())
+        Paragraph::new(self.transcript_text())
             .wrap(Wrap { trim: false })
             .line_count(self.viewport.width.max(1))
     }
@@ -586,7 +577,10 @@ mod tests {
         )));
 
         assert!(!app.turn_active());
-        assert_eq!(app.completed_lines(), ["partial", "error: protocol error"]);
+        assert_eq!(
+            app.markdown.completed().to_string(),
+            "partial\nerror: protocol error"
+        );
         assert_eq!(app.stream(), "");
     }
 
@@ -609,7 +603,24 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::Disconnected("offline".into())));
 
         assert!(!app.turn_active());
-        assert_eq!(app.completed_lines(), ["first", "second", "error: offline"]);
+        assert_eq!(
+            app.markdown.completed().to_string(),
+            "first\nsecond\nerror: offline"
+        );
+    }
+
+    #[test]
+    fn completed_markdown_block_freezes_while_the_last_block_keeps_streaming() {
+        let mut app = App::new(Context::root());
+
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "first paragraph\n\nsecond".into(),
+        )));
+
+        assert_eq!(app.markdown.completed_len(), 1);
+        assert_eq!(app.markdown.completed().to_string(), "first paragraph\n");
+        assert!(!app.stream().contains("first paragraph"));
+        assert!(app.stream().ends_with("second"));
     }
 
     #[test]
@@ -688,5 +699,23 @@ mod tests {
         }
 
         assert_eq!(app.scroll_offset(), 2);
+    }
+
+    #[test]
+    fn shrinking_markdown_tail_preserves_the_manually_scrolled_row() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 6,
+            height: 7,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "0  \n1  \n1234 **x".into(),
+        )));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        assert_eq!(app.scroll_offset(), 1);
+
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("**".into())));
+
+        assert_eq!(app.scroll_offset(), 0);
     }
 }
