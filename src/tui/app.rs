@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::TextArea;
 
@@ -219,7 +219,7 @@ impl App {
     }
 
     fn reduce_key(&mut self, key: KeyEvent) -> Vec<AppCommand> {
-        if !key.kind.is_press() {
+        if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
 
@@ -315,20 +315,17 @@ impl App {
             ChatEvent::MessageCompleted(_) => self.freeze_stream(),
             ChatEvent::TurnCompleted => {
                 self.freeze_stream();
-                self.pending = None;
                 self.turn_active = false;
             }
             ChatEvent::TurnFailed(failure) => {
                 self.freeze_stream();
                 self.completed_lines
                     .push(format!("error: {}", failure_label(failure)));
-                self.pending = None;
                 self.turn_active = false;
             }
             ChatEvent::Disconnected(reason) => {
                 self.freeze_stream();
                 self.completed_lines.push(format!("error: {reason}"));
-                self.pending = None;
                 self.turn_active = false;
             }
             ChatEvent::PermissionRequested { .. } => {}
@@ -378,7 +375,7 @@ fn failure_label(failure: ChatFailureKind) -> &'static str {
 mod tests {
     use std::collections::VecDeque;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::*;
     use crate::application::{ChatEvent, ChatFailureKind};
@@ -390,6 +387,10 @@ mod tests {
 
     fn alt_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn repeat_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat)
     }
 
     #[test]
@@ -432,24 +433,58 @@ mod tests {
         let mut app = App::new(Context::root());
 
         app.reduce(AppEvent::Resize {
+            width: 5,
+            height: 8,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "long wrapped content keeps the transcript taller than the viewport".into(),
+        )));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+
+        assert_eq!(app.viewport(), Viewport::new(5, 8));
+        assert!(app.scroll_offset() > 0);
+        assert!(!app.follow_tail());
+
+        app.reduce(AppEvent::Resize {
             width: 80,
             height: 24,
         });
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
 
         assert_eq!(app.viewport(), Viewport::new(80, 24));
         assert_eq!(app.scroll_offset(), 0);
         assert!(app.follow_tail());
+    }
 
-        app.reduce(AppEvent::Resize {
-            width: 40,
-            height: 3,
-        });
-        app.reduce(AppEvent::Key(key(KeyCode::End)));
+    #[test]
+    fn terminal_chat_events_keep_pending_until_matching_submit_ack() {
+        let terminal_events = [
+            ChatEvent::TurnCompleted,
+            ChatEvent::TurnFailed(ChatFailureKind::Protocol),
+            ChatEvent::Disconnected("offline".into()),
+        ];
 
-        assert_eq!(app.viewport(), Viewport::new(40, 3));
-        assert_eq!(app.scroll_offset(), 0);
-        assert!(app.follow_tail());
+        for terminal_event in terminal_events {
+            let mut app = App::new(Context::root());
+            app.reduce(AppEvent::Key(key(KeyCode::Char('o'))));
+            assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
+            app.reduce(AppEvent::Chat(terminal_event));
+
+            app.reduce(AppEvent::Key(key(KeyCode::Char('n'))));
+            assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+
+            app.reduce(AppEvent::CommandFinished {
+                context: ContextId::root(),
+                result: CommandResult::Submitted,
+            });
+            assert_eq!(app.status(), None);
+            assert_eq!(
+                app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+                vec![AppCommand::Submit {
+                    context: ContextId::root(),
+                    text: "n".into(),
+                }]
+            );
+        }
     }
 
     #[test]
@@ -492,6 +527,17 @@ mod tests {
 
         assert_eq!(app.input(), "n");
         assert!(app.turn_active());
+    }
+
+    #[test]
+    fn repeated_character_and_backspace_keys_edit_input() {
+        let mut app = App::new(Context::root());
+
+        app.reduce(AppEvent::Key(repeat_key(KeyCode::Char('a'))));
+        app.reduce(AppEvent::Key(repeat_key(KeyCode::Char('b'))));
+        app.reduce(AppEvent::Key(repeat_key(KeyCode::Backspace)));
+
+        assert_eq!(app.input(), "a");
     }
 
     #[test]

@@ -163,6 +163,7 @@ pub fn run_inactive_shell() -> Result<(), ShellError> {
     let _signals = ExitSignals::install().map_err(ShellError::Operation)?;
     with_terminal(|terminal| {
         let mut app = App::new(Context::root());
+        seed_viewport(terminal, &mut app);
         draw_inactive(terminal, &app)?;
 
         loop {
@@ -177,6 +178,14 @@ pub fn run_inactive_shell() -> Result<(), ShellError> {
             }
         }
     })
+}
+
+fn seed_viewport<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
+    let area = terminal.get_frame().area();
+    app.reduce(app::AppEvent::Resize {
+        width: area.width,
+        height: area.height,
+    });
 }
 
 fn handle_event<B: Backend>(
@@ -284,7 +293,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{RawMode, app::Context, handle_event, run_with_terminal};
+    use super::{RawMode, app::Context, handle_event, run_with_terminal, seed_viewport};
 
     #[derive(Clone)]
     struct FakeRawMode {
@@ -437,5 +446,17 @@ mod tests {
         assert_eq!(terminal.get_frame().area().width, 120);
         assert_eq!(terminal.get_frame().area().height, 40);
         assert_eq!(app.viewport(), super::app::Viewport::new(120, 40));
+    }
+
+    #[test]
+    fn initial_viewport_reaches_app_before_first_render() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = super::App::new(Context::root());
+
+        seed_viewport(&mut terminal, &mut app);
+        assert_eq!(app.viewport(), super::app::Viewport::new(80, 24));
+        terminal
+            .draw(|frame| super::ui::render(frame, &app))
+            .unwrap();
     }
 }
