@@ -14,6 +14,11 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+pub mod app;
+pub mod ui;
+
+use app::{App, Context};
+
 /// Failure from the terminal operation, restoration, or both.
 #[derive(Debug)]
 pub enum ShellError {
@@ -157,7 +162,8 @@ where
 pub fn run_inactive_shell() -> Result<(), ShellError> {
     let _signals = ExitSignals::install().map_err(ShellError::Operation)?;
     with_terminal(|terminal| {
-        draw_inactive(terminal)?;
+        let mut app = App::new(Context::root());
+        draw_inactive(terminal, &app)?;
 
         loop {
             if ExitSignals::requested() {
@@ -166,18 +172,23 @@ pub fn run_inactive_shell() -> Result<(), ShellError> {
             if !event::poll(Duration::from_millis(50))? {
                 continue;
             }
-            if handle_event(terminal, event::read()?)? {
+            if handle_event(terminal, &mut app, event::read()?)? {
                 return Ok(());
             }
         }
     })
 }
 
-fn handle_event<B: Backend>(terminal: &mut Terminal<B>, event: Event) -> Result<bool, B::Error> {
+fn handle_event<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    event: Event,
+) -> Result<bool, B::Error> {
     match event {
-        Event::Resize(_, _) => {
+        Event::Resize(width, height) => {
             terminal.autoresize()?;
-            draw_inactive(terminal)?;
+            app.reduce(app::AppEvent::Resize { width, height });
+            draw_inactive(terminal, app)?;
             Ok(false)
         }
         Event::Key(key)
@@ -192,10 +203,8 @@ fn handle_event<B: Backend>(terminal: &mut Terminal<B>, event: Event) -> Result<
     }
 }
 
-fn draw_inactive<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
-    terminal
-        .draw(|frame| frame.render_widget("July", frame.area()))
-        .map(|_| ())
+fn draw_inactive<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), B::Error> {
+    terminal.draw(|frame| ui::render(frame, app)).map(|_| ())
 }
 
 #[cfg(unix)]
@@ -275,7 +284,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{RawMode, handle_event, run_with_terminal};
+    use super::{RawMode, app::Context, handle_event, run_with_terminal};
 
     #[derive(Clone)]
     struct FakeRawMode {
@@ -420,11 +429,13 @@ mod tests {
     fn resize_event_updates_the_terminal_area() {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.backend_mut().resize(120, 40);
+        let mut app = super::App::new(Context::root());
 
-        let should_exit = handle_event(&mut terminal, Event::Resize(120, 40)).unwrap();
+        let should_exit = handle_event(&mut terminal, &mut app, Event::Resize(120, 40)).unwrap();
 
         assert!(!should_exit);
         assert_eq!(terminal.get_frame().area().width, 120);
         assert_eq!(terminal.get_frame().area().height, 40);
+        assert_eq!(app.viewport(), super::app::Viewport::new(120, 40));
     }
 }
