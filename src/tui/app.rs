@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::TextArea;
 
 use crate::application::{ChatEvent, ChatFailureKind};
@@ -194,17 +194,16 @@ impl App {
             AppEvent::Key(key) => self.reduce_key(key),
             AppEvent::Resize { width, height } => {
                 self.viewport = Viewport::new(width, height);
-                self.clamp_scroll();
+                let max_scroll = self.max_scroll_offset();
+                self.clamp_scroll(max_scroll);
                 Vec::new()
             }
             AppEvent::Chat(event) => {
-                self.reduce_chat(event);
+                self.reduce_chat_content(std::iter::once(event));
                 Vec::new()
             }
             AppEvent::ChatBatch(events) => {
-                for event in events {
-                    self.reduce_chat(event);
-                }
+                self.reduce_chat_content(events);
                 Vec::new()
             }
             AppEvent::CommandFinished { context, result } => {
@@ -228,11 +227,13 @@ impl App {
             KeyCode::PageUp => {
                 self.follow_tail = false;
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.clamp_scroll();
+                let max_scroll = self.max_scroll_offset();
+                self.clamp_scroll(max_scroll);
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.clamp_scroll();
+                let max_scroll = self.max_scroll_offset();
+                self.clamp_scroll(max_scroll);
             }
             KeyCode::End => {
                 self.scroll_offset = 0;
@@ -290,6 +291,21 @@ impl App {
         }
     }
 
+    fn reduce_chat_content(&mut self, events: impl IntoIterator<Item = ChatEvent>) {
+        let old_max_scroll = self.max_scroll_offset();
+        let was_following_tail = self.follow_tail;
+        for event in events {
+            self.reduce_chat(event);
+        }
+        let new_max_scroll = self.max_scroll_offset();
+        if !was_following_tail {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add(new_max_scroll.saturating_sub(old_max_scroll));
+        }
+        self.clamp_scroll(new_max_scroll);
+    }
+
     fn reduce_chat(&mut self, event: ChatEvent) {
         match event {
             ChatEvent::TextDelta(text) => {
@@ -317,7 +333,6 @@ impl App {
             }
             ChatEvent::PermissionRequested { .. } => {}
         }
-        self.clamp_scroll();
     }
 
     fn freeze_stream(&mut self) {
@@ -326,8 +341,8 @@ impl App {
         }
     }
 
-    fn clamp_scroll(&mut self) {
-        self.scroll_offset = self.scroll_offset.min(self.max_scroll_offset());
+    fn clamp_scroll(&mut self, max_scroll: usize) {
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
         if self.scroll_offset == 0 {
             self.follow_tail = true;
         }
@@ -339,11 +354,9 @@ impl App {
     }
 
     fn wrapped_row_count(&self) -> usize {
-        let width = usize::from(self.viewport.width.max(1));
-        self.transcript()
-            .split('\n')
-            .map(|line| Line::from(line).width().max(1).div_ceil(width))
-            .sum()
+        Paragraph::new(self.transcript())
+            .wrap(Wrap { trim: false })
+            .line_count(self.viewport.width.max(1))
     }
 }
 
@@ -600,6 +613,18 @@ mod tests {
 
         assert_eq!(app.scroll_offset(), 2);
         assert!(!app.follow_tail());
+    }
+
+    #[test]
+    fn wrapped_row_count_matches_paragraph_word_wrapping() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 5,
+            height: 7,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("a a a a a a".into())));
+
+        assert_eq!(app.wrapped_row_count(), 2);
     }
 
     #[test]

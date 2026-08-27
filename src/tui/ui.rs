@@ -111,4 +111,32 @@ mod tests {
             "3"
         );
     }
+
+    #[test]
+    fn streamed_content_keeps_a_manually_scrolled_row_visible() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "0\n1\n2\n3\n4\n5\n6\n7\n8\n9".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        for _ in 0..2 {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageUp,
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("\n10\n11".into())));
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
+            "3"
+        );
+    }
 }
