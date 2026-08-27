@@ -136,27 +136,32 @@ impl PtyChild {
     }
 
     fn read_once(&mut self) {
+        self.try_read_once().unwrap();
+    }
+
+    fn try_read_once(&mut self) -> io::Result<()> {
         let mut descriptor = libc::pollfd {
             fd: self.master.as_raw_fd(),
             events: libc::POLLIN,
             revents: 0,
         };
         let ready = unsafe { libc::poll(&mut descriptor, 1, 25) };
-        assert!(
-            ready >= 0,
-            "PTY poll failed: {}",
-            io::Error::last_os_error()
-        );
+        if ready < 0 {
+            return Err(io::Error::last_os_error());
+        }
         if ready == 0 {
-            return;
+            return Ok(());
         }
 
         let mut bytes = [0; 4096];
         match self.master.read(&mut bytes) {
-            Ok(0) => {}
-            Ok(read) => self.output.extend_from_slice(&bytes[..read]),
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
-            Err(error) => panic!("PTY read failed: {error}"),
+            Ok(0) => Ok(()),
+            Ok(read) => {
+                self.output.extend_from_slice(&bytes[..read]);
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -192,24 +197,32 @@ impl Drop for PtyChild {
         if self.reaped {
             return;
         }
-        match self.child.try_wait() {
-            Ok(Some(_)) => {
-                self.reaped = true;
-                return;
-            }
-            Ok(None) => {}
-            Err(_) => return,
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
         }
-
-        let _ = self.child.kill();
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
+            let _ = self.try_read_once();
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     self.reaped = true;
                     return;
                 }
-                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let _ = self.try_read_once();
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.reaped = true;
+                    return;
+                }
+                Ok(None) => {}
                 Err(_) => return,
             }
         }
