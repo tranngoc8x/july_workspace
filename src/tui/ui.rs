@@ -148,7 +148,7 @@ mod tests {
             height: 10,
         });
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "aaaaa a aaaaa a aaaaa a bbbbb b bbbbb b bbbbb b ccccc c ccccc c ccccc c".into(),
+            "aaaaa 0 aaaaa 1 aaaaa 2 bbbbb 3 bbbbb 4 bbbbb 5 ccccc 6 ccccc 7 ccccc 8".into(),
         )));
         let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
 
@@ -159,6 +159,17 @@ mod tests {
             assert_eq!(buffer.cell((x, 1)).unwrap().symbol(), "b");
         }
         assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "b");
+        assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "4");
+
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((6, 1)).unwrap().symbol(),
+            "3"
+        );
     }
 }
