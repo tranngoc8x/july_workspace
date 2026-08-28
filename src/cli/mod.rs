@@ -17,15 +17,15 @@ use crate::runtime::{
 use crate::transport::AcpTransport;
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 mod init;
 mod keys;
@@ -839,6 +839,68 @@ async fn run_repl() -> Result<(), CliError> {
     }
 }
 
+struct ReplLine {
+    line: Option<String>,
+    origin: Option<crate::tui::app::ContextId>,
+}
+
+struct ReplSessionState {
+    contexts: Vec<ReplContext>,
+    registered: HashSet<AgentId>,
+    live: Option<ReplChat>,
+}
+
+impl ReplSessionState {
+    fn new() -> Self {
+        Self {
+            contexts: vec![ReplContext::Root],
+            registered: HashSet::new(),
+            live: None,
+        }
+    }
+}
+
+struct ReplCaptureWriter<W> {
+    inner: W,
+    captured: Vec<u8>,
+}
+
+impl<W> ReplCaptureWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            captured: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.captured.clear();
+    }
+
+    fn take(&mut self) -> Option<String> {
+        if self.captured.is_empty() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&std::mem::take(&mut self.captured))
+                .trim_end()
+                .to_owned(),
+        )
+    }
+}
+
+impl<W: Write> Write for ReplCaptureWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.captured.extend_from_slice(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
@@ -846,23 +908,20 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
     let mut input = repl_input();
     let stdout = io::stdout();
     let stderr = io::stderr();
-    let mut stdout = stdout.lock();
-    let mut stderr = stderr.lock();
-    let mut contexts = vec![ReplContext::Root];
-    let mut registered = HashSet::new();
-    let mut live = None;
+    let mut stdout = ReplCaptureWriter::new(stdout.lock());
+    let mut stderr = ReplCaptureWriter::new(stderr.lock());
+    let mut state = ReplSessionState::new();
     let interaction = interact_repl_loop(
         service,
         workspace,
         &mut input,
         &mut stdout,
         &mut stderr,
-        &mut contexts,
-        &mut registered,
-        &mut live,
+        &mut state,
+        None,
     )
     .await;
-    let shutdown = close_repl_context(&mut live).await;
+    let shutdown = close_repl_context(&mut state.live).await;
     match (interaction, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(operation), Ok(())) => Err(operation),
@@ -877,17 +936,40 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
 async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
-    input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
-    stdout: &mut impl Write,
-    stderr: &mut impl Write,
-    contexts: &mut Vec<ReplContext>,
-    registered: &mut HashSet<AgentId>,
-    live: &mut Option<ReplChat>,
+    input: &mut mpsc::UnboundedReceiver<io::Result<ReplLine>>,
+    stdout: &mut ReplCaptureWriter<impl Write>,
+    stderr: &mut ReplCaptureWriter<impl Write>,
+    state: &mut ReplSessionState,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
 ) -> Result<(), CliError> {
+    let ReplSessionState {
+        contexts,
+        registered,
+        live,
+    } = state;
     let mut publish = PublishService::new(workspace.storage());
+    let mut pending_origin = None;
     loop {
+        if let Some(origin) = pending_origin.take() {
+            let context = project_repl_context(service, contexts.last().unwrap()).await?;
+            let result = match (stderr.take(), stdout.take()) {
+                (Some(error), _) => crate::tui::app::CommandResult::Failed(error),
+                (None, Some(output)) => crate::tui::app::CommandResult::Output { context, output },
+                (None, None) => crate::tui::app::CommandResult::Context(context),
+            };
+            if let Some(events) = tui_events {
+                let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
+                    context: origin,
+                    result,
+                });
+            }
+        } else {
+            stderr.clear();
+            stdout.clear();
+        }
         repl_write(stdout, format_args!("> "))?;
-        let line = tokio::select! {
+        stdout.clear();
+        let request = tokio::select! {
             line = input.recv() => match line {
                 Some(line) => line?,
                 None => {
@@ -901,7 +983,8 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 return Ok(());
             }
         };
-        let Some(line) = line else {
+        pending_origin = request.origin;
+        let Some(line) = request.line else {
             close_repl_context(live).await?;
             return Ok(());
         };
@@ -920,7 +1003,13 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
-                drain_repl_turn(chat, input, stdout).await?;
+                if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
+                    let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
+                        context: origin,
+                        result: crate::tui::app::CommandResult::Submitted,
+                    });
+                }
+                drain_repl_turn(chat, input, stdout, tui_events).await?;
             } else {
                 repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
             }
@@ -934,6 +1023,9 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         let arguments = arguments.as_str();
         match spec.name {
             "/exit" if arguments.is_empty() => {
+                if let Some(events) = tui_events {
+                    let _ = events.send(crate::tui::app::AppEvent::Exit);
+                }
                 close_repl_context(live).await?;
                 return Ok(());
             }
@@ -1032,8 +1124,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
-                if let Err(error) = restore_repl_context(service, workspace, &contexts, live).await
-                {
+                if let Err(error) = restore_repl_context(service, workspace, contexts, live).await {
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
@@ -1084,11 +1175,10 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     continue;
                 }
                 contexts.pop();
-                if let Err(error) = restore_repl_context(service, workspace, &contexts, live).await
-                {
+                if let Err(error) = restore_repl_context(service, workspace, contexts, live).await {
                     contexts.push(previous);
                     if let Err(restore) =
-                        restore_repl_context(service, workspace, &contexts, live).await
+                        restore_repl_context(service, workspace, contexts, live).await
                     {
                         return Err(CliError::OperationAndRestore {
                             operation: Box::new(error),
@@ -1273,7 +1363,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                     Err(error) => {
                         if let Err(restore) =
-                            restore_repl_context(service, workspace, &contexts, live).await
+                            restore_repl_context(service, workspace, contexts, live).await
                         {
                             return Err(CliError::OperationAndRestore {
                                 operation: Box::new(error),
@@ -1317,7 +1407,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     }
                     Err(error) => {
                         if let Err(restore) =
-                            restore_repl_context(service, workspace, &contexts, live).await
+                            restore_repl_context(service, workspace, contexts, live).await
                         {
                             return Err(CliError::OperationAndRestore {
                                 operation: Box::new(error),
@@ -1524,14 +1614,18 @@ async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
 
 async fn drain_repl_turn<C: ChatContext>(
     service: &mut C,
-    input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
+    input: &mut mpsc::UnboundedReceiver<io::Result<ReplLine>>,
     stdout: &mut impl Write,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
     loop {
         tokio::select! {
             event = service.next(timestamp()) => {
                 let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
+                if let Some(events) = tui_events {
+                    let _ = events.send(crate::tui::app::AppEvent::Chat(event.clone()));
+                }
                 match event {
                     ChatEvent::TextDelta(text) => repl_write(stdout, format_args!("{text}"))?,
                     ChatEvent::MessageCompleted(_) => repl_write(stdout, format_args!("\n"))?,
@@ -1542,7 +1636,7 @@ async fn drain_repl_turn<C: ChatContext>(
                         repl_write(stdout, format_args!("permission> "))?;
                         let (selected, interrupted) = tokio::select! {
                             line = input.recv() => (
-                                line.transpose()?.flatten()
+                                line.transpose()?.and_then(|line| line.line)
                                     .and_then(|line| line.parse::<usize>().ok())
                                     .and_then(|index| index.checked_sub(1))
                                     .and_then(|index| options.get(index))
@@ -1575,7 +1669,7 @@ async fn drain_repl_turn<C: ChatContext>(
     }
 }
 
-fn repl_input() -> mpsc::UnboundedReceiver<io::Result<Option<String>>> {
+fn repl_input() -> mpsc::UnboundedReceiver<io::Result<ReplLine>> {
     let (sender, receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -1583,20 +1677,61 @@ fn repl_input() -> mpsc::UnboundedReceiver<io::Result<Option<String>>> {
         loop {
             let mut line = String::new();
             let input = match stdin.read_line(&mut line) {
-                Ok(0) => Ok(None),
+                Ok(0) => Ok(ReplLine {
+                    line: None,
+                    origin: None,
+                }),
                 Ok(_) => {
                     line = line.trim_end_matches(['\n', '\r']).into();
-                    Ok(Some(line))
+                    Ok(ReplLine {
+                        line: Some(line),
+                        origin: None,
+                    })
                 }
                 Err(error) => Err(error),
             };
-            let done = matches!(&input, Ok(None) | Err(_));
+            let done = matches!(&input, Ok(ReplLine { line: None, .. }) | Err(_));
             if sender.send(input).is_err() || done {
                 return;
             }
         }
     });
     receiver
+}
+
+async fn project_repl_context<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    context: &ReplContext,
+) -> Result<crate::tui::app::Context, CliError> {
+    use crate::tui::app::{Context, ContextId};
+
+    Ok(match context {
+        ReplContext::Root => Context::root(),
+        ReplContext::Room(room_id) => {
+            let room = service.resolve_room(RoomRef::Id(*room_id)).await?;
+            Context::new(
+                ContextId::new(format!("room:{room_id}")),
+                format!("room · {}", room.name),
+            )
+        }
+        ReplContext::Dm {
+            conversation_id,
+            agent_id,
+            agent_name,
+        } => Context::new(
+            ContextId::new(format!("dm:{conversation_id}:{agent_id}")),
+            format!("dm · {agent_name}"),
+        ),
+        ReplContext::Thread {
+            conversation_id,
+            agent_id,
+            agent_name,
+            ..
+        } => Context::new(
+            ContextId::new(format!("thread:{conversation_id}:{agent_id}")),
+            format!("thread · {agent_name}"),
+        ),
+    })
 }
 
 async fn print_repl_status<R: crate::application::CollaborationRuntime>(
@@ -1652,6 +1787,124 @@ fn repl_write(output: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), C
     output.write_fmt(args)?;
     output.flush()?;
     Ok(())
+}
+
+/// Inactive typed adapter over the authoritative Phase 8 REPL state machine.
+pub struct InactiveTuiBridge {
+    input: mpsc::UnboundedSender<io::Result<ReplLine>>,
+    events: mpsc::UnboundedReceiver<crate::tui::app::AppEvent>,
+    buffered: VecDeque<crate::tui::app::AppEvent>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<Result<(), CliError>>,
+}
+
+impl InactiveTuiBridge {
+    pub async fn open(database: impl AsRef<Path>) -> Result<Self, CliError> {
+        let worker =
+            StorageWorker::open(database).map_err(|error| CliError::Runtime(error.to_string()))?;
+        let mut workspace =
+            WorkspaceRuntime::new(worker).map_err(|error| CliError::Runtime(error.to_string()))?;
+        let mut service = CollaborationService::new(workspace.storage());
+        let (input_sender, mut input) = mpsc::unbounded_channel();
+        let (event_sender, events) = mpsc::unbounded_channel();
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut stdout = ReplCaptureWriter::new(io::sink());
+            let mut stderr = ReplCaptureWriter::new(io::sink());
+            let mut state = ReplSessionState::new();
+            let interaction = tokio::select! {
+                interaction = interact_repl_loop(
+                    &mut service,
+                    &workspace,
+                    &mut input,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut state,
+                    Some(&event_sender),
+                ) => interaction,
+                _ = &mut shutdown_receiver => Ok(()),
+            };
+            let context_shutdown = close_repl_context(&mut state.live).await;
+            let interaction = match (interaction, context_shutdown) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(operation), Ok(())) => Err(operation),
+                (Ok(()), Err(shutdown)) => Err(shutdown),
+                (Err(operation), Err(shutdown)) => Err(CliError::OperationAndContextShutdown {
+                    operation: Box::new(operation),
+                    shutdown: shutdown.to_string(),
+                }),
+            };
+            let workspace_shutdown = workspace
+                .shutdown(timestamp())
+                .await
+                .map_err(|error| CliError::Runtime(error.to_string()));
+            match (interaction, workspace_shutdown) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(operation), Ok(())) => Err(operation),
+                (Ok(()), Err(shutdown)) => Err(shutdown),
+                (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+                    operation: Box::new(operation),
+                    shutdown: shutdown.to_string(),
+                }),
+            }
+        });
+        Ok(Self {
+            input: input_sender,
+            events,
+            buffered: VecDeque::new(),
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+
+    pub async fn execute(
+        &mut self,
+        command: crate::tui::app::AppCommand,
+    ) -> Result<crate::tui::app::AppEvent, CliError> {
+        use crate::tui::app::{AppCommand, AppEvent};
+
+        let (origin, line) = match command {
+            AppCommand::Submit { context, text } => (context, text),
+            AppCommand::Execute { context, input } => (context, input),
+        };
+        self.input
+            .send(Ok(ReplLine {
+                line: Some(line),
+                origin: Some(origin.clone()),
+            }))
+            .map_err(|_| CliError::EventStreamClosed)?;
+        loop {
+            let event = self
+                .events
+                .recv()
+                .await
+                .ok_or(CliError::EventStreamClosed)?;
+            if matches!(
+                &event,
+                AppEvent::CommandFinished { context, .. } if context == &origin
+            ) || matches!(event, AppEvent::Exit)
+            {
+                return Ok(event);
+            }
+            self.buffered.push_back(event);
+        }
+    }
+
+    pub async fn next_event(&mut self) -> Result<Option<crate::tui::app::AppEvent>, CliError> {
+        Ok(match self.buffered.pop_front() {
+            Some(event) => Some(event),
+            None => self.events.recv().await,
+        })
+    }
+
+    pub async fn shutdown(mut self) -> Result<(), CliError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task
+            .await
+            .map_err(|error| CliError::Runtime(error.to_string()))?
+    }
 }
 
 async fn run_dm(agent_name: String) -> Result<(), CliError> {

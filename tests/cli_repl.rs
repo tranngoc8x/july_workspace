@@ -1,8 +1,12 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use july_workspace::application::ChatEvent;
+use july_workspace::cli::InactiveTuiBridge;
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, ResultId, Room, RoomId,
     WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use july_workspace::storage::SqliteStore;
+use july_workspace::tui::app::{App, AppCommand, AppEvent, CommandResult, Context};
 use rusqlite::Connection;
 use serde_json::json;
 use std::io::{Read, Write};
@@ -252,6 +256,21 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
+}
+
+fn tui_command(app: &mut App, input: &str) -> AppCommand {
+    for character in input.chars() {
+        app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::NONE,
+        )));
+    }
+    app.reduce(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )))
+    .pop()
+    .expect("non-blank input emits one command")
 }
 
 #[cfg(unix)]
@@ -837,6 +856,202 @@ fn repl_thread_switch_failures_leave_the_previous_context_active() {
         5
     );
     assert!(workspace.messages(settlement).is_empty());
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permission_event() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let foreign_room = workspace.seed_room("foreign");
+    let agent = workspace.seed_agent("codex");
+    workspace.add_member(&room, &agent);
+    workspace.add_member(&foreign_room, &agent);
+    let thread = workspace.seed_thread(&room, "work", &[&agent]);
+    let foreign_thread = workspace.seed_thread(&foreign_room, "foreign work", &[&agent]);
+
+    let legacy = workspace.repl("/exit\n");
+    assert!(legacy.status.success(), "stderr: {}", stderr(&legacy));
+    assert_eq!(stdout(&legacy), "> ");
+
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    for (input, expected_label) in [("/room vna", "room · vna"), ("/dm codex", "dm · codex")] {
+        let event = bridge.execute(tui_command(&mut app, input)).await.unwrap();
+        app.reduce(event);
+        assert_eq!(app.context().label(), expected_label);
+    }
+
+    let active_dm = app.context().clone();
+    let failed = bridge
+        .execute(tui_command(&mut app, "/dm missing"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        &failed,
+        AppEvent::CommandFinished {
+            result: CommandResult::Failed(_),
+            ..
+        }
+    ));
+    app.reduce(failed);
+    assert_eq!(app.context(), &active_dm);
+
+    for (input, expected_label) in [
+        ("/back".to_owned(), "room · vna"),
+        (format!("/thread {thread} --agent codex"), "thread · codex"),
+    ] {
+        let event = bridge.execute(tui_command(&mut app, &input)).await.unwrap();
+        app.reduce(event);
+        assert_eq!(app.context().label(), expected_label);
+    }
+
+    let active_thread = app.context().clone();
+    let failed = bridge
+        .execute(tui_command(
+            &mut app,
+            &format!("/thread {foreign_thread} --agent codex"),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        &failed,
+        AppEvent::CommandFinished {
+            result: CommandResult::Failed(_),
+            ..
+        }
+    ));
+    app.reduce(failed);
+    assert_eq!(app.context(), &active_thread);
+
+    let exact = "/provider-command  keep  spacing";
+    let submitted = bridge.execute(tui_command(&mut app, exact)).await.unwrap();
+    assert!(matches!(
+        &submitted,
+        AppEvent::CommandFinished {
+            result: CommandResult::Submitted,
+            ..
+        }
+    ));
+    app.reduce(submitted);
+
+    let permission = bridge.next_event().await.unwrap().unwrap();
+    assert!(matches!(
+        &permission,
+        AppEvent::Chat(ChatEvent::PermissionRequested { .. })
+    ));
+    app.reduce(permission);
+
+    let persisted: i64 = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE body = ?1",
+            [exact],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted, 1);
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let bindings = connection
+        .prepare("SELECT id, conversation_id FROM session_bindings WHERE agent_id = ?1 ORDER BY id")
+        .unwrap()
+        .query_map([agent.id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert_ne!(bindings[0].0, bindings[1].0);
+    assert_ne!(bindings[0].1, bindings[1].1);
+
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_exposes_successful_command_output_to_app() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_agent("codex");
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    let opened = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    let active_dm = app.context().clone();
+
+    let status = bridge
+        .execute(tui_command(&mut app, "/status"))
+        .await
+        .unwrap();
+    app.reduce(status);
+
+    assert_eq!(app.context(), &active_dm);
+    assert!(
+        app.status()
+            .is_some_and(|status| status.starts_with("dm\t") && status.contains("\tcodex\t")),
+        "successful /status output was not visible: {:?}",
+        app.status()
+    );
+    assert!(!app.turn_active());
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_buffers_raw_events_while_execute_waits_for_its_completion() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    let opened = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    let submitted = bridge
+        .execute(tui_command(&mut app, "exact buffered turn"))
+        .await
+        .unwrap();
+    app.reduce(submitted);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let origin = app.context().id().clone();
+    let _rooms = bridge
+        .execute(AppCommand::Execute {
+            context: origin,
+            input: "/rooms".into(),
+        })
+        .await
+        .unwrap();
+
+    let mut buffered = Vec::new();
+    for _ in 0..3 {
+        buffered.push(
+            tokio::time::timeout(Duration::from_millis(250), bridge.next_event())
+                .await
+                .expect("execute discarded an earlier queued event")
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(matches!(
+        &buffered[0],
+        AppEvent::Chat(ChatEvent::TextDelta(text)) if text == "fixture reply"
+    ));
+    assert!(matches!(
+        &buffered[1],
+        AppEvent::Chat(ChatEvent::MessageCompleted(_))
+    ));
+    assert!(matches!(
+        &buffered[2],
+        AppEvent::Chat(ChatEvent::TurnCompleted)
+    ));
+
+    bridge.shutdown().await.unwrap();
 }
 
 #[test]

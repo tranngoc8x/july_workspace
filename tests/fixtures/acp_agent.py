@@ -7,6 +7,33 @@ def send(message):
     print(json.dumps(message, separators=(",", ":")), flush=True)
 
 
+def complete_prompt(prompt_id, session_id, text="fixture reply", stop_reason="end_turn"):
+    send({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        },
+    })
+    send({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {"sessionUpdate": "usage_update", "used": 12, "size": 4096},
+        },
+    })
+    send({
+        "jsonrpc": "2.0",
+        "id": prompt_id,
+        "result": {"stopReason": stop_reason},
+    })
+
+
 sessions = set()
 pending = {}
 cancelled = set()
@@ -82,6 +109,9 @@ for line in sys.stdin:
                 "error": {"code": -32000, "message": "Login required"},
             })
             continue
+        if "--no-permission" in sys.argv:
+            complete_prompt(request_id, session_id)
+            continue
         permission_id = next_permission
         next_permission += 1
         pending[permission_id] = (request_id, session_id)
@@ -143,30 +173,9 @@ for line in sys.stdin:
             if session_id in cancelled or permission_cancelled
             else "fixture reply"
         )
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": text},
-                },
-            },
-        })
-
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": {"sessionUpdate": "usage_update", "used": 12, "size": 4096},
-            },
-        })
-        send({
-            "jsonrpc": "2.0",
-            "id": prompt_id,
-            "result": {
-                "stopReason": "cancelled" if session_id in cancelled else "end_turn"
-            },
-        })
+        complete_prompt(
+            prompt_id,
+            session_id,
+            text,
+            "cancelled" if session_id in cancelled else "end_turn",
+        )

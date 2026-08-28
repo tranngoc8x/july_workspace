@@ -79,6 +79,7 @@ pub enum AppCommand {
 pub enum CommandResult {
     Submitted,
     Context(Context),
+    Output { context: Context, output: String },
     Failed(String),
 }
 
@@ -271,6 +272,11 @@ impl App {
             CommandResult::Submitted => {}
             CommandResult::Context(context) => {
                 self.context = context;
+                self.turn_active = false;
+            }
+            CommandResult::Output { context, output } => {
+                self.context = context;
+                self.status = Some(output);
                 self.turn_active = false;
             }
             CommandResult::Failed(error) => {
