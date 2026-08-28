@@ -26,7 +26,8 @@ to route an explicit target.
 Phase 4 locks and implements the corresponding application command surface so
 the presentation layer does not define domain behavior. Phase 8 adds the
 top-level REPL and the Room/Thread shell commands below on top of that surface.
-No full TUI is required.
+Phase 10 replaces only the no-argument, both-streams-TTY presentation with a
+full-screen TUI over the same controller and services.
 
 ## Core commands
 
@@ -172,10 +173,32 @@ july session list
 july session restart <conversation> --agent cashpoint
 ```
 
-## REPL UX
+## Interactive shell
 
-`july` with no arguments starts the Phase 8 REPL. The prompt is always `> `;
-entering a context echoes the resolved descriptor.
+No-argument dispatch is selected before terminal initialization:
+
+| Invocation | Standard streams | Behavior |
+|---|---|---|
+| `july` | stdin and stdout are TTYs | Phase 10 TUI |
+| `july` | either stream is not a TTY | Phase 8 line REPL |
+| `july dm ...` | any | existing standalone stream |
+| `july thread open ...` | any | existing standalone stream |
+| finite command or `--json` | any | existing CLI output |
+
+The TUI keeps application-owned scrollback, a multiline editor, Root/Room/DM/
+Thread navigation, progressive Markdown, resize and follow-tail behavior. A
+permission modal owns input while open. Ctrl-C clears nonempty idle input,
+cancels an active turn once, and a second press exits from a pending or
+acknowledged cancellation. Normal, error, panic, Ctrl-C, SIGTERM and SIGHUP
+paths restore the terminal.
+
+Mouse support, themes, plugins, syntax highlighting, a daemon, new command
+grammar, schema changes, transcript replay and TUI wrappers for standalone DM
+or Thread commands remain out of scope. Live-provider smoke is optional; local
+PTY and simulated-runtime tests do not prove provider behavior.
+
+The compatibility line REPL prompt remains `> `; entering a context echoes the
+resolved descriptor.
 
 ```text
 $ july

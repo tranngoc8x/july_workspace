@@ -5,7 +5,7 @@
 ```text
 ┌────────────────────────────────────────────┐
 │ Presentation                              │
-│ CLI / REPL / future TUI / future GUI      │
+│ CLI / REPL / Phase 10 TUI / future GUI    │
 └──────────────────────┬─────────────────────┘
                        │
                        ▼

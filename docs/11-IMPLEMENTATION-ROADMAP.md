@@ -463,9 +463,13 @@ DoD:
 
 ---
 
-## Phase 10 — Interactive TUI — Planned
+## Phase 10 — Interactive TUI — Implemented
 
-Status: approved design; implementation not started.
+Status: complete. The no-argument both-streams-TTY path now runs the Ratatui
+shell. Non-TTY line REPL, named standalone streams, finite commands and JSON
+output retain their Phase 8 contracts. PTY tests cover dispatch and terminal
+restoration; reducer, rendering and integration tests cover the remaining DoD.
+Fresh closure-gate evidence is recorded on `JULY_WORKSPACE-m5e.6`.
 
 Replace only the no-argument REPL on an interactive terminal with a Ratatui
 shell. Preserve the Phase 8 runtime, context isolation, command grammar,
@@ -496,6 +500,8 @@ DoD:
 
 Detailed design and slice DAG:
 `docs/superpowers/specs/2026-08-26-phase-10-interactive-tui-design.md`.
+
+Live-provider smoke remains opt-in and is not Phase 10 closure evidence.
 
 ---
 

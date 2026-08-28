@@ -65,6 +65,9 @@ Then start July:
 july
 ```
 
+With both standard streams attached to a terminal, this opens the full-screen
+TUI. Piped or redirected use keeps the line REPL for script compatibility.
+
 ---
 
 ## Quick start
@@ -505,22 +508,21 @@ Rust
 
 ## Current status
 
-The main July architecture and the July Next work have been implemented.
-
-Current work is focused on simplifying and consolidating the interactive command UX:
+The main July architecture, July Next work and Phase 10 interactive TUI are
+implemented. The TUI provides application-owned scrollback, progressive
+Markdown, multiline input, context navigation, permission handling and
+cancel-once active-turn behavior while preserving the existing CLI contracts.
 
 ```text
-Command UX consolidation
-├── canonical command registry
-├── /help
-├── /help <command>
-├── normalized navigation
-├── /thread new
-├── /back semantics
-├── /quit
-├── agent onboarding UX
-└── command/scope regression tests
+july                         both streams TTY → TUI
+july                         either stream non-TTY → line REPL
+july dm ...                  standalone stream
+july thread open ...         standalone stream
+finite command / --json      unchanged CLI output
 ```
+
+The TUI deliberately has no mouse workflow, theme/plugin system, syntax
+highlighting, daemon, new command grammar or transcript replay.
 
 The next major interoperability area is **A2A**.
 

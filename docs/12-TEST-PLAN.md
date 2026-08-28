@@ -265,3 +265,25 @@ Kill session → recover → continue.
 
 ### F — Isolation
 Unrelated Cashpoint DM runs while VNA/payment remains active; no leakage.
+
+## 13. Phase 10 TUI and compatibility
+
+Current Phase 10 coverage proves:
+
+- both-streams-TTY no-argument dispatch selects the TUI, while either
+  non-TTY stream preserves the line REPL;
+- PTY normal, error, unwind, Ctrl-C, SIGTERM and SIGHUP paths restore terminal
+  state;
+- Unicode editing, resize, wrapped-row scrolling, follow-tail and tiny-terminal
+  rendering remain bounded;
+- adversarial Markdown chunks converge with one-shot rendering, completed
+  blocks stay frozen, fences are hidden and quotes are styled;
+- permission input is exclusive, cancellation is sent once, failed delivery is
+  retryable and a pending cancellation remains escapable;
+- stale context results cannot replace the active descriptor, and DM/Thread
+  switching preserves exact input, distinct bindings and isolated histories;
+- named commands, human/JSON output and standalone DM/Thread streams retain
+  their existing contracts.
+
+Live-provider smoke remains opt-in. PTY and simulated-runtime coverage must not
+be reported as proof of authenticated provider behavior.
