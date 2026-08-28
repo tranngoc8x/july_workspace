@@ -843,8 +843,25 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
 ) -> Result<(), CliError> {
+    let mut input = repl_input();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = stdout.lock();
+    let mut stderr = stderr.lock();
+    let mut contexts = vec![ReplContext::Root];
+    let mut registered = HashSet::new();
     let mut live = None;
-    let interaction = interact_repl_loop(service, workspace, &mut live).await;
+    let interaction = interact_repl_loop(
+        service,
+        workspace,
+        &mut input,
+        &mut stdout,
+        &mut stderr,
+        &mut contexts,
+        &mut registered,
+        &mut live,
+    )
+    .await;
     let shutdown = close_repl_context(&mut live).await;
     match (interaction, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
@@ -860,14 +877,16 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
 async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
+    input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
     live: &mut Option<ReplChat>,
 ) -> Result<(), CliError> {
-    let mut input = repl_input();
-    let mut contexts = vec![ReplContext::Root];
-    let mut registered = HashSet::new();
     let mut publish = PublishService::new(workspace.storage());
     loop {
-        repl_stdout(format_args!("> "))?;
+        repl_write(stdout, format_args!("> "))?;
         let line = tokio::select! {
             line = input.recv() => match line {
                 Some(line) => line?,
@@ -898,17 +917,17 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             ) {
                 let chat = live.as_mut().expect("active context has a live service");
                 if let Err(error) = chat.send(line, timestamp()).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
-                drain_repl_turn(chat, &mut input).await?;
+                drain_repl_turn(chat, input, stdout).await?;
             } else {
-                repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
             }
             continue;
         };
         if !spec.available_in(scope) {
-            repl_stderr(format_args!("{}\n", spec.scope_error(scope)))?;
+            repl_write(stderr, format_args!("{}\n", spec.scope_error(scope)))?;
             continue;
         }
         let arguments = arguments.to_owned();
@@ -919,41 +938,47 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 return Ok(());
             }
             "/help" if arguments.is_empty() => {
-                repl_stdout(format_args!("{}", registry::help(scope)))?
+                repl_write(stdout, format_args!("{}", registry::help(scope)))?
             }
             "/help" => match registry::find(arguments) {
-                Some(spec) => repl_stdout(format_args!("{}", registry::help_command(spec)))?,
-                None => repl_stderr(format_args!("unknown command: {arguments}\n"))?,
+                Some(spec) => repl_write(stdout, format_args!("{}", registry::help_command(spec)))?,
+                None => repl_write(stderr, format_args!("unknown command: {arguments}\n"))?,
             },
             "/status" if arguments.is_empty() => {
-                print_repl_status(service, workspace, contexts.last().unwrap()).await?
+                print_repl_status(service, workspace, contexts.last().unwrap(), stdout, stderr)
+                    .await?
             }
             "/rooms" if arguments.is_empty() => match service.list_rooms().await {
                 Ok(rooms) => {
                     for room in rooms {
-                        repl_stdout(format_args!(
-                            "{}\t{}\t{}\n",
-                            room.id, room.name, room.status
-                        ))?;
+                        repl_write(
+                            stdout,
+                            format_args!("{}\t{}\t{}\n", room.id, room.name, room.status),
+                        )?;
                     }
                 }
-                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
             "/agents" if arguments.is_empty() => match service.list_agents().await {
-                Ok(agents) if agents.is_empty() => repl_stderr(format_args!("{NO_AGENTS}\n"))?,
+                Ok(agents) if agents.is_empty() => {
+                    repl_write(stderr, format_args!("{NO_AGENTS}\n"))?
+                }
                 Ok(agents) => {
                     for agent in agents {
-                        repl_stdout(format_args!(
-                            "{}\t{}\t{}\t{}\t{}\n",
-                            agent.id,
-                            agent.name,
-                            agent.project_root,
-                            agent.transport_type,
-                            agent.status
-                        ))?;
+                        repl_write(
+                            stdout,
+                            format_args!(
+                                "{}\t{}\t{}\t{}\t{}\n",
+                                agent.id,
+                                agent.name,
+                                agent.project_root,
+                                agent.transport_type,
+                                agent.status
+                            ),
+                        )?;
                     }
                 }
-                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
             "/work" if arguments.is_empty() => {
                 let conversation_id = contexts
@@ -964,18 +989,21 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 match service.list_work_items(conversation_id).await {
                     Ok(work_items) => {
                         for work in work_items {
-                            repl_stdout(format_args!(
-                                "{}\t{}\t{}\t{}\n",
-                                work.id,
-                                work.status,
-                                work.title,
-                                work.owner_agent_id
-                                    .map(|agent| agent.to_string())
-                                    .unwrap_or_default(),
-                            ))?;
+                            repl_write(
+                                stdout,
+                                format_args!(
+                                    "{}\t{}\t{}\t{}\n",
+                                    work.id,
+                                    work.status,
+                                    work.title,
+                                    work.owner_agent_id
+                                        .map(|agent| agent.to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            )?;
                         }
                     }
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
             "/results" if arguments.is_empty() => {
@@ -987,26 +1015,30 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 match service.list_work_results(conversation_id).await {
                     Ok(results) => {
                         for result in results {
-                            repl_stdout(format_args!(
-                                "{}\t{}\t{}\t{}\n",
-                                result.id, result.work_id, result.status, result.summary,
-                            ))?;
+                            repl_write(
+                                stdout,
+                                format_args!(
+                                    "{}\t{}\t{}\t{}\n",
+                                    result.id, result.work_id, result.status, result.summary,
+                                ),
+                            )?;
                         }
                     }
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
             "/restart" if arguments.is_empty() => {
                 if let Err(error) = close_repl_context(live).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 if let Err(error) = restore_repl_context(service, workspace, &contexts, live).await
                 {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
-                print_repl_status(service, workspace, contexts.last().unwrap()).await?
+                print_repl_status(service, workspace, contexts.last().unwrap(), stdout, stderr)
+                    .await?
             }
             "/thread new" if !arguments.is_empty() => {
                 let room_id = contexts
@@ -1029,21 +1061,26 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             })
                             .await
                         {
-                            Ok(thread) => repl_stdout(format_args!(
-                                "thread\t{}\t{}\n",
-                                thread.thread_id, thread.primary_work_id
-                            ))?,
-                            Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                            Ok(thread) => repl_write(
+                                stdout,
+                                format_args!(
+                                    "thread\t{}\t{}\n",
+                                    thread.thread_id, thread.primary_work_id
+                                ),
+                            )?,
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                         }
                     }
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
-            "/back" if contexts.len() == 1 => repl_stderr(format_args!("already at root\n"))?,
+            "/back" if contexts.len() == 1 => {
+                repl_write(stderr, format_args!("already at root\n"))?
+            }
             "/back" if arguments.is_empty() => {
                 let previous = contexts.last().unwrap().clone();
                 if let Err(error) = close_repl_context(live).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 contexts.pop();
@@ -1058,10 +1095,11 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             restore: restore.to_string(),
                         });
                     }
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
-                print_repl_status(service, workspace, contexts.last().unwrap()).await?;
+                print_repl_status(service, workspace, contexts.last().unwrap(), stdout, stderr)
+                    .await?;
             }
             "/members" if arguments.is_empty() => match contexts.last().unwrap() {
                 ReplContext::Room(room_id) => {
@@ -1075,10 +1113,10 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                                 false,
                             );
                             if !output.is_empty() {
-                                repl_stdout(format_args!("{output}\n"))?;
+                                repl_write(stdout, format_args!("{output}\n"))?;
                             }
                         }
-                        Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                        Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                     }
                 }
                 ReplContext::Thread {
@@ -1093,10 +1131,10 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             false,
                         );
                         if !output.is_empty() {
-                            repl_stdout(format_args!("{output}\n"))?;
+                            repl_write(stdout, format_args!("{output}\n"))?;
                         }
                     }
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 },
                 ReplContext::Root | ReplContext::Dm { .. } => {
                     unreachable!("registry scopes /members to room and thread")
@@ -1106,15 +1144,15 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 Ok(reference) => match service.resolve_room(reference).await {
                     Ok(room) => {
                         if let Err(error) = close_repl_context(live).await {
-                            repl_stderr(format_args!("{error}\n"))?;
+                            repl_write(stderr, format_args!("{error}\n"))?;
                             continue;
                         }
-                        repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?;
+                        repl_write(stdout, format_args!("room\t{}\t{}\n", room.id, room.name))?;
                         contexts.push(ReplContext::Room(room.id));
                     }
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 },
-                Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
             "/publish" if !arguments.is_empty() => {
                 let source_conversation_id = contexts
@@ -1127,14 +1165,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     [result] => (*result, None),
                     [result, flag, target] if *flag == "--to" => (*result, Some(*target)),
                     _ => {
-                        repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                        repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
                         continue;
                     }
                 };
                 let result_id = match result_id(result) {
                     Ok(result_id) => result_id,
                     Err(error) => {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                 };
@@ -1144,14 +1182,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Some(target) => match thread_id(target) {
                         Ok(target) => target,
                         Err(error) => {
-                            repl_stderr(format_args!("{error}\n"))?;
+                            repl_write(stderr, format_args!("{error}\n"))?;
                             continue;
                         }
                     },
                     None => match publish.resolve_target(source_conversation_id).await {
                         Ok(target) => target,
                         Err(error) => {
-                            repl_stderr(format_args!("{error}\n"))?;
+                            repl_write(stderr, format_args!("{error}\n"))?;
                             continue;
                         }
                     },
@@ -1165,15 +1203,18 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     })
                     .await
                 {
-                    Ok(published) => repl_stdout(format_args!(
-                        "{}\t{}\t{}\t{}\t{}\n",
-                        published.publish_id,
-                        published.result.id,
-                        published.source_conversation_id,
-                        published.target_conversation_id,
-                        published.published_at,
-                    ))?,
-                    Err(error) => repl_stderr(format_args!("{error}\n"))?,
+                    Ok(published) => repl_write(
+                        stdout,
+                        format_args!(
+                            "{}\t{}\t{}\t{}\t{}\n",
+                            published.publish_id,
+                            published.result.id,
+                            published.source_conversation_id,
+                            published.target_conversation_id,
+                            published.published_at,
+                        ),
+                    )?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
             "/thread" if !arguments.is_empty() => {
@@ -1182,21 +1223,21 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     [thread] => (*thread, None),
                     [thread, flag, agent] if *flag == "--agent" => (*thread, Some(*agent)),
                     _ => {
-                        repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?;
+                        repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
                         continue;
                     }
                 };
                 let thread_id = match thread_id(thread) {
                     Ok(thread_id) => thread_id,
                     Err(error) => {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                 };
                 let agent = match resolve_thread_agent(service, thread_id, agent).await {
                     Ok(agent) => agent,
                     Err(error) => {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                 };
@@ -1207,25 +1248,28 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     .room_id()
                     .expect("room and thread scopes own a room");
                 if let Err(error) = require_thread_in_room(service, room_id, thread_id).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 if !registered.contains(&agent.id) {
                     if let Err(error) = register_acp_agent(workspace, &agent).await {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                     registered.insert(agent.id);
                 }
                 if let Err(error) = close_repl_context(live).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 match open_repl_thread(workspace, &agent, thread_id, room_id).await {
                     Ok((context, chat)) => {
                         contexts.push(context);
                         *live = Some(chat);
-                        repl_stdout(format_args!("thread\t{thread_id}\t{}\n", agent.name))?;
+                        repl_write(
+                            stdout,
+                            format_args!("thread\t{thread_id}\t{}\n", agent.name),
+                        )?;
                     }
                     Err(error) => {
                         if let Err(restore) =
@@ -1236,7 +1280,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                                 restore: restore.to_string(),
                             });
                         }
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                     }
                 }
             }
@@ -1245,31 +1289,31 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Ok(reference) => match service.resolve_agent(reference).await {
                         Ok(agent) => agent,
                         Err(error) => {
-                            repl_stderr(format_args!("{error}\n"))?;
+                            repl_write(stderr, format_args!("{error}\n"))?;
                             continue;
                         }
                     },
                     Err(error) => {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                 };
                 if !registered.contains(&agent.id) {
                     if let Err(error) = register_acp_agent(workspace, &agent).await {
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                     registered.insert(agent.id);
                 }
                 if let Err(error) = close_repl_context(live).await {
-                    repl_stderr(format_args!("{error}\n"))?;
+                    repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 match open_repl_dm(workspace, &agent).await {
                     Ok((context, dm)) => {
                         contexts.push(context);
                         *live = Some(dm);
-                        repl_stdout(format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
+                        repl_write(stdout, format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
                     }
                     Err(error) => {
                         if let Err(restore) =
@@ -1280,12 +1324,12 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                                 restore: restore.to_string(),
                             });
                         }
-                        repl_stderr(format_args!("{error}\n"))?;
+                        repl_write(stderr, format_args!("{error}\n"))?;
                     }
                 }
             }
             // A registered command with arguments it does not accept.
-            _ => repl_stderr(format_args!("{}\n", CliError::InvalidCommand))?,
+            _ => repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?,
         }
     }
 }
@@ -1481,6 +1525,7 @@ async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
 async fn drain_repl_turn<C: ChatContext>(
     service: &mut C,
     input: &mut mpsc::UnboundedReceiver<io::Result<Option<String>>>,
+    stdout: &mut impl Write,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
     loop {
@@ -1488,13 +1533,13 @@ async fn drain_repl_turn<C: ChatContext>(
             event = service.next(timestamp()) => {
                 let Some(event) = event? else { return Err(CliError::EventStreamClosed); };
                 match event {
-                    ChatEvent::TextDelta(text) => repl_stdout(format_args!("{text}"))?,
-                    ChatEvent::MessageCompleted(_) => repl_stdout(format_args!("\n"))?,
+                    ChatEvent::TextDelta(text) => repl_write(stdout, format_args!("{text}"))?,
+                    ChatEvent::MessageCompleted(_) => repl_write(stdout, format_args!("\n"))?,
                     ChatEvent::PermissionRequested { request_id, options } => {
                         for (index, option) in options.iter().enumerate() {
-                            repl_stdout(format_args!("{}. {}\n", index + 1, option.label))?;
+                            repl_write(stdout, format_args!("{}. {}\n", index + 1, option.label))?;
                         }
-                        repl_stdout(format_args!("permission> "))?;
+                        repl_write(stdout, format_args!("permission> "))?;
                         let (selected, interrupted) = tokio::select! {
                             line = input.recv() => (
                                 line.transpose()?.flatten()
@@ -1558,12 +1603,14 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
     context: &ReplContext,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
 ) -> Result<(), CliError> {
     match context {
-        ReplContext::Root => repl_stdout(format_args!("root\n"))?,
+        ReplContext::Root => repl_write(stdout, format_args!("root\n"))?,
         ReplContext::Room(room_id) => match service.resolve_room(RoomRef::Id(*room_id)).await {
-            Ok(room) => repl_stdout(format_args!("room\t{}\t{}\n", room.id, room.name))?,
-            Err(error) => repl_stderr(format_args!("{error}\n"))?,
+            Ok(room) => repl_write(stdout, format_args!("room\t{}\t{}\n", room.id, room.name))?,
+            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
         },
         ReplContext::Dm {
             conversation_id,
@@ -1592,25 +1639,18 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
                 ReplContext::Thread { .. } => "thread",
                 _ => "dm",
             };
-            repl_stdout(format_args!(
-                "{kind}\t{conversation_id}\t{agent_name}\t{binding_id}\t{status}\n"
-            ))?;
+            repl_write(
+                stdout,
+                format_args!("{kind}\t{conversation_id}\t{agent_name}\t{binding_id}\t{status}\n"),
+            )?;
         }
     }
     Ok(())
 }
 
-fn repl_stdout(args: fmt::Arguments<'_>) -> Result<(), CliError> {
-    let mut stdout = io::stdout().lock();
-    stdout.write_fmt(args)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-fn repl_stderr(args: fmt::Arguments<'_>) -> Result<(), CliError> {
-    let mut stderr = io::stderr().lock();
-    stderr.write_fmt(args)?;
-    stderr.flush()?;
+fn repl_write(output: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), CliError> {
+    output.write_fmt(args)?;
+    output.flush()?;
     Ok(())
 }
 
