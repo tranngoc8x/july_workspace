@@ -1,8 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::App;
+use super::app::{App, PermissionModal};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -39,6 +41,73 @@ pub fn render(frame: &mut Frame, app: &App) {
         Paragraph::new("Enter send · Alt+Enter newline · Esc exit"),
         areas[3],
     );
+
+    if let Some(permission) = app.permission() {
+        let width = area.width.saturating_sub(4).min(60);
+        let height = area
+            .height
+            .saturating_sub(2)
+            .min((permission.options().len() as u16).saturating_add(7))
+            .max(5);
+        let popup = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        let mut lines = vec![Line::from(permission.prompt().to_owned()), Line::default()];
+        lines.extend(
+            permission
+                .options()
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let marker = if index == permission.selected() {
+                        "❯ "
+                    } else {
+                        "  "
+                    };
+                    let style = if index == permission.selected() {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(format!("{marker}{}", option.label), style))
+                }),
+        );
+        lines.push(Line::default());
+        lines.push(Line::from("Enter choose · Esc reject · Ctrl-C cancel"));
+        let block = Block::bordered().title("Permission requested");
+        let inner = block.inner(popup);
+        let scroll = permission_scroll(permission, &lines, inner);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(block, popup);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            inner,
+        );
+    }
+}
+
+fn permission_scroll(permission: &PermissionModal, lines: &[Line<'_>], area: Rect) -> u16 {
+    let width = area.width.max(1);
+    let viewport = usize::from(area.height.max(1));
+    let total = Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    let max_scroll = total.saturating_sub(viewport);
+    let requested = if permission.follows_selection() {
+        let selected_line = permission.selected().saturating_add(2);
+        Paragraph::new(Text::from(lines[..=selected_line].to_vec()))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .saturating_sub(viewport)
+    } else {
+        usize::from(permission.scroll()).saturating_mul(viewport)
+    };
+    requested.min(max_scroll).min(usize::from(u16::MAX)) as u16
 }
 
 #[cfg(test)]
@@ -47,6 +116,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use crate::application::ChatEvent;
+    use crate::domain::PermissionOption;
     use crate::tui::app::{App, AppEvent, Context};
 
     use super::render;
@@ -215,5 +285,88 @@ mod tests {
             .find(|cell| cell.symbol() == "f")
             .unwrap();
         assert_ne!(code.style(), ratatui::style::Style::default());
+    }
+
+    #[test]
+    fn permission_choices_render_in_an_exclusive_centered_modal() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "permission-1".to_owned().into(),
+            prompt: "Write file in src/main.rs?".into(),
+            options: vec![
+                PermissionOption {
+                    id: "once".into(),
+                    label: "Allow once".into(),
+                },
+                PermissionOption {
+                    id: "reject".into(),
+                    label: "Reject".into(),
+                },
+            ],
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Permission requested"));
+        assert!(rendered.contains("Write file in src/main.rs?"));
+        assert!(rendered.contains("❯ Allow once"));
+        assert!(rendered.contains("  Reject"));
+        assert!(rendered.contains("Enter choose · Esc reject · Ctrl-C"));
+        assert!(rendered.contains("cancel"));
+    }
+
+    #[test]
+    fn permission_page_scroll_uses_wrapped_rows_and_clamps_at_the_end() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 32,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "permission-1".to_owned().into(),
+            prompt: "This deliberately long permission prompt wraps across several rows in a narrow terminal before the only available choice".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+        for _ in 0..20 {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::PageDown,
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        let bottom_page = app.permission().unwrap().scroll();
+        assert!(bottom_page > 0);
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageUp,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(app.permission().unwrap().scroll(), bottom_page - 1);
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::PageDown,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(32, 10)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("❯ Allow once"));
+        assert!(rendered.contains("Ctrl-C cancel"));
     }
 }

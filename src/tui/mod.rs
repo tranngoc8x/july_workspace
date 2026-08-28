@@ -7,6 +7,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 
@@ -179,6 +180,89 @@ pub fn run_inactive_shell() -> Result<(), ShellError> {
             }
         }
     })
+}
+
+/// Run the active TUI while keeping all application I/O outside the reducer.
+pub async fn run_app(
+    mut dispatch: impl FnMut(app::AppCommand) -> io::Result<()>,
+    mut next_application_event: impl FnMut() -> io::Result<Option<app::AppEvent>>,
+) -> Result<(), ShellError> {
+    let _signals = ExitSignals::install().map_err(ShellError::Operation)?;
+    let mut guard = TerminalGuard::enter(io::stdout(), CrosstermRawMode)?;
+    let operation = async {
+        let mut terminal = Terminal::new(CrosstermBackend::new(&mut guard.writer))?;
+        let mut app = App::new(Context::root());
+        let mut terminal_events = event::EventStream::new();
+        let mut frames = tokio::time::interval(Duration::from_millis(33));
+        frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        seed_viewport(&mut terminal, &mut app);
+        draw_inactive(&mut terminal, &app)?;
+        let mut dirty = false;
+
+        loop {
+            if ExitSignals::requested() || app.exit_requested() {
+                break;
+            }
+
+            tokio::select! {
+                terminal_event = terminal_events.next() => match terminal_event {
+                    Some(Ok(Event::Resize(width, height))) => {
+                        terminal.autoresize()?;
+                        dispatch_all(
+                            app.reduce(app::AppEvent::Resize { width, height }),
+                            &mut dispatch,
+                        )?;
+                        dirty = true;
+                    }
+                    Some(Ok(Event::Key(key))) => {
+                        dispatch_all(app.reduce(app::AppEvent::Key(key)), &mut dispatch)?;
+                        dirty = true;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error),
+                    None => break,
+                },
+                _ = frames.tick() => {
+                    if dirty {
+                        draw_inactive(&mut terminal, &app)?;
+                        dirty = false;
+                    }
+                }
+            }
+
+            for _ in 0..app::CHAT_BATCH_LIMIT {
+                let Some(event) = next_application_event()? else {
+                    break;
+                };
+                dispatch_all(app.reduce(event), &mut dispatch)?;
+                dirty = true;
+                if app.exit_requested() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let restore = guard.restore();
+    match (operation, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(ShellError::Operation(operation)),
+        (Ok(()), Err(restore)) => Err(ShellError::Restore(restore)),
+        (Err(operation), Err(restore)) => {
+            Err(ShellError::OperationAndRestore { operation, restore })
+        }
+    }
+}
+
+fn dispatch_all(
+    commands: Vec<app::AppCommand>,
+    dispatch: &mut impl FnMut(app::AppCommand) -> io::Result<()>,
+) -> io::Result<()> {
+    for command in commands {
+        dispatch(command)?;
+    }
+    Ok(())
 }
 
 fn seed_viewport<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {

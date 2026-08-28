@@ -2,12 +2,13 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::text::Text;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::TextArea;
 
 use super::markdown::MarkdownStream;
-use crate::application::{ChatEvent, ChatFailureKind};
+use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
+use crate::domain::{PermissionOption, PermissionOutcome};
 
 pub const CHAT_BATCH_LIMIT: usize = 32;
 
@@ -71,8 +72,19 @@ impl Viewport {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppCommand {
-    Submit { context: ContextId, text: String },
-    Execute { context: ContextId, input: String },
+    Submit {
+        context: ContextId,
+        text: String,
+    },
+    Execute {
+        context: ContextId,
+        input: String,
+    },
+    RespondPermission {
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+    },
+    CancelTurn,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,7 +109,79 @@ pub enum AppEvent {
         context: ContextId,
         result: CommandResult,
     },
+    PermissionFinished(Result<(), String>),
+    CancelFinished(Result<(), String>),
     Exit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnState {
+    Idle,
+    Active,
+    Cancelling,
+    CancelAcknowledged,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PermissionModal {
+    request_id: ChatPermissionRequestId,
+    prompt: String,
+    options: Vec<PermissionOption>,
+    selected: usize,
+    scroll: u16,
+    follow_selection: bool,
+}
+
+impl PermissionModal {
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn options(&self) -> &[PermissionOption] {
+        &self.options
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    pub fn scroll(&self) -> u16 {
+        self.scroll
+    }
+
+    pub fn follows_selection(&self) -> bool {
+        self.follow_selection
+    }
+
+    pub(crate) fn max_scroll_page(&self, viewport: Viewport) -> u16 {
+        let width = viewport
+            .width
+            .saturating_sub(4)
+            .min(60)
+            .saturating_sub(2)
+            .max(1);
+        let height = viewport
+            .height
+            .saturating_sub(2)
+            .min((self.options.len() as u16).saturating_add(7))
+            .max(5)
+            .saturating_sub(2)
+            .max(1);
+        let mut lines = vec![Line::from(self.prompt.clone()), Line::default()];
+        lines.extend(
+            self.options
+                .iter()
+                .map(|option| Line::from(format!("  {}", option.label))),
+        );
+        lines.push(Line::default());
+        lines.push(Line::from("Enter choose · Esc reject · Ctrl-C cancel"));
+        let rows = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        rows.saturating_sub(usize::from(height))
+            .div_ceil(usize::from(height))
+            .min(usize::from(u16::MAX)) as u16
+    }
 }
 
 pub struct App {
@@ -108,7 +192,8 @@ pub struct App {
     scroll_offset: usize,
     follow_tail: bool,
     pending: Option<ContextId>,
-    turn_active: bool,
+    turn: TurnState,
+    permission: Option<PermissionModal>,
     status: Option<String>,
     exit_requested: bool,
 }
@@ -123,7 +208,8 @@ impl App {
             scroll_offset: 0,
             follow_tail: true,
             pending: None,
-            turn_active: false,
+            turn: TurnState::Idle,
+            permission: None,
             status: None,
             exit_requested: false,
         }
@@ -168,7 +254,15 @@ impl App {
     }
 
     pub fn turn_active(&self) -> bool {
-        self.turn_active
+        self.turn != TurnState::Idle
+    }
+
+    pub fn turn_state(&self) -> TurnState {
+        self.turn
+    }
+
+    pub fn permission(&self) -> Option<&PermissionModal> {
+        self.permission.as_ref()
     }
 
     pub fn status(&self) -> Option<&str> {
@@ -186,22 +280,43 @@ impl App {
                 self.viewport = Viewport::new(width, height);
                 let max_scroll = self.max_scroll_offset();
                 self.clamp_scroll(max_scroll);
+                if let Some(max_page) = self
+                    .permission
+                    .as_ref()
+                    .map(|permission| permission.max_scroll_page(self.viewport))
+                {
+                    let permission = self.permission.as_mut().unwrap();
+                    permission.scroll = permission.scroll.min(max_page);
+                }
                 Vec::new()
             }
-            AppEvent::Chat(event) => {
-                self.reduce_chat_content(std::iter::once(event));
-                Vec::new()
-            }
-            AppEvent::ChatBatch(events) => {
-                self.reduce_chat_content(events);
-                Vec::new()
-            }
+            AppEvent::Chat(event) => self.reduce_chat_content(std::iter::once(event)),
+            AppEvent::ChatBatch(events) => self.reduce_chat_content(events),
             AppEvent::CommandFinished { context, result } => {
                 self.reduce_command_result(context, result);
                 Vec::new()
             }
             AppEvent::Exit => {
                 self.exit_requested = true;
+                Vec::new()
+            }
+            AppEvent::CancelFinished(result) => {
+                if self.turn != TurnState::Cancelling {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(()) => self.turn = TurnState::CancelAcknowledged,
+                    Err(error) => {
+                        self.turn = TurnState::Active;
+                        self.status = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::PermissionFinished(result) => {
+                if let Err(error) = result {
+                    self.status = Some(error);
+                }
                 Vec::new()
             }
             AppEvent::Tick => Vec::new(),
@@ -211,6 +326,14 @@ impl App {
     fn reduce_key(&mut self, key: KeyEvent) -> Vec<AppCommand> {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
+        }
+
+        if self.permission.is_some() {
+            return self.reduce_permission_key(key);
+        }
+
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cancel_or_exit();
         }
 
         match key.code {
@@ -230,6 +353,12 @@ impl App {
                 self.follow_tail = true;
             }
             KeyCode::Enter if key.modifiers == KeyModifiers::NONE => return self.submit(),
+            KeyCode::Esc => self.exit_requested = true,
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.turn == TurnState::Idle && self.input().is_empty() {
+                    self.exit_requested = true;
+                }
+            }
             _ => {
                 self.input.input(key);
             }
@@ -237,8 +366,79 @@ impl App {
         Vec::new()
     }
 
+    fn reduce_permission_key(&mut self, key: KeyEvent) -> Vec<AppCommand> {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cancel_or_exit();
+        }
+
+        let max_scroll_page = self
+            .permission
+            .as_ref()
+            .unwrap()
+            .max_scroll_page(self.viewport);
+        let permission = self.permission.as_mut().unwrap();
+        match key.code {
+            KeyCode::Up => {
+                permission.selected = permission.selected.saturating_sub(1);
+                permission.follow_selection = true;
+            }
+            KeyCode::Down => {
+                permission.selected =
+                    (permission.selected + 1).min(permission.options.len().saturating_sub(1));
+                permission.follow_selection = true;
+            }
+            KeyCode::PageUp => {
+                permission.scroll = permission.scroll.saturating_sub(1);
+                permission.follow_selection = false;
+            }
+            KeyCode::PageDown => {
+                permission.scroll = permission.scroll.saturating_add(1).min(max_scroll_page);
+                permission.follow_selection = false;
+            }
+            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                let permission = self.permission.take().unwrap();
+                return vec![AppCommand::RespondPermission {
+                    request_id: permission.request_id,
+                    outcome: PermissionOutcome::Selected(
+                        permission.options[permission.selected].id.clone(),
+                    ),
+                }];
+            }
+            KeyCode::Esc => {
+                let permission = self.permission.take().unwrap();
+                return vec![AppCommand::RespondPermission {
+                    request_id: permission.request_id,
+                    outcome: PermissionOutcome::Cancelled,
+                }];
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn cancel_or_exit(&mut self) -> Vec<AppCommand> {
+        match self.turn {
+            TurnState::Active => {
+                self.turn = TurnState::Cancelling;
+                vec![AppCommand::CancelTurn]
+            }
+            TurnState::Cancelling | TurnState::CancelAcknowledged => {
+                self.exit_requested = true;
+                Vec::new()
+            }
+            TurnState::Idle if !self.input().is_empty() => {
+                self.input = TextArea::default();
+                Vec::new()
+            }
+            TurnState::Idle => {
+                self.exit_requested = true;
+                Vec::new()
+            }
+        }
+    }
+
     fn submit(&mut self) -> Vec<AppCommand> {
-        if self.pending.is_some() || self.turn_active {
+        if self.pending.is_some() || self.turn != TurnState::Idle {
             return Vec::new();
         }
 
@@ -248,7 +448,7 @@ impl App {
         }
 
         self.input = TextArea::default();
-        self.turn_active = true;
+        self.turn = TurnState::Active;
         let context = self.context.id.clone();
         self.pending = Some(context.clone());
         vec![if text.starts_with('/') {
@@ -272,25 +472,29 @@ impl App {
             CommandResult::Submitted => {}
             CommandResult::Context(context) => {
                 self.context = context;
-                self.turn_active = false;
+                self.turn = TurnState::Idle;
             }
             CommandResult::Output { context, output } => {
                 self.context = context;
                 self.status = Some(output);
-                self.turn_active = false;
+                self.turn = TurnState::Idle;
             }
             CommandResult::Failed(error) => {
                 self.status = Some(error);
-                self.turn_active = false;
+                self.turn = TurnState::Idle;
             }
         }
     }
 
-    fn reduce_chat_content(&mut self, events: impl IntoIterator<Item = ChatEvent>) {
+    fn reduce_chat_content(
+        &mut self,
+        events: impl IntoIterator<Item = ChatEvent>,
+    ) -> Vec<AppCommand> {
         let old_max_scroll = self.max_scroll_offset();
         let was_following_tail = self.follow_tail;
+        let mut commands = Vec::new();
         for event in events {
-            self.reduce_chat(event);
+            commands.extend(self.reduce_chat(event));
         }
         let new_max_scroll = self.max_scroll_offset();
         if !was_following_tail {
@@ -303,32 +507,64 @@ impl App {
             };
         }
         self.clamp_scroll(new_max_scroll);
+        commands
     }
 
-    fn reduce_chat(&mut self, event: ChatEvent) {
+    fn reduce_chat(&mut self, event: ChatEvent) -> Vec<AppCommand> {
         match event {
             ChatEvent::TextDelta(text) => {
                 self.markdown.push(&text);
-                self.turn_active = true;
+                if self.turn == TurnState::Idle {
+                    self.turn = TurnState::Active;
+                }
             }
             ChatEvent::MessageCompleted(_) => self.freeze_stream(),
             ChatEvent::TurnCompleted => {
                 self.freeze_stream();
-                self.turn_active = false;
+                self.finish_turn();
             }
             ChatEvent::TurnFailed(failure) => {
                 self.freeze_stream();
                 self.markdown
                     .push_plain(format!("error: {}", failure_label(failure)));
-                self.turn_active = false;
+                self.finish_turn();
             }
             ChatEvent::Disconnected(reason) => {
                 self.freeze_stream();
                 self.markdown.push_plain(format!("error: {reason}"));
-                self.turn_active = false;
+                self.finish_turn();
             }
-            ChatEvent::PermissionRequested { .. } => {}
+            ChatEvent::PermissionRequested {
+                request_id,
+                prompt,
+                options,
+            } => {
+                if options.is_empty() {
+                    self.status = Some("permission request had no choices".into());
+                    return vec![AppCommand::RespondPermission {
+                        request_id,
+                        outcome: PermissionOutcome::Cancelled,
+                    }];
+                }
+                if self.turn == TurnState::Idle {
+                    self.turn = TurnState::Active;
+                }
+                self.permission = Some(PermissionModal {
+                    request_id,
+                    prompt,
+                    options,
+                    selected: 0,
+                    scroll: 0,
+                    follow_selection: false,
+                });
+            }
         }
+        Vec::new()
+    }
+
+    fn finish_turn(&mut self) {
+        self.turn = TurnState::Idle;
+        self.permission = None;
     }
 
     fn freeze_stream(&mut self) {
@@ -375,8 +611,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     use super::*;
-    use crate::application::{ChatEvent, ChatFailureKind};
-    use crate::domain::{MemberType, Message};
+    use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
+    use crate::domain::{MemberType, Message, PermissionOption, PermissionOutcome};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -384,6 +620,10 @@ mod tests {
 
     fn alt_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn repeat_key(code: KeyCode) -> KeyEvent {
@@ -723,5 +963,180 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta("**".into())));
 
         assert_eq!(app.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn permission_modal_is_exclusive_and_selects_the_highlighted_option() {
+        let mut app = App::new(Context::root());
+        let request_id = ChatPermissionRequestId::from("permission-1".to_owned());
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: request_id.clone(),
+            prompt: "Write file".into(),
+            options: vec![
+                PermissionOption {
+                    id: "once".into(),
+                    label: "Allow once".into(),
+                },
+                PermissionOption {
+                    id: "always".into(),
+                    label: "Allow always".into(),
+                },
+            ],
+        }));
+
+        app.reduce(AppEvent::Key(key(KeyCode::Char('x'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+
+        assert_eq!(app.input(), "");
+        assert_eq!(app.permission().unwrap().selected(), 1);
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::RespondPermission {
+                request_id,
+                outcome: PermissionOutcome::Selected("always".into()),
+            }]
+        );
+        assert!(app.permission().is_none());
+    }
+
+    #[test]
+    fn modified_enter_is_ignored_by_the_permission_modal() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: ChatPermissionRequestId::from("permission-1".to_owned()),
+            prompt: "Write file".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+
+        assert!(
+            app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)))
+                .is_empty()
+        );
+        assert!(app.permission().is_some());
+    }
+
+    #[test]
+    fn escape_rejects_permission_and_empty_options_do_not_trap_the_editor() {
+        let mut app = App::new(Context::root());
+        let request_id = ChatPermissionRequestId::from("permission-1".to_owned());
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: request_id.clone(),
+            prompt: "Write file".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Esc))),
+            vec![AppCommand::RespondPermission {
+                request_id,
+                outcome: PermissionOutcome::Cancelled,
+            }]
+        );
+
+        let empty_id = ChatPermissionRequestId::from("permission-empty".to_owned());
+        assert_eq!(
+            app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+                request_id: empty_id.clone(),
+                prompt: "Write file".into(),
+                options: Vec::new(),
+            })),
+            vec![AppCommand::RespondPermission {
+                request_id: empty_id,
+                outcome: PermissionOutcome::Cancelled,
+            }]
+        );
+        assert!(app.permission().is_none());
+        assert_eq!(app.status(), Some("permission request had no choices"));
+    }
+
+    #[test]
+    fn active_turn_cancel_is_sent_once_and_delivery_failure_is_retryable() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("working".into())));
+
+        assert_eq!(
+            app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c')))),
+            vec![AppCommand::CancelTurn]
+        );
+        assert_eq!(app.turn_state(), TurnState::Cancelling);
+
+        app.reduce(AppEvent::CancelFinished(Err("delivery failed".into())));
+        assert_eq!(app.turn_state(), TurnState::Active);
+        assert_eq!(app.status(), Some("delivery failed"));
+        assert_eq!(
+            app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c')))),
+            vec![AppCommand::CancelTurn]
+        );
+    }
+
+    #[test]
+    fn second_ctrl_c_escapes_pending_or_acknowledged_cancel_without_resending() {
+        for acknowledge in [false, true] {
+            let mut app = App::new(Context::root());
+            app.reduce(AppEvent::Chat(ChatEvent::TextDelta("working".into())));
+            assert_eq!(
+                app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c')))),
+                vec![AppCommand::CancelTurn]
+            );
+            if acknowledge {
+                app.reduce(AppEvent::CancelFinished(Ok(())));
+                assert_eq!(app.turn_state(), TurnState::CancelAcknowledged);
+            }
+
+            assert!(
+                app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))))
+                    .is_empty()
+            );
+            assert!(app.exit_requested());
+        }
+    }
+
+    #[test]
+    fn stale_cancel_result_cannot_revive_a_completed_turn() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("working".into())));
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+
+        app.reduce(AppEvent::CancelFinished(Ok(())));
+
+        assert_eq!(app.turn_state(), TurnState::Idle);
+        assert!(
+            app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))))
+                .is_empty()
+        );
+        assert!(app.exit_requested());
+    }
+
+    #[test]
+    fn ctrl_d_does_not_exit_an_active_turn() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("working".into())));
+
+        assert!(
+            app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('d'))))
+                .is_empty()
+        );
+        assert!(!app.exit_requested());
+        assert_eq!(app.input(), "");
+    }
+
+    #[test]
+    fn idle_ctrl_c_clears_input_before_it_exits() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Key(key(KeyCode::Char('x'))));
+
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+        assert_eq!(app.input(), "");
+        assert!(!app.exit_requested());
+
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+        assert!(app.exit_requested());
     }
 }

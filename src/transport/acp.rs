@@ -361,6 +361,12 @@ async fn run_connection(
                 let event = TransportEvent::PermissionRequested(PermissionRequest {
                     session,
                     request_id: request_id.clone(),
+                    prompt: request
+                        .tool_call
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Permission requested".into()),
                     options,
                 });
                 let events = permission_events.clone();

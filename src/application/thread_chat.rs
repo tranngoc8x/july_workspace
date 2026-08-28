@@ -144,9 +144,11 @@ impl<R: ThreadChatRuntime> ThreadChatService<R> {
             }
             ChatRuntimeEvent::PermissionRequested {
                 request_id,
+                prompt,
                 options,
             } => Ok(Some(ChatEvent::PermissionRequested {
                 request_id,
+                prompt,
                 options,
             })),
             ChatRuntimeEvent::TurnCompleted => Ok(Some(ChatEvent::TurnCompleted)),

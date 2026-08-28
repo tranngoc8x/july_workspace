@@ -358,6 +358,7 @@ async fn sends_exact_content_and_persists_both_message_directions() {
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: session.clone(),
             request_id: PermissionRequestId::from("permission-1"),
+            prompt: "Write file".into(),
             options: vec![PermissionOption {
                 id: "allow".into(),
                 label: "Allow".into(),
@@ -384,8 +385,10 @@ async fn sends_exact_content_and_persists_both_message_directions() {
     let request_id = match service.next_event(NOW.into()).await.unwrap() {
         Some(DirectMessageEvent::PermissionRequested {
             request_id,
+            prompt,
             options,
         }) => {
+            assert_eq!(prompt, "Write file");
             assert_eq!(options[0].id, "allow");
             request_id
         }
@@ -462,6 +465,7 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
             .send(TransportEvent::PermissionRequested(PermissionRequest {
                 session: session.clone(),
                 request_id: PermissionRequestId::from(correlation_id),
+                prompt: "Write file".into(),
                 options: vec![PermissionOption {
                     id: "allow".into(),
                     label: "Allow".into(),
@@ -500,6 +504,7 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
                 remote_session_id: "foreign".into(),
             },
             request_id: PermissionRequestId::from("foreign-session"),
+            prompt: "Write file".into(),
             options: vec![],
         }))
         .await
@@ -526,6 +531,7 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: session.clone(),
             request_id: PermissionRequestId::from("queued-owned-session"),
+            prompt: "Write file".into(),
             options: vec![],
         }))
         .await
@@ -551,6 +557,7 @@ async fn permissions_fail_closed_and_pending_requests_are_audited_on_shutdown() 
                 remote_session_id: "foreign".into(),
             },
             request_id: PermissionRequestId::from("queued-foreign-session"),
+            prompt: "Write file".into(),
             options: vec![],
         }))
         .await

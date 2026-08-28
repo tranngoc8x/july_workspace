@@ -298,9 +298,11 @@ impl<R: DirectMessageRuntime> DirectMessageService<R> {
             }
             DirectMessageRuntimeEvent::PermissionRequested {
                 request_id,
+                prompt,
                 options,
             } => Ok(Some(DirectMessageEvent::PermissionRequested {
                 request_id,
+                prompt,
                 options,
             })),
             DirectMessageRuntimeEvent::TurnCompleted => Ok(Some(DirectMessageEvent::TurnCompleted)),

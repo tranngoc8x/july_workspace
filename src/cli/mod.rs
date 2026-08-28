@@ -20,7 +20,7 @@ use serde_json::json;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -818,6 +818,9 @@ async fn run_repl() -> Result<(), CliError> {
     {
         std::fs::create_dir_all(parent)?;
     }
+    if use_tui(io::stdin().is_terminal(), io::stdout().is_terminal()) {
+        return run_tui_repl(database).await;
+    }
     let worker =
         StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
     let mut workspace =
@@ -839,9 +842,47 @@ async fn run_repl() -> Result<(), CliError> {
     }
 }
 
+const fn use_tui(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
+}
+
+async fn run_tui_repl(database: PathBuf) -> Result<(), CliError> {
+    let bridge = std::cell::RefCell::new(InactiveTuiBridge::open(database).await?);
+    let interaction = crate::tui::run_app(
+        |command| bridge.borrow().dispatch(command).map_err(io::Error::other),
+        || {
+            bridge
+                .borrow_mut()
+                .try_next_event()
+                .map_err(io::Error::other)
+        },
+    )
+    .await
+    .map_err(|error| CliError::Runtime(error.to_string()));
+    let shutdown = bridge.into_inner().shutdown().await;
+    match (interaction, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
 struct ReplLine {
     line: Option<String>,
     origin: Option<crate::tui::app::ContextId>,
+}
+
+enum ReplInput {
+    Line(io::Result<ReplLine>),
+    Permission {
+        request_id: ChatPermissionRequestId,
+        outcome: PermissionOutcome,
+    },
+    Cancel,
 }
 
 struct ReplSessionState {
@@ -936,7 +977,7 @@ async fn interact_repl<R: crate::application::CollaborationRuntime>(
 async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
-    input: &mut mpsc::UnboundedReceiver<io::Result<ReplLine>>,
+    input: &mut mpsc::UnboundedReceiver<ReplInput>,
     stdout: &mut ReplCaptureWriter<impl Write>,
     stderr: &mut ReplCaptureWriter<impl Write>,
     state: &mut ReplSessionState,
@@ -970,8 +1011,24 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         repl_write(stdout, format_args!("> "))?;
         stdout.clear();
         let request = tokio::select! {
-            line = input.recv() => match line {
-                Some(line) => line?,
+            input = input.recv() => match input {
+                Some(ReplInput::Line(line)) => line?,
+                Some(ReplInput::Permission { .. }) => {
+                    if let Some(events) = tui_events {
+                        let _ = events.send(crate::tui::app::AppEvent::PermissionFinished(
+                            Err("no active permission request".into()),
+                        ));
+                    }
+                    continue;
+                }
+                Some(ReplInput::Cancel) => {
+                    if let Some(events) = tui_events {
+                        let _ = events.send(crate::tui::app::AppEvent::CancelFinished(
+                            Err("no active turn".into()),
+                        ));
+                    }
+                    continue;
+                }
                 None => {
                     close_repl_context(live).await?;
                     return Ok(());
@@ -1614,11 +1671,12 @@ async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
 
 async fn drain_repl_turn<C: ChatContext>(
     service: &mut C,
-    input: &mut mpsc::UnboundedReceiver<io::Result<ReplLine>>,
+    input: &mut mpsc::UnboundedReceiver<ReplInput>,
     stdout: &mut impl Write,
     tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
+    let mut permission = None;
     loop {
         tokio::select! {
             event = service.next(timestamp()) => {
@@ -1629,39 +1687,89 @@ async fn drain_repl_turn<C: ChatContext>(
                 match event {
                     ChatEvent::TextDelta(text) => repl_write(stdout, format_args!("{text}"))?,
                     ChatEvent::MessageCompleted(_) => repl_write(stdout, format_args!("\n"))?,
-                    ChatEvent::PermissionRequested { request_id, options } => {
-                        for (index, option) in options.iter().enumerate() {
-                            repl_write(stdout, format_args!("{}. {}\n", index + 1, option.label))?;
-                        }
-                        repl_write(stdout, format_args!("permission> "))?;
-                        let (selected, interrupted) = tokio::select! {
-                            line = input.recv() => (
-                                line.transpose()?.and_then(|line| line.line)
-                                    .and_then(|line| line.parse::<usize>().ok())
-                                    .and_then(|index| index.checked_sub(1))
-                                    .and_then(|index| options.get(index))
-                                    .map(|option| PermissionOutcome::Selected(option.id.clone()))
-                                    .unwrap_or(PermissionOutcome::Cancelled),
-                                false,
-                            ),
-                            signal = tokio::signal::ctrl_c(), if !cancelled => {
-                                signal?;
-                                (PermissionOutcome::Cancelled, true)
+                    ChatEvent::PermissionRequested {
+                        request_id,
+                        prompt: _,
+                        options,
+                    } => {
+                        if tui_events.is_none() {
+                            for (index, option) in options.iter().enumerate() {
+                                repl_write(stdout, format_args!("{}. {}\n", index + 1, option.label))?;
                             }
-                        };
-                        service.permit(request_id, selected, timestamp()).await?;
-                        if interrupted {
-                            service.cancel(timestamp()).await?;
-                            cancelled = true;
+                            repl_write(stdout, format_args!("permission> "))?;
                         }
+                        permission = Some((request_id, options));
                     }
                     ChatEvent::TurnCompleted => return Ok(()),
                     ChatEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
                     ChatEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
                 }
             }
+            control = input.recv(), if tui_events.is_some() || permission.is_some() => {
+                let Some(control) = control else { return Err(CliError::EventStreamClosed); };
+                match control {
+                    ReplInput::Line(line) => {
+                        let Some((request_id, options)) = permission.take() else { continue; };
+                        let outcome = line?.line
+                            .and_then(|line| line.parse::<usize>().ok())
+                            .and_then(|index| index.checked_sub(1))
+                            .and_then(|index| options.get(index))
+                            .map(|option| PermissionOutcome::Selected(option.id.clone()))
+                            .unwrap_or(PermissionOutcome::Cancelled);
+                        service.permit(request_id, outcome, timestamp()).await?;
+                    }
+                    ReplInput::Permission { request_id, outcome } => {
+                        let Some((pending_id, options)) = permission.take() else {
+                            if let Some(events) = tui_events {
+                                let _ = events.send(crate::tui::app::AppEvent::PermissionFinished(
+                                    Err("no active permission request".into()),
+                                ));
+                            }
+                            continue;
+                        };
+                        if pending_id != request_id {
+                            permission = Some((pending_id, options));
+                            if let Some(events) = tui_events {
+                                let _ = events.send(crate::tui::app::AppEvent::PermissionFinished(
+                                    Err("stale permission response".into()),
+                                ));
+                            }
+                            continue;
+                        }
+                        let result = service.permit(request_id, outcome, timestamp()).await;
+                        if let Some(events) = tui_events {
+                            let _ = events.send(crate::tui::app::AppEvent::PermissionFinished(
+                                result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                            ));
+                        }
+                        result?;
+                    }
+                    ReplInput::Cancel => {
+                        if cancelled {
+                            if let Some(events) = tui_events {
+                                let _ = events.send(crate::tui::app::AppEvent::CancelFinished(Ok(())));
+                            }
+                            continue;
+                        }
+                        let result = service.cancel(timestamp()).await;
+                        if result.is_ok() {
+                            cancelled = true;
+                        }
+                        if let Some(events) = tui_events {
+                            let _ = events.send(crate::tui::app::AppEvent::CancelFinished(
+                                result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                            ));
+                        }
+                    }
+                }
+            }
             signal = tokio::signal::ctrl_c(), if !cancelled => {
                 signal?;
+                if let Some((request_id, _)) = permission.take() {
+                    service
+                        .permit(request_id, PermissionOutcome::Cancelled, timestamp())
+                        .await?;
+                }
                 service.cancel(timestamp()).await?;
                 cancelled = true;
             }
@@ -1669,7 +1777,7 @@ async fn drain_repl_turn<C: ChatContext>(
     }
 }
 
-fn repl_input() -> mpsc::UnboundedReceiver<io::Result<ReplLine>> {
+fn repl_input() -> mpsc::UnboundedReceiver<ReplInput> {
     let (sender, receiver) = mpsc::unbounded_channel();
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -1691,7 +1799,7 @@ fn repl_input() -> mpsc::UnboundedReceiver<io::Result<ReplLine>> {
                 Err(error) => Err(error),
             };
             let done = matches!(&input, Ok(ReplLine { line: None, .. }) | Err(_));
-            if sender.send(input).is_err() || done {
+            if sender.send(ReplInput::Line(input)).is_err() || done {
                 return;
             }
         }
@@ -1791,7 +1899,7 @@ fn repl_write(output: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), C
 
 /// Inactive typed adapter over the authoritative Phase 8 REPL state machine.
 pub struct InactiveTuiBridge {
-    input: mpsc::UnboundedSender<io::Result<ReplLine>>,
+    input: mpsc::UnboundedSender<ReplInput>,
     events: mpsc::UnboundedReceiver<crate::tui::app::AppEvent>,
     buffered: VecDeque<crate::tui::app::AppEvent>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -1866,12 +1974,15 @@ impl InactiveTuiBridge {
         let (origin, line) = match command {
             AppCommand::Submit { context, text } => (context, text),
             AppCommand::Execute { context, input } => (context, input),
+            AppCommand::RespondPermission { .. } | AppCommand::CancelTurn => {
+                return Err(CliError::InvalidCommand);
+            }
         };
         self.input
-            .send(Ok(ReplLine {
+            .send(ReplInput::Line(Ok(ReplLine {
                 line: Some(line),
                 origin: Some(origin.clone()),
-            }))
+            })))
             .map_err(|_| CliError::EventStreamClosed)?;
         loop {
             let event = self
@@ -1895,6 +2006,45 @@ impl InactiveTuiBridge {
             Some(event) => Some(event),
             None => self.events.recv().await,
         })
+    }
+
+    pub fn try_next_event(&mut self) -> Result<Option<crate::tui::app::AppEvent>, CliError> {
+        Ok(match self.buffered.pop_front() {
+            Some(event) => Some(event),
+            None => match self.events.try_recv() {
+                Ok(event) => Some(event),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(CliError::EventStreamClosed);
+                }
+            },
+        })
+    }
+
+    pub fn dispatch(&self, command: crate::tui::app::AppCommand) -> Result<(), CliError> {
+        use crate::tui::app::AppCommand;
+
+        let input = match command {
+            AppCommand::Submit { context, text } => ReplInput::Line(Ok(ReplLine {
+                line: Some(text),
+                origin: Some(context),
+            })),
+            AppCommand::Execute { context, input } => ReplInput::Line(Ok(ReplLine {
+                line: Some(input),
+                origin: Some(context),
+            })),
+            AppCommand::RespondPermission {
+                request_id,
+                outcome,
+            } => ReplInput::Permission {
+                request_id,
+                outcome,
+            },
+            AppCommand::CancelTurn => ReplInput::Cancel,
+        };
+        self.input
+            .send(input)
+            .map_err(|_| CliError::EventStreamClosed)
     }
 
     pub async fn shutdown(mut self) -> Result<(), CliError> {
@@ -2635,7 +2785,11 @@ async fn drain_turn<C: ChatContext>(
                         io::stdout().flush()?;
                     }
                     ChatEvent::MessageCompleted(_) => println!(),
-                    ChatEvent::PermissionRequested { request_id, options } => {
+                    ChatEvent::PermissionRequested {
+                        request_id,
+                        prompt: _,
+                        options,
+                    } => {
                         if permission(service, lines, request_id, &options).await? && !cancelled {
                             service.cancel(timestamp()).await?;
                             cancelled = true;
@@ -2668,6 +2822,7 @@ async fn handle_idle_event<C: ChatContext>(
         ChatEvent::MessageCompleted(_) => println!(),
         ChatEvent::PermissionRequested {
             request_id,
+            prompt: _,
             options,
         } => {
             return permission(service, lines, request_id, &options).await;
@@ -2722,6 +2877,14 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::CliError;
+
+    #[test]
+    fn tui_dispatch_requires_both_standard_streams_to_be_terminals() {
+        assert!(super::use_tui(true, true));
+        assert!(!super::use_tui(true, false));
+        assert!(!super::use_tui(false, true));
+        assert!(!super::use_tui(false, false));
+    }
 
     #[test]
     fn operation_and_restore_preserves_the_operation_error_code() {

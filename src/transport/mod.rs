@@ -110,6 +110,7 @@ impl Display for PermissionRequestId {
 pub struct PermissionRequest {
     pub session: SessionRef,
     pub request_id: PermissionRequestId,
+    pub prompt: String,
     pub options: Vec<PermissionOption>,
 }
 
@@ -330,6 +331,7 @@ mod tests {
         let permission = PermissionRequest {
             session: session.clone(),
             request_id: PermissionRequestId::from("permission-1"),
+            prompt: "Write file".into(),
             options: vec![],
         };
         sender

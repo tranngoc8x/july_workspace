@@ -34,6 +34,7 @@ pub enum ChatEvent {
     MessageCompleted(Message),
     PermissionRequested {
         request_id: ChatPermissionRequestId,
+        prompt: String,
         options: Vec<PermissionOption>,
     },
     TurnCompleted,
@@ -47,6 +48,7 @@ pub enum ChatRuntimeEvent {
     AgentMessageCompleted,
     PermissionRequested {
         request_id: ChatPermissionRequestId,
+        prompt: String,
         options: Vec<PermissionOption>,
     },
     TurnCompleted,

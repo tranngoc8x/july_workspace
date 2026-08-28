@@ -291,6 +291,7 @@ async fn dm_and_thread_share_one_owner_and_route_events_by_binding() {
             remote_session_id: format!("remote-{}", creates[0].binding_id),
         },
         request_id: PermissionRequestId::from("dm-permission"),
+        prompt: "Write file".into(),
         options: vec![PermissionOption {
             id: "allow".into(),
             label: "Allow".into(),
@@ -303,6 +304,7 @@ async fn dm_and_thread_share_one_owner_and_route_events_by_binding() {
     let permission = PermissionRequest {
         session: thread_session.clone(),
         request_id: PermissionRequestId::from("thread-permission"),
+        prompt: "Write file".into(),
         options: vec![PermissionOption {
             id: "allow".into(),
             label: "Allow".into(),
@@ -402,6 +404,7 @@ async fn detaching_one_session_does_not_stop_or_mutate_the_other() {
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: dm_session.clone(),
             request_id: PermissionRequestId::from("dm-pending"),
+            prompt: "Write file".into(),
             options: vec![option.clone()],
         }))
         .await
@@ -410,6 +413,7 @@ async fn detaching_one_session_does_not_stop_or_mutate_the_other() {
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: thread_session.clone(),
             request_id: PermissionRequestId::from("thread-pending"),
+            prompt: "Write file".into(),
             options: vec![option],
         }))
         .await
@@ -434,6 +438,7 @@ async fn detaching_one_session_does_not_stop_or_mutate_the_other() {
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session: dm_session,
             request_id: PermissionRequestId::from("late-detached"),
+            prompt: "Write file".into(),
             options: vec![],
         }))
         .await
@@ -533,6 +538,7 @@ async fn failed_permission_audit_is_retried_by_root_shutdown() {
         .send(TransportEvent::PermissionRequested(PermissionRequest {
             session,
             request_id: PermissionRequestId::from("retry-audit"),
+            prompt: "Write file".into(),
             options: vec![],
         }))
         .await

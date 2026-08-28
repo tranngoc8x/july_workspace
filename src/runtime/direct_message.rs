@@ -639,6 +639,7 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
                         .insert(request_id.clone(), request.session);
                     return Ok(Some(DirectMessageRuntimeEvent::PermissionRequested {
                         request_id: request_id.into(),
+                        prompt: request.prompt,
                         options: request.options,
                     }));
                 }

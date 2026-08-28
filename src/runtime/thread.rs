@@ -528,6 +528,7 @@ impl<T: AgentTransport + Send + 'static> ThreadChatRuntime for AgentThreadRuntim
                     self.permissions.insert(request_id.clone(), request.session);
                     return Ok(Some(ChatRuntimeEvent::PermissionRequested {
                         request_id: request_id.into(),
+                        prompt: request.prompt,
                         options: request.options,
                     }));
                 }

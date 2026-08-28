@@ -975,6 +975,7 @@ dependencies = [
  "agent-client-protocol",
  "chrono",
  "crossterm",
+ "futures-util",
  "libc",
  "pulldown-cmark",
  "ratatui",

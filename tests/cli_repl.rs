@@ -1054,6 +1054,106 @@ async fn inactive_tui_bridge_buffers_raw_events_while_execute_waits_for_its_comp
     bridge.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn tui_bridge_delivers_the_selected_permission_without_text_input() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    let opened = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    let submitted = bridge
+        .execute(tui_command(&mut app, "needs permission"))
+        .await
+        .unwrap();
+    app.reduce(submitted);
+    app.reduce(bridge.next_event().await.unwrap().unwrap());
+
+    let commands = app.reduce(AppEvent::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    )));
+    let [permission] = commands.as_slice() else {
+        panic!("permission selection did not emit one command");
+    };
+    bridge.dispatch(permission.clone()).unwrap();
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let completed = matches!(event, AppEvent::Chat(ChatEvent::TurnCompleted));
+        app.reduce(event);
+        if completed {
+            break;
+        }
+    }
+
+    let selected: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT selected_option_id FROM permission_decisions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(selected, "allow-once");
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tui_cancel_ack_and_late_permission_remain_escapable_without_a_second_cancel() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--permission-after-cancel"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    let command = tui_command(&mut app, "/dm codex");
+    let event = bridge.execute(command).await.unwrap();
+    app.reduce(event);
+    let command = tui_command(&mut app, "cancel me");
+    let event = bridge.execute(command).await.unwrap();
+    app.reduce(event);
+    let commands = app.reduce(AppEvent::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )));
+    let [cancel] = commands.as_slice() else {
+        panic!("first Ctrl-C did not emit one cancel");
+    };
+    bridge.dispatch(cancel.clone()).unwrap();
+
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        app.reduce(event);
+    }
+    assert!(app.permission().is_some());
+    assert_eq!(
+        app.turn_state(),
+        july_workspace::tui::app::TurnState::CancelAcknowledged
+    );
+    assert!(
+        app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))
+        .is_empty()
+    );
+    assert!(app.exit_requested());
+
+    bridge.shutdown().await.unwrap();
+}
+
 #[test]
 fn repl_publish_resolves_the_single_downstream_target() {
     let workspace = TestWorkspace::new();

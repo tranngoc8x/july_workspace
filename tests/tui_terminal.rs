@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use july_workspace::tui::{run_inactive_shell, with_terminal};
+use july_workspace::tui::{run_app, run_inactive_shell, with_terminal};
 
 const CHILD_MODE: &str = "JULY_TUI_TEST_CHILD";
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h";
@@ -41,6 +41,12 @@ fn terminal_child() {
             assert!(result.is_err());
         }
         "inactive" => run_inactive_shell().unwrap(),
+        "active" => tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(run_app(|_| Ok(()), || Ok(None)))
+            .unwrap(),
         mode => panic!("unknown child mode: {mode}"),
     }
 }
@@ -66,6 +72,43 @@ fn pty_ctrl_c_restores_terminal() {
     child.wait_for(ENTER_SCREEN);
     child.master.write_all(b"\x03").unwrap();
     assert_restored(child, None);
+}
+
+#[test]
+fn active_pty_ctrl_c_restores_terminal() {
+    let mut child = spawn_pty("active");
+    child.wait_for(ENTER_SCREEN);
+    child.master.write_all(b"\x03").unwrap();
+    assert_restored(child, None);
+}
+
+#[test]
+fn active_pty_sigterm_restores_terminal() {
+    let mut child = spawn_pty("active");
+    child.wait_for(ENTER_SCREEN);
+    send_signal(&child.child, libc::SIGTERM);
+    assert_restored(child, None);
+}
+
+#[test]
+fn active_pty_sighup_restores_terminal() {
+    let mut child = spawn_pty("active");
+    child.wait_for(ENTER_SCREEN);
+    send_signal(&child.child, libc::SIGHUP);
+    assert_restored(child, None);
+}
+
+#[test]
+fn no_argument_binary_uses_tui_when_both_streams_are_terminals() {
+    let database =
+        std::env::temp_dir().join(format!("july-tui-dispatch-{}.db", ulid::Ulid::generate()));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_july"));
+    command.env("JULY_WORKSPACE_DB", &database);
+    let mut child = spawn_pty_command(command);
+    child.wait_for(ENTER_SCREEN);
+    child.master.write_all(b"\x03").unwrap();
+    assert_restored(child, None);
+    let _ = std::fs::remove_file(database);
 }
 
 #[test]
@@ -230,6 +273,16 @@ impl Drop for PtyChild {
 }
 
 fn spawn_pty(mode: &str) -> PtyChild {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .arg("--exact")
+        .arg("terminal_child")
+        .arg("--nocapture")
+        .env(CHILD_MODE, mode);
+    spawn_pty_command(command)
+}
+
+fn spawn_pty_command(mut command: Command) -> PtyChild {
     let mut master = -1;
     let mut slave = -1;
     let mut size = libc::winsize {
@@ -260,12 +313,7 @@ fn spawn_pty(mode: &str) -> PtyChild {
         io::Error::last_os_error()
     );
 
-    let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .arg("--exact")
-        .arg("terminal_child")
-        .arg("--nocapture")
-        .env(CHILD_MODE, mode)
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
