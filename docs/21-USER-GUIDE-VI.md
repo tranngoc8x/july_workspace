@@ -7,31 +7,39 @@ Sau khi hoàn thành phần Quick start, bạn sẽ có:
 
 - một ACP adapter đã được cài và xác minh;
 - một project agent tồn tại bền vững trong SQLite;
-- một Room và một Thread có agent tham gia;
-- một phiên chat DM hoặc Thread chạy qua TUI/REPL;
+- một Room có agent tham gia;
+- một phiên làm việc mở bằng `@agent` chạy qua TUI/REPL;
 - dữ liệu workspace được giữ lại giữa các lần chạy July.
 
 ## 1. July Workspace là gì?
 
 July là workspace local-first để phối hợp nhiều coding agent trên nhiều project.
-July quản lý các đối tượng bền vững sau:
+
+Bạn chỉ cần nhớ ba khái niệm:
 
 ```text
-Workspace
-├── Agent       logical agent gắn với một project
-├── Room        phạm vi cộng tác
-│   └── Thread  ngữ cảnh làm việc độc lập
-├── Work        đơn vị công việc trong Thread
-├── Result      kết quả có cấu trúc của Work
-└── Session     phiên runtime có thể resume hoặc thay thế
+Agent   ai làm
+Room    nhóm / khu vực
+Work    việc đang làm
 ```
+
+và hai ký tự:
+
+```text
+@   chọn agent
+/   chạy command
+```
+
+Bên dưới, July còn giữ `Result` (kết quả có cấu trúc của Work) và `Session`
+(phiên runtime có thể resume hoặc thay thế). `Thread`, `Conversation` và
+`Session` là chi tiết triển khai — bạn không cần tạo hay đặt tên chúng.
 
 Điểm cần nhớ:
 
 - `Agent` không phải là một process Codex/Claude đang chạy.
 - Thêm Agent không tự khởi động model session.
-- Room không phải một shared prompt chứa toàn bộ lịch sử.
-- Thread là ranh giới ngữ cảnh; transcript không tự chảy sang Thread khác.
+- Room là nơi khởi động việc, không phải một shared prompt chứa toàn bộ lịch sử.
+- Work là ranh giới ngữ cảnh; transcript không tự chảy sang Work khác.
 - Result có thể được publish qua ranh giới; transcript thì không.
 
 ## 2. Yêu cầu hệ thống
@@ -207,7 +215,26 @@ july agent show cashpoint
 
 ### Bước 3: Chat trực tiếp với agent
 
-Cách ngắn nhất:
+Cách ngắn nhất là mở workspace rồi gọi tên agent:
+
+```bash
+july
+```
+
+```text
+> @cashpoint fix callback retry
+```
+
+July mở việc trực tiếp với `cashpoint` và gửi luôn prompt. Gõ tiếp là đi vào
+cùng ngữ cảnh đó:
+
+```text
+> also add regression tests
+```
+
+Gọi lại `@cashpoint` sau này sẽ nối tiếp đúng transcript cũ.
+
+Nếu chỉ cần một stream DM độc lập, không qua workspace shell:
 
 ```bash
 july dm cashpoint
@@ -227,24 +254,7 @@ july room member add VNA cashpoint
 july room members VNA
 ```
 
-### Bước 5: Tạo Thread
-
-```bash
-july thread create "Refund flow" \
-  --room VNA \
-  --goal "Thiết kế và triển khai refund flow" \
-  --member cashpoint
-```
-
-Output text có dạng:
-
-```text
-<thread-id>\t<primary-work-id>
-```
-
-Giữ lại `thread-id`; navigation tới Thread dùng ID chuẩn, không dùng title.
-
-### Bước 6: Mở workspace tương tác
+### Bước 5: Mở workspace tương tác
 
 ```bash
 july
@@ -253,13 +263,34 @@ july
 Nếu stdin và stdout đều là TTY, July mở full-screen TUI. Nếu một trong hai bị
 pipe hoặc redirect, July dùng line REPL tương thích script.
 
-Trong July:
+### Bước 6: Tạo Work nhiều agent
+
+Vào Room rồi gọi tên các agent cần làm việc cùng nhau:
 
 ```text
 /room VNA
-/thread <thread-id> --agent cashpoint
-Hãy phân tích refund flow hiện tại và đề xuất bước tiếp theo.
+@cashpoint @pay implement refund flow
 ```
+
+July tạo Work mới, đưa bạn vào luôn, và gửi prompt:
+
+```text
+work	<work-id>	implement refund flow
+```
+
+Gõ tiếp là đi vào cùng Work đó:
+
+```text
+> support partial refund too
+```
+
+Nếu một agent chưa phải thành viên Room, mention sẽ thêm nó và báo:
+
+```text
+member	pay	<room-id>
+```
+
+Không cần tạo Thread thủ công, không cần `/thread` trước khi gõ prompt.
 
 ## 6. Quản lý adapter và Agent
 
@@ -365,10 +396,15 @@ july room list --json
 july room members Payments --json
 ```
 
-Room membership và Thread membership là hai trạng thái riêng. Agent ở trong
-Room không tự động trở thành thành viên của mọi Thread trong Room.
+Room membership và Work membership là hai trạng thái riêng. Agent ở trong Room
+không tự động trở thành thành viên của mọi Work trong Room. Mention `@agent`
+lo cả hai: agent chưa ở trong Room sẽ được thêm vào Room rồi vào Work.
 
-## 8. Quản lý Thread
+## 8. Quản lý Thread (admin surface)
+
+Thread là tên nội bộ của Work. Trong TUI/REPL bạn dùng `@agent` và `/work`;
+phần dưới đây là command quản trị, dùng khi cần script hoá hoặc dựng sẵn
+Work trước khi vào làm.
 
 ```bash
 july thread create <title> --room <room> [--goal <text>] [--member <agent>]...
@@ -412,10 +448,10 @@ Nó dùng cùng input loop với `july dm`: `/exit`, `/quit`, EOF hoặc `Ctrl-C
 idle sẽ thoát; `Ctrl-C` trong active turn/permission chỉ gửi cancel rồi trở lại
 prompt sau khi turn kết thúc.
 
-`/thread new` trong TUI/REPL chỉ tạo Thread với local user, không tự thêm Agent
-và không tự chuyển context. Nếu muốn chat ngay, cách ngắn nhất là tạo bằng
-top-level `july thread create ... --member <agent>`, hoặc thêm Agent sau đó bằng
-`july thread member add <thread-id> <agent>`.
+`/thread` và `/thread new` vẫn chạy trong TUI/REPL nhưng đã bị ẩn khỏi `/help`:
+`/thread new` chỉ tạo Thread với local user, không tự thêm Agent và không tự
+chuyển context. Cách ngắn nhất để bắt đầu làm việc là `@agent` trong Room —
+xem mục 5, bước 6.
 
 ## 9. Sử dụng TUI và REPL
 
@@ -426,7 +462,7 @@ top-level `july thread create ... --member <agent>`, hoặc thêm Agent sau đó
 | `july` trong terminal | Full-screen TUI |
 | `printf '/status\n/quit\n' \| july` | Line REPL |
 | `july dm <agent>` | DM stream độc lập |
-| `july thread open ...` | Thread stream độc lập |
+| `july thread open ...` | Work stream độc lập |
 | Command quản trị | Output hữu hạn rồi thoát |
 
 TUI và line REPL dùng cùng context model và cùng slash-command registry.
@@ -436,6 +472,7 @@ TUI và line REPL dùng cùng context model và cùng slash-command registry.
 | Phím | Hành vi |
 |---|---|
 | `Enter` | Gửi input hiện tại |
+| `Tab` | Hoàn thành tên agent đang gõ sau `@` |
 | `Alt+Enter` | Xuống dòng trong editor |
 | `PageUp` / `PageDown` | Cuộn transcript |
 | `End` | Trở lại cuối transcript và bật follow-tail |
@@ -460,50 +497,105 @@ Khi permission modal xuất hiện:
 ```text
 Root
 ├── Room
-├── DM
-└── Room → Thread
+│   └── Work
+└── Direct work (một agent)
 ```
 
 `/back` chỉ quay lại context trước trong history. Nó không xóa membership,
 không kết thúc Work và không xóa conversation.
 
+### Gọi agent bằng `@`
+
+`@` chỉ có nghĩa khi đứng ở **đầu** dòng. Phần còn lại của dòng là prompt.
+
+| Bạn gõ | July làm gì |
+|---|---|
+| `@cashpoint fix callback retry` | Mở/nối việc trực tiếp với `cashpoint`, vào luôn, gửi prompt |
+| `@cashpoint` | Vào việc trực tiếp, không gửi gì |
+| `@cashpoint @pay implement refund flow` | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt |
+| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại |
+| `@nobody hi` | Báo `agent nobody does not exist`, giữ nguyên context |
+
+Quy tắc bổ sung:
+
+- Thứ tự mention không quan trọng: `@a @b` và `@b @a` là cùng một tập agent.
+- Mention lại đúng tập agent của context đang mở là **tiếp tục**, không tạo mới.
+- Từ Room, mention luôn tạo Work mới — July không đoán rằng việc mới thuộc
+  Work cũ.
+- Nhiều agent bắt buộc phải ở trong Room. Ở Root sẽ báo
+  `work with several agents needs a room; enter one with /room <room>`.
+- Agent chưa là thành viên Room sẽ được thêm, và July in dòng `member ...`.
+- Agent đầu tiên trong mention nhận turn; các agent còn lại vào Work làm
+  thành viên.
+- Text không bắt đầu bằng `@` hay `/`, khi đang ở trong một việc, được gửi
+  nguyên văn cho agent.
+
 ### Slash commands
 
 | Command | Context hợp lệ | Mục đích |
 |---|---|---|
-| `/dm <agent>` | mọi context | Mở DM |
 | `/room <room>` | mọi context | Vào Room |
-| `/thread new <title> [--goal <goal>]` | Room, Thread | Tạo Thread trong Room hiện tại |
-| `/thread <thread-id> [--agent <agent>]` | Room, Thread | Vào Thread của Room hiện tại |
+| `/work` | Room | Liệt kê Work của Room |
+| `/work <work-id> [--agent <agent>]` | Room, Work | Vào một Work |
+| `/work` | Work | Liệt kê work item bên trong Work hiện tại |
+| `/dm <agent>` | mọi context | Mở việc trực tiếp (tương đương `@agent` không prompt) |
 | `/back` | mọi context | Quay lại context trước |
 | `/rooms` | mọi context | Liệt kê Room |
 | `/agents` | mọi context | Liệt kê Agent |
-| `/members` | Room, Thread | Liệt kê thành viên active |
-| `/work` | Thread | Liệt kê Work của Thread |
-| `/results` | Thread | Liệt kê Result của Thread |
+| `/members` | Room, Work | Liệt kê thành viên active |
+| `/results` | Work | Liệt kê Result |
 | `/status` | mọi context | Xem context hiện tại |
-| `/publish <result> [--to <thread>]` | Thread | Publish Result |
-| `/restart` | DM, Thread | Đóng rồi mở lại binding của context hiện tại |
+| `/publish <result> [--to <work>]` | Work | Publish Result |
+| `/restart` | việc trực tiếp, Work | Đóng rồi mở lại binding của context hiện tại |
 | `/help [command]` | mọi context | Xem help theo context |
 | `/exit`, `/quit` | mọi context | Thoát July |
 
+Một số output và nhãn context vẫn dùng chữ `thread` — đó là tên nội bộ của
+Work. Ví dụ `/work <id>` xác nhận bằng `thread\t<work-id>\t<agent>`, và
+`/help work` ghi `contexts: room, thread`.
+
+Hai command legacy vẫn chạy nhưng không còn xuất hiện trong `/help`:
+`/thread <id> [--agent <agent>]` (tương đương `/work <id>`) và
+`/thread new <title> [--goal <goal>]`. `/help thread` vẫn giải thích chúng.
+
 ### Quy tắc gửi message
 
-- Ở DM hoặc Thread, input không khớp một slash command đã đăng ký được gửi
-  nguyên văn cho agent.
-- Ở Root hoặc Room, text thường bị từ chối vì chưa có live conversation.
+- Trong một việc, input không khớp slash command và không mở đầu bằng `@`
+  được gửi nguyên văn cho agent.
+- Ở Room, text thường **không** bị từ chối: July liệt kê các agent trong Room
+  kèm chính prompt đó đã gắn `@`, bạn chọn bằng cách gõ lại một dòng.
+
+  ```text
+  [vna] > investigate refund issue
+  who should work on this?
+    @cashpoint investigate refund issue
+    @pay investigate refund issue
+  ```
+
+- Ở Root, text thường vẫn bị từ chối vì chưa có live conversation; hãy dùng
+  `@agent` hoặc `/room`.
 - Command dùng sai context trả lỗi rõ ràng, không tự đổi nghĩa.
-- Từ DM muốn vào Thread, trước tiên dùng `/room <room>`, sau đó `/thread ...`.
-- `/thread <id>` không đoán agent nếu Thread có zero hoặc nhiều active Agent;
+- `/work <id>` không đoán agent nếu Work có zero hoặc nhiều active Agent;
   khi đó hãy thêm `--agent <name>`.
 
 ## 10. Work, Result và Publish
 
-Khi tạo Thread, July đồng thời tạo một primary Work và trả về
-`primary-work-id`. Trong command surface hiện tại:
+Chú ý `/work` có hai nghĩa theo context:
 
-- `/work` chỉ đọc danh sách Work trong Thread;
-- `/results` chỉ đọc Result của Thread;
+| Ở đâu | `/work` in ra |
+|---|---|
+| Trong Room | `<work-id>  <status>  <title>` — danh sách Work để vào |
+| Trong một Work | `<item-id>  <status>  <title>  <owner>` — work item bên trong |
+
+Hai ID này khác nhau: `/work <work-id>` dùng ID ở cột đầu của bảng trên,
+không dùng item-id.
+
+Mỗi Work được tạo cùng một primary work item; khi tạo bằng CLI,
+`july thread create` trả về cả `<work-id>` lẫn `<primary-work-id>`. Trong
+command surface hiện tại:
+
+- `/work` chỉ đọc, không tạo và không đổi trạng thái;
+- `/results` chỉ đọc Result;
 - state transition của Work và việc tạo Result hiện chỉ có ở Rust application
   API; command surface và ACP/chat event surface hiện tại chưa expose mutation;
 - chưa có top-level command để người dùng tạo Work hoặc Result thủ công.
@@ -514,7 +606,7 @@ Publish một Result từ CLI:
 july publish <result-id> --to <target-thread-id>
 ```
 
-Hoặc trong Thread:
+Hoặc trong một Work:
 
 ```text
 /publish <result-id>
@@ -522,7 +614,7 @@ Hoặc trong Thread:
 
 Khi bỏ `--to` trong REPL:
 
-- đúng một downstream Thread được liên kết bởi Work dependency: tự chọn;
+- đúng một downstream Work được liên kết bởi Work dependency: tự chọn;
 - không có downstream target: báo lỗi;
 - nhiều target: bắt buộc dùng `--to <thread-id>`.
 
@@ -536,10 +628,10 @@ mà không làm mất logical identity.
 
 Trong giao diện người dùng hiện tại:
 
-- `/restart` detach rồi mở lại DM/Thread hiện tại; July ưu tiên resume binding
-  và remote session đang có, nên command này không đảm bảo tạo provider session
+- `/restart` detach rồi mở lại việc hiện tại; July ưu tiên resume binding và
+  remote session đang có, nên command này không đảm bảo tạo provider session
   mới;
-- mở lại DM/Thread sẽ reuse hoặc resume binding khi có thể;
+- mở lại một việc sẽ reuse hoặc resume binding khi có thể;
 - khi remote session bị mất, July tạo replacement binding và gửi recovery
   capsule trước khi tiếp tục;
 - recovery capsule được giao theo at-least-once, không cam kết exactly-once;
@@ -630,7 +722,7 @@ Sau đó dùng:
 
 ```text
 /help
-/help thread
+/help work
 ```
 
 ### `agent dùng transport acp cần --adapter ...`
@@ -655,7 +747,7 @@ Kiểm tra npm có trên `PATH` với adapter npm, hoặc Cargo có trên `PATH`
 
 ### `authentication required`
 
-Đăng nhập vào provider/runtime tương ứng ngoài July, sau đó mở lại DM/Thread.
+Đăng nhập vào provider/runtime tương ứng ngoài July, sau đó mở lại việc.
 July init xác minh ACP identity và protocol; nó không đăng nhập tài khoản model
 thay bạn.
 
@@ -673,28 +765,30 @@ july agent update <agent> --adapter <adapter-id>
 tên mới, hoặc khôi phục dữ liệu bằng quy trình quản trị ngoài command surface
 hiện tại.
 
-### Không vào được Thread
+### Không vào được Work
 
 Kiểm tra theo thứ tự:
 
 ```bash
 july room members <room>
-july thread members <thread-id>
+july thread members <work-id>
 ```
 
 Nếu thiếu membership:
 
 ```bash
 july room member add <room> <agent>
-july thread member add <thread-id> <agent>
+july thread member add <work-id> <agent>
 ```
 
 Trong workspace shell, phải vào đúng Room trước:
 
 ```text
 /room <room>
-/thread <thread-id> --agent <agent>
+/work <work-id> --agent <agent>
 ```
+
+Với Work tạo bằng `@agent`, membership đã được lo sẵn.
 
 ### Command hợp lệ nhưng báo unavailable
 
@@ -724,10 +818,23 @@ Command surface hiện tại không có:
 - full-transcript recovery;
 - top-level `work`, `result`, `memory`, `checkpoint` hoặc `session` commands;
 - tự động publish hoặc tự đoán target bằng LLM;
-- shared transcript giữa các Thread.
+- shared transcript giữa các Work.
 
 Các giới hạn này là chủ ý của phiên bản hiện tại, không phải bước cấu hình còn
 thiếu.
+
+Hai giới hạn của giao diện, không phải chủ ý:
+
+- Plain prompt trong Room in ra danh sách gợi ý chứ chưa phải selector bấm
+  chọn được; bạn chọn bằng cách gõ lại một dòng.
+- **Trong full-screen TUI, output của các command inspection (`/rooms`,
+  `/agents`, `/members`, `/work`, `/results`, `/status`) hiện không hiển thị.**
+  Chúng chạy và trả kết quả bình thường ở line REPL. Muốn xem trong lúc chờ
+  bản sửa, chạy qua pipe:
+
+  ```bash
+  printf '/room VNA\n/work\n/quit\n' | july
+  ```
 
 ## 15. Cheat sheet
 
@@ -745,15 +852,15 @@ july agent update cashpoint --adapter codex
 july room create VNA --description "VNA collaboration"
 july room member add VNA cashpoint
 
-# Thread
+# Work (admin surface)
 july thread create "Refund flow" --room VNA --member cashpoint
 july thread list --room VNA
-july thread members <thread-id>
+july thread members <work-id>
 
 # Chat
-july dm cashpoint
-july thread open <thread-id> --agent cashpoint
 july
+july dm cashpoint
+july thread open <work-id> --agent cashpoint
 
 # Automation
 july --json agent list
@@ -762,17 +869,22 @@ july thread list --room VNA --json
 ```
 
 ```text
-# Trong TUI/REPL
+# Trong TUI/REPL — việc thường ngày
+@cashpoint fix callback retry              một agent
+/room VNA
+@cashpoint @pay implement refund flow      nhiều agent, tạo Work
+support partial refund too                 gõ tiếp vào Work đó
+
+# Điều hướng và tra cứu
 /help
 /agents
 /rooms
-/dm cashpoint
 /room VNA
-/thread <thread-id> --agent cashpoint
-/status
+/work                                      list Work của Room
+/work <work-id>                            vào một Work
 /members
-/work
 /results
+/status
 /restart
 /back
 /exit
