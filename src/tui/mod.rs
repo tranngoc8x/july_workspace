@@ -192,6 +192,7 @@ pub fn run_inactive_shell() -> Result<(), ShellError> {
 
 /// Run the active TUI while keeping all application I/O outside the reducer.
 pub async fn run_app(
+    agents: Vec<String>,
     mut dispatch: impl FnMut(app::AppCommand) -> io::Result<()>,
     mut next_application_event: impl FnMut() -> io::Result<Option<app::AppEvent>>,
 ) -> Result<(), ShellError> {
@@ -200,6 +201,7 @@ pub async fn run_app(
     let operation = async {
         let mut terminal = Terminal::new(CrosstermBackend::new(&mut guard.writer))?;
         let mut app = App::new(Context::root());
+        app.reduce(app::AppEvent::Agents(agents));
         let mut terminal_events = event::EventStream::new();
         let mut frames = tokio::time::interval(Duration::from_millis(33));
         frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
