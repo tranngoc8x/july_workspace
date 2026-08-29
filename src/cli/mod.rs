@@ -1610,6 +1610,10 @@ async fn route_mentions<R: crate::application::CollaborationRuntime>(
             Err(error) => return Ok(Some(error.into())),
         }
     }
+    // Already in the work these mentions name: the prompt just continues it.
+    if context_targets(service, contexts, &agents).await? {
+        return Ok(None);
+    }
     match agents.as_slice() {
         [agent] => enter_repl_dm(service, workspace, contexts, registered, live, agent).await,
         agents => {
@@ -1618,6 +1622,35 @@ async fn route_mentions<R: crate::application::CollaborationRuntime>(
             )
             .await
         }
+    }
+}
+
+/// Whether the active context already has exactly these agents, in which case
+/// mentioning them again is a continuation rather than a new work.
+async fn context_targets<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    contexts: &[ReplContext],
+    agents: &[crate::domain::Agent],
+) -> Result<bool, CliError> {
+    match contexts.last() {
+        Some(ReplContext::Dm { agent_id, .. }) => {
+            Ok(matches!(agents, [agent] if agent.id == *agent_id))
+        }
+        Some(ReplContext::Thread {
+            conversation_id, ..
+        }) => {
+            let members: HashSet<AgentId> = service
+                .list_thread_members(*conversation_id)
+                .await?
+                .into_iter()
+                .filter(|member| {
+                    member.left_at.is_none() && member.member_type == MemberType::Agent
+                })
+                .filter_map(|member| AgentId::from_str(&member.member_id).ok())
+                .collect();
+            Ok(members == agents.iter().map(|agent| agent.id).collect())
+        }
+        Some(ReplContext::Root | ReplContext::Room(_)) | None => Ok(false),
     }
 }
 

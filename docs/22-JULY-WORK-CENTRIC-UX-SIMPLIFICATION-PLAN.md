@@ -816,11 +816,11 @@ Sau khi UX mới ổn định, mới đánh giá việc merge Thread vào Work �
   tường minh, và việc thêm không im lặng.
 - **Work owner (§12.7)**: mention đầu tiên nhận turn; các agent còn lại vào
   Work với tư cách member. Chưa broadcast prompt cho tất cả.
-- **Rule C chưa resume (§4)**: plan viết "create/resume collaboration Work",
-  hiện mỗi lần mention nhiều agent đều tạo Work mới. Rule B thì resume đúng
-  (`get_or_create_dm`). Chưa có khoá tự nhiên để resume một Work đa agent —
-  xem "Câu hỏi mở" bên dưới. Hành vi hiện tại được khoá bằng
-  `repl_two_mention_created_works_keep_separate_transcripts`.
+- **Resume (§4)**: mention lại đúng tập agent của context đang mở là tiếp tục
+  context đó, không tạo gì — áp dụng cho cả Rule B lẫn Rule C, và không phụ
+  thuộc thứ tự mention. Từ Room thì mention luôn tạo Work mới: July không đoán
+  rằng việc mới thuộc về Work cũ. Rule B ngoài ra còn resume ở tầng dưới qua
+  `get_or_create_dm`, nên quay lại một agent luôn nối vào cùng transcript.
 - **`@` completion**: hoàn thành ở cuối input, snapshot danh sách agent lúc
   mở session (agent được cấu hình ngoài phiên làm việc).
 
@@ -835,18 +835,8 @@ Sau khi UX mới ổn định, mới đánh giá việc merge Thread vào Work �
 | Room prompt | `repl_plain_room_prompt_offers_targets_instead_of_a_command_error` |
 | Auto-enter | `repl_work_lists_room_work_and_opens_one_without_thread` |
 | Isolation | `repl_two_mention_created_works_keep_separate_transcripts` |
+| Resume trong context | `repl_mentioning_the_same_agents_inside_a_work_continues_it`, `repl_mentioning_the_open_agent_inside_direct_work_continues_it`, `repl_mentioning_a_different_set_inside_a_work_still_creates_one` |
 | Compatibility | Toàn bộ suite cũ giữ nguyên, xanh |
-
-### Câu hỏi mở
-
-Rule C nên resume theo khoá nào? Hai lựa chọn deterministic:
-
-```text
-a) chỉ resume khi đang ở trong Work có đúng tập participants đó
-b) resume Work mở gần nhất trong Room có đúng tập agent members đó
-```
-
-(b) khớp plan hơn nhưng nhét việc mới vào Work cũ. Chưa chọn.
 
 ### Chưa làm (đúng như §19)
 
