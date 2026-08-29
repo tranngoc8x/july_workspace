@@ -1655,3 +1655,112 @@ fn repl_help_teaches_mentions_and_hides_threads() {
     assert!(stdout_output.contains("/work [work]"));
     assert!(!stdout_output.contains("/thread"));
 }
+
+#[test]
+fn repl_repeated_mention_resumes_the_same_direct_work() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("@codex one\n1\n/back\n@codex two\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let conversations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(conversations, 1, "a second mention resumes the first work");
+    let conversation: String = connection
+        .query_row(
+            "SELECT id FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        workspace
+            .messages(conversation.parse().unwrap())
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "fixture reply", "two", "fixture reply"]
+    );
+}
+
+#[test]
+fn repl_plain_prompt_inside_work_stays_in_that_work() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &codex);
+    workspace.add_member(&room, &pay);
+
+    let output = workspace.repl(
+        "/room vna\n@codex @pay implement refund flow\n1\nsupport partial refund too\n1\n/quit\n",
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let threads: Vec<String> = connection
+        .prepare("SELECT id FROM conversations WHERE type = 'thread'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(threads.len(), 1, "the follow-up prompt made no new work");
+    assert_eq!(
+        workspace
+            .messages(threads[0].parse().unwrap())
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "implement refund flow",
+            "fixture reply",
+            "support partial refund too",
+            "fixture reply"
+        ]
+    );
+}
+
+#[test]
+fn repl_two_mention_created_works_keep_separate_transcripts() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &codex);
+    workspace.add_member(&room, &pay);
+
+    let output = workspace.repl(
+        "/room vna\n@codex @pay refund flow\n1\n/back\n@codex @pay callback retry\n1\n/quit\n",
+    );
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let threads: Vec<(String, String)> = connection
+        .prepare("SELECT id, title FROM conversations WHERE type = 'thread' ORDER BY created_at")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // Rule C creates a Work per mention; it does not resume a matching one.
+    assert_eq!(threads.len(), 2);
+    for (thread, title) in threads {
+        assert_eq!(
+            workspace
+                .messages(thread.parse().unwrap())
+                .iter()
+                .map(|(body, _)| body.as_str())
+                .collect::<Vec<_>>(),
+            [title.as_str(), "fixture reply"],
+            "work {title} transcript"
+        );
+    }
+}
