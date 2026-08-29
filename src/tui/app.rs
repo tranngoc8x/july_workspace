@@ -215,7 +215,6 @@ pub struct App {
     pending: Option<ContextId>,
     turn: TurnState,
     permission: Option<PermissionModal>,
-    status: Option<String>,
     error: Option<String>,
     agents: Vec<String>,
     tick: usize,
@@ -234,7 +233,6 @@ impl App {
             pending: None,
             turn: TurnState::Idle,
             permission: None,
-            status: None,
             error: None,
             agents: Vec::new(),
             tick: 0,
@@ -260,6 +258,21 @@ impl App {
 
     pub fn stream(&self) -> &str {
         self.markdown.tail()
+    }
+
+    /// The transcript as plain text, for tests and diagnostics.
+    pub fn transcript(&self) -> String {
+        self.transcript_text()
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub(crate) fn transcript_text(&self) -> Text<'static> {
@@ -325,11 +338,7 @@ impl App {
         self.permission.as_ref()
     }
 
-    pub fn status(&self) -> Option<&str> {
-        self.status.as_deref()
-    }
-
-    /// Last command failure, cleared on the next submit.
+    /// Last command failure or interruption, cleared on the next submit.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -387,14 +396,14 @@ impl App {
                     Ok(()) => self.turn = TurnState::CancelAcknowledged,
                     Err(error) => {
                         self.turn = TurnState::Active;
-                        self.status = Some(error);
+                        self.error = Some(error);
                     }
                 }
                 Vec::new()
             }
             AppEvent::PermissionFinished(result) => {
                 if let Err(error) = result {
-                    self.status = Some(error);
+                    self.error = Some(error);
                 }
                 Vec::new()
             }
@@ -612,7 +621,7 @@ impl App {
 
     fn reduce_command_result(&mut self, context: ContextId, result: CommandResult) {
         if self.pending.as_ref() != Some(&context) {
-            self.status = Some(format!("ignored stale command result for {context}"));
+            self.error = Some(format!("ignored stale command result for {context}"));
             return;
         }
 
@@ -625,7 +634,10 @@ impl App {
             }
             CommandResult::Output { context, output } => {
                 self.context = context;
-                self.status = Some(output);
+                // Command output belongs in the transcript: it can be long,
+                // and the footer is one line.
+                self.freeze_stream();
+                self.markdown.push_plain(output);
                 self.turn = TurnState::Idle;
             }
             CommandResult::Failed(error) => {
@@ -689,7 +701,7 @@ impl App {
                 options,
             } => {
                 if options.is_empty() {
-                    self.status = Some("permission request had no choices".into());
+                    self.error = Some("permission request had no choices".into());
                     return vec![AppCommand::RespondPermission {
                         request_id,
                         outcome: PermissionOutcome::Cancelled,
@@ -878,7 +890,7 @@ mod tests {
                 context: ContextId::root(),
                 result: CommandResult::Submitted,
             });
-            assert_eq!(app.status(), None);
+            assert_eq!(app.error(), None);
             assert_eq!(
                 app.reduce(AppEvent::Key(key(KeyCode::Enter))),
                 vec![AppCommand::Submit {
@@ -956,7 +968,7 @@ mod tests {
 
         assert_eq!(app.context(), &Context::root());
         assert_eq!(
-            app.status(),
+            app.error(),
             Some("ignored stale command result for dm:stale")
         );
     }
@@ -1137,7 +1149,6 @@ mod tests {
         });
 
         assert_eq!(app.error(), Some("invalid command"));
-        assert!(app.status().is_none());
 
         app.reduce(AppEvent::Key(key(KeyCode::Char('h'))));
         app.reduce(AppEvent::Key(key(KeyCode::Enter)));
@@ -1312,7 +1323,7 @@ mod tests {
             }]
         );
         assert!(app.permission().is_none());
-        assert_eq!(app.status(), Some("permission request had no choices"));
+        assert_eq!(app.error(), Some("permission request had no choices"));
     }
 
     #[test]
@@ -1328,7 +1339,7 @@ mod tests {
 
         app.reduce(AppEvent::CancelFinished(Err("delivery failed".into())));
         assert_eq!(app.turn_state(), TurnState::Active);
-        assert_eq!(app.status(), Some("delivery failed"));
+        assert_eq!(app.error(), Some("delivery failed"));
         assert_eq!(
             app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c')))),
             vec![AppCommand::CancelTurn]

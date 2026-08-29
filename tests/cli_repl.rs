@@ -250,6 +250,24 @@ impl Drop for TestWorkspace {
     }
 }
 
+/// A prompt and the reply it draws are persisted independently, so their
+/// storage order can interleave across turns. Assert the prompts in order and
+/// the replies by count.
+fn assert_turns(workspace: &TestWorkspace, conversation: ConversationId, prompts: &[&str]) {
+    let messages = workspace.messages(conversation);
+    let sent: Vec<&str> = messages
+        .iter()
+        .map(|(body, _)| body.as_str())
+        .filter(|body| *body != "fixture reply")
+        .collect();
+    assert_eq!(sent, prompts, "prompts in {conversation}");
+    assert_eq!(
+        messages.len() - sent.len(),
+        prompts.len(),
+        "one reply per prompt in {conversation}"
+    );
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
@@ -997,11 +1015,12 @@ async fn inactive_tui_bridge_exposes_successful_command_output_to_app() {
     app.reduce(status);
 
     assert_eq!(app.context(), &active_dm);
+    let transcript = app.transcript();
     assert!(
-        app.status()
-            .is_some_and(|status| status.starts_with("dm\t") && status.contains("\tcodex\t")),
-        "successful /status output was not visible: {:?}",
-        app.status()
+        transcript
+            .lines()
+            .any(|line| line.starts_with("dm\t") && line.contains("\tcodex\t")),
+        "successful /status output was not visible: {transcript:?}"
     );
     assert!(!app.turn_active());
     bridge.shutdown().await.unwrap();
@@ -1680,14 +1699,7 @@ fn repl_repeated_mention_resumes_the_same_direct_work() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(
-        workspace
-            .messages(conversation.parse().unwrap())
-            .iter()
-            .map(|(body, _)| body.as_str())
-            .collect::<Vec<_>>(),
-        ["one", "fixture reply", "two", "fixture reply"]
-    );
+    assert_turns(&workspace, conversation.parse().unwrap(), &["one", "two"]);
 }
 
 #[test]
@@ -1713,18 +1725,10 @@ fn repl_plain_prompt_inside_work_stays_in_that_work() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(threads.len(), 1, "the follow-up prompt made no new work");
-    assert_eq!(
-        workspace
-            .messages(threads[0].parse().unwrap())
-            .iter()
-            .map(|(body, _)| body.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "implement refund flow",
-            "fixture reply",
-            "support partial refund too",
-            "fixture reply"
-        ]
+    assert_turns(
+        &workspace,
+        threads[0].parse().unwrap(),
+        &["implement refund flow", "support partial refund too"],
     );
 }
 
@@ -1789,18 +1793,10 @@ fn repl_mentioning_the_same_agents_inside_a_work_continues_it() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(threads.len(), 1, "the repeated mention resumed the work");
-    assert_eq!(
-        workspace
-            .messages(threads[0].parse().unwrap())
-            .iter()
-            .map(|(body, _)| body.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "refund flow",
-            "fixture reply",
-            "also partial refund",
-            "fixture reply"
-        ]
+    assert_turns(
+        &workspace,
+        threads[0].parse().unwrap(),
+        &["refund flow", "also partial refund"],
     );
 }
 
@@ -1846,12 +1842,5 @@ fn repl_mentioning_the_open_agent_inside_direct_work_continues_it() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(
-        workspace
-            .messages(conversation.parse().unwrap())
-            .iter()
-            .map(|(body, _)| body.as_str())
-            .collect::<Vec<_>>(),
-        ["one", "fixture reply", "two", "fixture reply"]
-    );
+    assert_turns(&workspace, conversation.parse().unwrap(), &["one", "two"]);
 }
