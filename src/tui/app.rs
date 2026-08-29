@@ -114,6 +114,8 @@ pub enum AppEvent {
         rows: u16,
     },
     Tick,
+    /// Agent names for `@` completion, sent once when the session opens.
+    Agents(Vec<String>),
     Chat(ChatEvent),
     ChatBatch(Vec<ChatEvent>),
     CommandFinished {
@@ -215,6 +217,7 @@ pub struct App {
     permission: Option<PermissionModal>,
     status: Option<String>,
     error: Option<String>,
+    agents: Vec<String>,
     tick: usize,
     exit_requested: bool,
 }
@@ -233,6 +236,7 @@ impl App {
             permission: None,
             status: None,
             error: None,
+            agents: Vec::new(),
             tick: 0,
             exit_requested: false,
         }
@@ -361,6 +365,10 @@ impl App {
                 self.scroll_by(usize::from(rows), up);
                 Vec::new()
             }
+            AppEvent::Agents(agents) => {
+                self.agents = agents;
+                Vec::new()
+            }
             AppEvent::Chat(event) => self.reduce_chat_content(std::iter::once(event)),
             AppEvent::ChatBatch(events) => self.reduce_chat_content(events),
             AppEvent::CommandFinished { context, result } => {
@@ -424,6 +432,7 @@ impl App {
                 self.scroll_offset = 0;
                 self.follow_tail = true;
             }
+            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => self.complete_mention(),
             KeyCode::Enter if key.modifiers == KeyModifiers::NONE => return self.submit(),
             KeyCode::Esc => self.exit_requested = true,
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -506,6 +515,64 @@ impl App {
                 self.exit_requested = true;
                 Vec::new()
             }
+        }
+    }
+
+    /// The `@` prefix being typed at the end of the input, if any.
+    /// ponytail: completion follows the caret only at the end of the input,
+    /// which is where mentions are typed; mid-line editing skips it.
+    fn mention_prefix(&self) -> Option<String> {
+        let input = self.input();
+        let word = input.split_whitespace().next_back()?;
+        if !input.ends_with(word) {
+            return None;
+        }
+        word.strip_prefix('@').map(str::to_owned)
+    }
+
+    /// Agent names that match what is being typed after `@`.
+    pub fn completions(&self) -> Vec<&str> {
+        let Some(prefix) = self.mention_prefix() else {
+            return Vec::new();
+        };
+        self.agents
+            .iter()
+            .filter(|agent| agent.starts_with(&prefix) && agent.len() > prefix.len())
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Tab: extend the `@` prefix by the single match, or by the longest
+    /// prefix every match shares.
+    fn complete_mention(&mut self) {
+        let Some(prefix) = self.mention_prefix() else {
+            return;
+        };
+        let matches = self.completions();
+        let Some(first) = matches.first() else {
+            return;
+        };
+        let shared = matches.iter().skip(1).fold(first.len(), |shared, other| {
+            let mut end = 0;
+            for (index, character) in first[..shared].char_indices() {
+                let next = index + character.len_utf8();
+                if other.len() < next
+                    || other.as_bytes()[index..next] != first.as_bytes()[index..next]
+                {
+                    break;
+                }
+                end = next;
+            }
+            end
+        });
+        let completion = first[prefix.len()..shared].to_owned();
+        if completion.is_empty() {
+            return;
+        }
+        let single = matches.len() == 1;
+        self.input.insert_str(completion);
+        if single {
+            self.input.insert_str(" ");
         }
     }
 
@@ -926,6 +993,38 @@ mod tests {
             "› h\npartial\nerror: protocol error"
         );
         assert_eq!(app.stream(), "");
+    }
+
+    #[test]
+    fn tab_completes_an_agent_mention_and_the_footer_lists_the_candidates() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Agents(vec![
+            "cashpoint".into(),
+            "cashflow".into(),
+            "pay".into(),
+        ]));
+
+        // Nothing to complete until an `@` is being typed.
+        for character in "hello ".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert!(app.completions().is_empty());
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "hello ");
+
+        // Several matches: complete only the prefix they share, and offer both.
+        for character in "@cash".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert_eq!(app.completions(), ["cashpoint", "cashflow"]);
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "hello @cash", "no shared prefix left to add");
+
+        // One match: complete it fully and leave a space for the next word.
+        app.reduce(AppEvent::Key(key(KeyCode::Char('f'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "hello @cashflow ");
+        assert!(app.completions().is_empty());
     }
 
     #[test]

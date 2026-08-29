@@ -45,7 +45,7 @@ fn terminal_child() {
             .enable_time()
             .build()
             .unwrap()
-            .block_on(run_app(|_| Ok(()), || Ok(None)))
+            .block_on(run_app(Vec::new(), |_| Ok(()), || Ok(None)))
             .unwrap(),
         mode => panic!("unknown child mode: {mode}"),
     }

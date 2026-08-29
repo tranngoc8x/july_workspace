@@ -849,7 +849,9 @@ const fn use_tui(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
 
 async fn run_tui_repl(database: PathBuf) -> Result<(), CliError> {
     let bridge = std::cell::RefCell::new(InactiveTuiBridge::open(database).await?);
+    let agents = bridge.borrow().agents();
     let interaction = crate::tui::run_app(
+        agents,
         |command| bridge.borrow().dispatch(command).map_err(io::Error::other),
         || {
             bridge
@@ -2235,6 +2237,8 @@ fn repl_write(output: &mut impl Write, args: fmt::Arguments<'_>) -> Result<(), C
 /// Inactive typed adapter over the authoritative Phase 8 REPL state machine.
 pub struct InactiveTuiBridge {
     input: mpsc::UnboundedSender<ReplInput>,
+    /// Agent names for `@` completion, snapshotted when the session opened.
+    agents: Vec<String>,
     events: mpsc::UnboundedReceiver<crate::tui::app::AppEvent>,
     buffered: VecDeque<crate::tui::app::AppEvent>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -2251,6 +2255,14 @@ impl InactiveTuiBridge {
         let (input_sender, mut input) = mpsc::unbounded_channel();
         let (event_sender, events) = mpsc::unbounded_channel();
         let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        // ponytail: a snapshot at open is enough for `@` completion; agents are
+        // configured outside the session.
+        let agents = service
+            .list_agents()
+            .await?
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect();
         let task = tokio::spawn(async move {
             let mut stdout = ReplCaptureWriter::new(io::sink());
             let mut stderr = ReplCaptureWriter::new(io::sink());
@@ -2295,9 +2307,14 @@ impl InactiveTuiBridge {
             input: input_sender,
             events,
             buffered: VecDeque::new(),
+            agents,
             shutdown: Some(shutdown),
             task,
         })
+    }
+
+    pub fn agents(&self) -> Vec<String> {
+        self.agents.clone()
     }
 
     pub async fn execute(

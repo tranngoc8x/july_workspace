@@ -46,15 +46,19 @@ pub fn render(frame: &mut Frame, app: &App) {
     let input_area = input.inner(areas[2]);
     frame.render_widget(input, areas[2]);
     frame.render_widget(app.input_widget(), input_area);
-    let footer = app.error().map_or_else(
-        || Line::from("Enter send · Alt+Enter newline · wheel/PgUp scroll · Esc exit"),
-        |error| {
-            Line::from(Span::styled(
-                format!("! {error}"),
-                Style::default().fg(Color::Red),
-            ))
-        },
-    );
+    let completions = app.completions();
+    let footer = match (app.error(), completions.is_empty()) {
+        (Some(error), _) => Line::from(Span::styled(
+            format!("! {error}"),
+            Style::default().fg(Color::Red),
+        )),
+        // While an `@` is being typed, the footer is the agent picker.
+        (None, false) => Line::from(Span::styled(
+            format!("Tab  {}", completions.join("  ")),
+            Style::default().fg(Color::Cyan),
+        )),
+        (None, true) => Line::from("Enter send · Alt+Enter newline · wheel/PgUp scroll · Esc exit"),
+    };
     frame.render_widget(Paragraph::new(footer), areas[3]);
 
     if let Some(permission) = app.permission() {
