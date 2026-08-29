@@ -278,15 +278,37 @@ pub fn find(name: &str) -> Option<&'static CommandSpec> {
         .find(|spec| spec.name == slashed || spec.aliases.contains(&slashed.as_str()))
 }
 
+/// Still executable, no longer taught: Thread is an implementation detail of
+/// Work, so `/work` is what `/help` points at. The handlers stay for scripts
+/// and for anyone who already knows them.
+const HIDDEN: &[&str] = &["/thread", "/thread new"];
+
 pub fn for_scope(scope: CommandScope) -> impl Iterator<Item = &'static CommandSpec> {
     COMMANDS.iter().filter(move |spec| spec.available_in(scope))
 }
 
+/// `for_scope` minus the commands `/help` no longer advertises.
+pub fn visible_for_scope(scope: CommandScope) -> impl Iterator<Item = &'static CommandSpec> {
+    for_scope(scope).filter(|spec| !HIDDEN.contains(&spec.name))
+}
+
+/// `@` targets work, `/` runs a command: the two things a user must remember.
+const HELP_PREAMBLE: &str = "\
+Work with one agent
+  @cashpoint fix callback retry
+
+Work with several agents (inside a room)
+  @cashpoint @pay implement refund flow
+
+";
+
 /// Context-aware `/help`, grouped by command kind.
 pub fn help(scope: CommandScope) -> String {
-    let mut rendered = String::new();
+    let mut rendered = String::from(HELP_PREAMBLE);
     for kind in CommandKind::ORDER {
-        let mut group: Vec<_> = for_scope(scope).filter(|spec| spec.kind == *kind).collect();
+        let mut group: Vec<_> = visible_for_scope(scope)
+            .filter(|spec| spec.kind == *kind)
+            .collect();
         if group.is_empty() {
             continue;
         }
@@ -403,6 +425,17 @@ mod tests {
         let thread = help(Thread);
         assert!(thread.contains("/work"));
         assert!(thread.contains("/publish"));
+    }
+
+    #[test]
+    fn help_teaches_mentions_and_no_longer_advertises_threads() {
+        let room = help(Room);
+        assert!(room.contains("@cashpoint @pay implement refund flow"));
+        assert!(room.contains("/work [work]"));
+        assert!(!room.contains("/thread"));
+        // Hidden is not removed: the commands still resolve and still explain.
+        assert_eq!(resolve("/thread new x").unwrap().0.name, "/thread new");
+        assert!(help_command(find("thread").unwrap()).contains("usage"));
     }
 
     #[test]
