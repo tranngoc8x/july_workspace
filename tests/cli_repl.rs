@@ -474,7 +474,8 @@ fn repl_inspection_commands_report_workspace_state_without_mutating_it() {
     assert!(stdout_output.contains(&format!("{}\tOperations\tactive\n", room.id)));
     assert!(stdout_output.contains(&format!("{}\tcodex\t", codex.id)));
     assert!(
-        stderr(&output).contains("/work is unavailable in root context (available in: thread)\n")
+        stderr(&output)
+            .contains("/work is unavailable in root context (available in: room, thread)\n")
     );
     assert!(stdout_output.contains("\tSettlement\t"));
     assert!(stdout_output.contains(&format!("{result_id}\t")));
@@ -1594,4 +1595,30 @@ fn repl_unknown_mention_is_reported_and_keeps_the_context() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stderr(&output).contains("agent nobody does not exist"));
     assert_eq!(stdout(&output).matches("\tcodex\t").count(), 1);
+}
+
+#[test]
+fn repl_work_lists_room_work_and_opens_one_without_thread() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+    let refunds = workspace.seed_thread(&room, "Refund flow", &[&codex]);
+
+    let output = workspace.repl(&format!(
+        "/room vna\n/work\n/work {refunds}\nsupport partial refund too\n1\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains(&format!("{refunds}\topen\tRefund flow\n")));
+    assert!(stdout_output.contains(&format!("thread\t{refunds}\tcodex\n")));
+    assert_eq!(
+        workspace
+            .messages(refunds)
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["support partial refund too", "fixture reply"]
+    );
 }

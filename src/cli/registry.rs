@@ -167,11 +167,11 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/work",
         aliases: &[],
-        kind: Inspection,
-        scopes: &[Thread],
-        summary: "list work items of the current thread",
-        usage: "/work",
-        examples: &["/work"],
+        kind: Navigation,
+        scopes: &[Room, Thread],
+        summary: "list work in the current room, or open one; inside work, list its items",
+        usage: "/work [work]",
+        examples: &["/work", "/work 0198f0f2-0000-7000-8000-000000000001"],
     },
     CommandSpec {
         name: "/results",
