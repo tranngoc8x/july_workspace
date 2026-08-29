@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 
 mod init;
 mod keys;
+mod mention;
 pub mod registry;
 
 use registry::CommandScope;
@@ -1056,6 +1057,37 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             if line.trim().is_empty() {
                 continue;
             }
+            // Rules B and C: `@agent ...` targets work regardless of context.
+            if let Some(parsed) = mention::parse(&line) {
+                let names: Vec<String> = parsed.agents.iter().map(|&n| n.to_owned()).collect();
+                let prompt = parsed.prompt.to_owned();
+                // A new context replaces the breadcrumb, so its echo is not a status.
+                navigated = true;
+                if let Some(error) = route_mentions(
+                    service, workspace, contexts, registered, live, &names, &prompt, stdout,
+                )
+                .await?
+                {
+                    repl_write(stderr, format_args!("{error}\n"))?;
+                    continue;
+                }
+                if prompt.is_empty() {
+                    continue;
+                }
+                let chat = live.as_mut().expect("entered context has a live service");
+                if let Err(error) = chat.send(prompt, timestamp()).await {
+                    repl_write(stderr, format_args!("{error}\n"))?;
+                    continue;
+                }
+                if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
+                    let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
+                        context: origin,
+                        result: crate::tui::app::CommandResult::Submitted,
+                    });
+                }
+                drain_repl_turn(chat, input, stdout, tui_events).await?;
+                continue;
+            }
             if matches!(
                 contexts.last(),
                 Some(ReplContext::Dm { .. } | ReplContext::Thread { .. })
@@ -1561,6 +1593,215 @@ fn open_thread_runtime(
     workspace
         .thread(agent_id)
         .map_err(|error| CliError::Runtime(error.to_string()))
+}
+
+/// Rule B/C: turn `@` targets into an active work context and enter it.
+/// `Ok(None)` entered; `Ok(Some(error))` is recoverable and belongs on stderr.
+// The REPL threads its whole mutable context through these; a wrapper struct
+// would only rename the same fields.
+#[allow(clippy::too_many_arguments)]
+async fn route_mentions<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
+    live: &mut Option<ReplChat>,
+    names: &[String],
+    prompt: &str,
+    stdout: &mut impl Write,
+) -> Result<Option<CliError>, CliError> {
+    let mut agents = Vec::with_capacity(names.len());
+    for name in names {
+        let reference = match agent_ref(name) {
+            Ok(reference) => reference,
+            Err(error) => return Ok(Some(error)),
+        };
+        match service.resolve_agent(reference).await {
+            Ok(agent) => agents.push(agent),
+            Err(error) => return Ok(Some(error.into())),
+        }
+    }
+    match agents.as_slice() {
+        [agent] => enter_repl_dm(service, workspace, contexts, registered, live, agent).await,
+        agents => {
+            enter_repl_work(
+                service, workspace, contexts, registered, live, agents, prompt, stdout,
+            )
+            .await
+        }
+    }
+}
+
+/// Rule B: one agent is direct work, which is a DM underneath.
+async fn enter_repl_dm<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
+    live: &mut Option<ReplChat>,
+    agent: &crate::domain::Agent,
+) -> Result<Option<CliError>, CliError> {
+    if !registered.contains(&agent.id) {
+        if let Err(error) = register_acp_agent(workspace, agent).await {
+            return Ok(Some(error.into()));
+        }
+        registered.insert(agent.id);
+    }
+    if let Err(error) = close_repl_context(live).await {
+        return Ok(Some(error));
+    }
+    match open_repl_dm(workspace, agent).await {
+        Ok((context, dm)) => {
+            contexts.push(context);
+            *live = Some(dm);
+            Ok(None)
+        }
+        Err(error) => Ok(Some(
+            recover_repl_context(service, workspace, contexts, live, error).await?,
+        )),
+    }
+}
+
+/// Rule C: several agents share a Work, which is a Thread underneath. The
+/// first mention owns the turn; the others join as members.
+// The REPL threads its whole mutable context through these; a wrapper struct
+// would only rename the same fields.
+#[allow(clippy::too_many_arguments)]
+async fn enter_repl_work<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
+    live: &mut Option<ReplChat>,
+    agents: &[crate::domain::Agent],
+    prompt: &str,
+    stdout: &mut impl Write,
+) -> Result<Option<CliError>, CliError> {
+    let Some(room_id) = contexts.last().unwrap().room_id() else {
+        return Ok(Some(
+            CollaborationError::InvalidCommand(
+                "work with several agents needs a room; enter one with /room <room>".into(),
+            )
+            .into(),
+        ));
+    };
+    // Membership is a precondition of the Thread, so an explicit mention adds
+    // the agent and says so rather than failing or mutating silently.
+    let members = match service.list_room_members(RoomRef::Id(room_id)).await {
+        Ok(members) => members,
+        Err(error) => return Ok(Some(error.into())),
+    };
+    for agent in agents {
+        let joined = members
+            .iter()
+            .any(|member| member.left_at.is_none() && member.agent_id == agent.id);
+        if joined {
+            continue;
+        }
+        match service
+            .add_room_member(AddRoomMember {
+                room: RoomRef::Id(room_id),
+                agent: AgentRef::Id(agent.id),
+                role: None,
+                changed_at: timestamp(),
+            })
+            .await
+        {
+            Ok(_) => repl_write(
+                stdout,
+                format_args!("member\t{}\t{}\n", agent.name, room_id),
+            )?,
+            Err(error) => return Ok(Some(error.into())),
+        }
+    }
+    let thread_id = ConversationId::new();
+    let title = work_title(prompt);
+    if let Err(error) = service
+        .create_thread(CreateThread {
+            thread_id,
+            primary_work_id: WorkItemId::new(),
+            room: RoomRef::Id(room_id),
+            title: title.clone(),
+            goal: None,
+            user_id: LOCAL_USER_ID.into(),
+            initial_agents: agents.iter().map(|agent| AgentRef::Id(agent.id)).collect(),
+            created_at: timestamp(),
+        })
+        .await
+    {
+        return Ok(Some(error.into()));
+    }
+    repl_write(stdout, format_args!("work\t{thread_id}\t{title}\n"))?;
+    enter_repl_thread(
+        service, workspace, contexts, registered, live, &agents[0], thread_id, room_id,
+    )
+    .await
+}
+
+/// Open a Thread for `agent` and make it the active context.
+// The REPL threads its whole mutable context through these; a wrapper struct
+// would only rename the same fields.
+#[allow(clippy::too_many_arguments)]
+async fn enter_repl_thread<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
+    live: &mut Option<ReplChat>,
+    agent: &crate::domain::Agent,
+    thread_id: ConversationId,
+    room_id: RoomId,
+) -> Result<Option<CliError>, CliError> {
+    if !registered.contains(&agent.id) {
+        if let Err(error) = register_acp_agent(workspace, agent).await {
+            return Ok(Some(error.into()));
+        }
+        registered.insert(agent.id);
+    }
+    if let Err(error) = close_repl_context(live).await {
+        return Ok(Some(error));
+    }
+    match open_repl_thread(workspace, agent, thread_id, room_id).await {
+        Ok((context, chat)) => {
+            contexts.push(context);
+            *live = Some(chat);
+            Ok(None)
+        }
+        Err(error) => Ok(Some(
+            recover_repl_context(service, workspace, contexts, live, error).await?,
+        )),
+    }
+}
+
+/// A failed switch must leave the previous context live; if even that fails the
+/// session cannot continue.
+async fn recover_repl_context<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &[ReplContext],
+    live: &mut Option<ReplChat>,
+    error: CliError,
+) -> Result<CliError, CliError> {
+    match restore_repl_context(service, workspace, contexts, live).await {
+        Ok(()) => Ok(error),
+        Err(restore) => Err(CliError::OperationAndRestore {
+            operation: Box::new(error),
+            restore: restore.to_string(),
+        }),
+    }
+}
+
+/// A Work title from the opening prompt: the first line, trimmed to something
+/// a breadcrumb can hold.
+fn work_title(prompt: &str) -> String {
+    let line = prompt.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return "untitled work".into();
+    }
+    match line.char_indices().nth(60) {
+        Some((end, _)) => format!("{}…", line[..end].trim_end()),
+        None => line.to_owned(),
+    }
 }
 
 async fn close_repl_context(live: &mut Option<ReplChat>) -> Result<(), CliError> {
