@@ -236,6 +236,8 @@ pub const COMMANDS: &[CommandSpec] = &[
 /// `/thread new` wins over `/thread`. Returns the spec and the remaining
 /// argument text. Lines that do not start with `/` are never commands.
 pub fn resolve(line: &str) -> Option<(&'static CommandSpec, &str)> {
+    // A command typed with leading blanks is still a command; chat keeps the raw line.
+    let line = line.trim_start();
     if !line.starts_with('/') {
         return None;
     }
@@ -376,9 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_requires_a_word_boundary_and_a_leading_slash() {
+    fn resolve_requires_a_word_boundary_and_a_slash_after_leading_blanks() {
         assert!(resolve("/threading abc").is_none());
-        assert!(resolve(" /status").is_none());
+        assert_eq!(resolve("  /status").unwrap().0.name, "/status");
         assert!(resolve("hello").is_none());
         assert_eq!(resolve("/exit").unwrap().0.name, "/exit");
         assert_eq!(resolve("/quit").unwrap().0.name, "/exit");

@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::text::{Line, Text};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::TextArea;
 
@@ -11,6 +12,11 @@ use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
 use crate::domain::{PermissionOption, PermissionOutcome};
 
 pub const CHAT_BATCH_LIMIT: usize = 32;
+
+/// Braille frames for the "agent is working" indicator.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Frame ticks held per spinner step so the animation stays readable at 30fps.
+const SPINNER_TICKS_PER_FRAME: usize = 3;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ContextId(String);
@@ -46,7 +52,7 @@ impl Context {
     }
 
     pub fn root() -> Self {
-        Self::new(ContextId::root(), "root")
+        Self::new(ContextId::root(), "july")
     }
 
     pub fn id(&self) -> &ContextId {
@@ -101,6 +107,11 @@ pub enum AppEvent {
     Resize {
         width: u16,
         height: u16,
+    },
+    /// Wheel or trackpad scroll over the transcript.
+    Scroll {
+        up: bool,
+        rows: u16,
     },
     Tick,
     Chat(ChatEvent),
@@ -184,6 +195,14 @@ impl PermissionModal {
     }
 }
 
+/// `TextArea` underlines the cursor line by default, which reads as the typed
+/// text being underlined; the input keeps a plain line style instead.
+fn new_input() -> TextArea<'static> {
+    let mut input = TextArea::default();
+    input.set_cursor_line_style(Style::default());
+    input
+}
+
 pub struct App {
     context: Context,
     input: TextArea<'static>,
@@ -195,6 +214,8 @@ pub struct App {
     turn: TurnState,
     permission: Option<PermissionModal>,
     status: Option<String>,
+    error: Option<String>,
+    tick: usize,
     exit_requested: bool,
 }
 
@@ -202,7 +223,7 @@ impl App {
     pub fn new(context: Context) -> Self {
         Self {
             context,
-            input: TextArea::default(),
+            input: new_input(),
             viewport: Viewport::new(0, 0),
             markdown: MarkdownStream::default(),
             scroll_offset: 0,
@@ -211,6 +232,8 @@ impl App {
             turn: TurnState::Idle,
             permission: None,
             status: None,
+            error: None,
+            tick: 0,
             exit_requested: false,
         }
     }
@@ -236,7 +259,40 @@ impl App {
     }
 
     pub(crate) fn transcript_text(&self) -> Text<'static> {
-        self.markdown.text()
+        // ponytail: terminal cells have no line-height; one spacer row between
+        // consecutive non-empty lines is the closest equivalent.
+        let text = self.markdown.text();
+        let mut lines = Vec::with_capacity(text.lines.len() * 2);
+        let mut rest = text.lines.into_iter().peekable();
+        while let Some(line) = rest.next() {
+            let spaced = line.width() > 0
+                && rest
+                    .peek()
+                    .is_some_and(|next: &Line<'static>| next.width() > 0);
+            lines.push(line);
+            if spaced {
+                lines.push(Line::default());
+            }
+        }
+        if let Some(frame) = self.spinner_frame() {
+            let label = match self.turn {
+                TurnState::Cancelling => "cancelling",
+                TurnState::CancelAcknowledged => "cancelled",
+                _ => "working",
+            };
+            if lines.last().is_some_and(|line| line.width() > 0) {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled(
+                format!("{frame} {label}…"),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+        Text {
+            alignment: text.alignment,
+            style: text.style,
+            lines,
+        }
     }
 
     pub(crate) fn transcript_scroll(&self) -> u16 {
@@ -269,6 +325,17 @@ impl App {
         self.status.as_deref()
     }
 
+    /// Last command failure, cleared on the next submit.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Current spinner frame while a turn is in flight.
+    pub fn spinner_frame(&self) -> Option<&'static str> {
+        (self.turn != TurnState::Idle)
+            .then(|| SPINNER_FRAMES[(self.tick / SPINNER_TICKS_PER_FRAME) % SPINNER_FRAMES.len()])
+    }
+
     pub fn exit_requested(&self) -> bool {
         self.exit_requested
     }
@@ -288,6 +355,10 @@ impl App {
                     let permission = self.permission.as_mut().unwrap();
                     permission.scroll = permission.scroll.min(max_page);
                 }
+                Vec::new()
+            }
+            AppEvent::Scroll { up, rows } => {
+                self.scroll_by(usize::from(rows), up);
                 Vec::new()
             }
             AppEvent::Chat(event) => self.reduce_chat_content(std::iter::once(event)),
@@ -319,7 +390,10 @@ impl App {
                 }
                 Vec::new()
             }
-            AppEvent::Tick => Vec::new(),
+            AppEvent::Tick => {
+                self.tick = self.tick.wrapping_add(1);
+                Vec::new()
+            }
         }
     }
 
@@ -337,17 +411,15 @@ impl App {
         }
 
         match key.code {
-            KeyCode::PageUp => {
-                self.follow_tail = false;
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                let max_scroll = self.max_scroll_offset();
-                self.clamp_scroll(max_scroll);
+            KeyCode::PageUp => self.scroll_by(self.transcript_rows(), true),
+            KeyCode::PageDown => self.scroll_by(self.transcript_rows(), false),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_by(1, true);
             }
-            KeyCode::PageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                let max_scroll = self.max_scroll_offset();
-                self.clamp_scroll(max_scroll);
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_by(1, false);
             }
+            KeyCode::Home => self.scroll_by(usize::MAX, true),
             KeyCode::End => {
                 self.scroll_offset = 0;
                 self.follow_tail = true;
@@ -427,7 +499,7 @@ impl App {
                 Vec::new()
             }
             TurnState::Idle if !self.input().is_empty() => {
-                self.input = TextArea::default();
+                self.input = new_input();
                 Vec::new()
             }
             TurnState::Idle => {
@@ -446,15 +518,25 @@ impl App {
         if text.trim().is_empty() {
             return Vec::new();
         }
+        self.error = None;
+        // Leading blanks must not turn a command into chat.
+        let command = text.trim_start().starts_with('/');
 
-        self.input = TextArea::default();
+        self.input = new_input();
+        self.freeze_stream();
+        self.markdown.push_plain(
+            text.lines()
+                .map(|line| format!("› {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         self.turn = TurnState::Active;
         let context = self.context.id.clone();
         self.pending = Some(context.clone());
-        vec![if text.starts_with('/') {
+        vec![if command {
             AppCommand::Execute {
                 context,
-                input: text,
+                input: text.trim_start().to_owned(),
             }
         } else {
             AppCommand::Submit { context, text }
@@ -480,7 +562,7 @@ impl App {
                 self.turn = TurnState::Idle;
             }
             CommandResult::Failed(error) => {
-                self.status = Some(error);
+                self.error = Some(error.trim_end().to_owned());
                 self.turn = TurnState::Idle;
             }
         }
@@ -571,6 +653,22 @@ impl App {
         self.markdown.finish();
     }
 
+    fn scroll_by(&mut self, rows: usize, up: bool) {
+        if up {
+            self.follow_tail = false;
+            self.scroll_offset = self.scroll_offset.saturating_add(rows);
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+        }
+        let max_scroll = self.max_scroll_offset();
+        self.clamp_scroll(max_scroll);
+    }
+
+    /// Rows the transcript pane owns: the frame minus header, input and hints.
+    fn transcript_rows(&self) -> usize {
+        usize::from(self.viewport.height.saturating_sub(5)).max(1)
+    }
+
     fn clamp_scroll(&mut self, max_scroll: usize) {
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         if self.scroll_offset == 0 {
@@ -580,7 +678,7 @@ impl App {
 
     fn max_scroll_offset(&self) -> usize {
         self.wrapped_row_count()
-            .saturating_sub(usize::from(self.viewport.height.saturating_sub(5)).max(1))
+            .saturating_sub(self.transcript_rows())
     }
 
     fn wrapped_row_count(&self) -> usize {
@@ -825,7 +923,7 @@ mod tests {
         assert!(!app.turn_active());
         assert_eq!(
             app.markdown.completed().to_string(),
-            "partial\nerror: protocol error"
+            "› h\npartial\nerror: protocol error"
         );
         assert_eq!(app.stream(), "");
     }
@@ -911,11 +1009,71 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "1234567890123456".into(),
         )));
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        for _ in 0..10 {
+            app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        }
 
-        assert_eq!(app.scroll_offset(), 2);
+        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
         assert!(!app.follow_tail());
+    }
+
+    #[test]
+    fn leading_blanks_still_execute_a_command_and_failures_surface_as_an_error() {
+        let mut app = App::new(Context::root());
+        for character in "  /thread 01 --agent cashpoint".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/thread 01 --agent cashpoint".into(),
+            }]
+        );
+
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Failed("invalid command\n".into()),
+        });
+
+        assert_eq!(app.error(), Some("invalid command"));
+        assert!(app.status().is_none());
+
+        app.reduce(AppEvent::Key(key(KeyCode::Char('h'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+
+        assert!(app.error().is_none());
+    }
+
+    #[test]
+    fn page_keys_move_a_transcript_page_and_the_wheel_moves_its_rows() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            (0..40).map(|row| format!("{row}  \n")).collect::<String>(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        assert_eq!(app.scroll_offset(), 5);
+        assert!(!app.follow_tail());
+
+        app.reduce(AppEvent::Scroll { up: true, rows: 3 });
+        assert_eq!(app.scroll_offset(), 8);
+
+        app.reduce(AppEvent::Key(key(KeyCode::PageDown)));
+        assert_eq!(app.scroll_offset(), 3);
+
+        app.reduce(AppEvent::Key(key(KeyCode::Home)));
+        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
+
+        app.reduce(AppEvent::Key(key(KeyCode::End)));
+        assert_eq!(app.scroll_offset(), 0);
+        assert!(app.follow_tail());
     }
 
     #[test]
@@ -926,6 +1084,7 @@ mod tests {
             height: 7,
         });
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta("a a a a a a".into())));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
 
         assert_eq!(app.wrapped_row_count(), 2);
     }
@@ -940,10 +1099,12 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "1234567890123456".into(),
         )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         for _ in 0..10 {
             app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
         }
 
+        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
         assert_eq!(app.scroll_offset(), 2);
     }
 
@@ -957,7 +1118,7 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "0  \n1  \n1234 **x".into(),
         )));
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Up)));
         assert_eq!(app.scroll_offset(), 1);
 
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta("**".into())));

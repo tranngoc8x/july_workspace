@@ -990,14 +990,19 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     } = state;
     let mut publish = PublishService::new(workspace.storage());
     let mut pending_origin = None;
+    // Navigation echoes duplicate the TUI breadcrumb, so they never become a status.
+    let mut navigated = false;
     loop {
         if let Some(origin) = pending_origin.take() {
-            let context = project_repl_context(service, contexts.last().unwrap()).await?;
+            let context = project_repl_context(service, contexts).await?;
             let result = match (stderr.take(), stdout.take()) {
                 (Some(error), _) => crate::tui::app::CommandResult::Failed(error),
-                (None, Some(output)) => crate::tui::app::CommandResult::Output { context, output },
-                (None, None) => crate::tui::app::CommandResult::Context(context),
+                (None, Some(output)) if !navigated => {
+                    crate::tui::app::CommandResult::Output { context, output }
+                }
+                (None, _) => crate::tui::app::CommandResult::Context(context),
             };
+            navigated = false;
             if let Some(events) = tui_events {
                 let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
                     context: origin,
@@ -1478,6 +1483,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             // A registered command with arguments it does not accept.
             _ => repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?,
         }
+        navigated = matches!(spec.name, "/room" | "/thread" | "/dm" | "/back");
     }
 }
 
@@ -1809,37 +1815,71 @@ fn repl_input() -> mpsc::UnboundedReceiver<ReplInput> {
 
 async fn project_repl_context<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
-    context: &ReplContext,
+    contexts: &[ReplContext],
 ) -> Result<crate::tui::app::Context, CliError> {
     use crate::tui::app::{Context, ContextId};
 
-    Ok(match context {
-        ReplContext::Root => Context::root(),
-        ReplContext::Room(room_id) => {
-            let room = service.resolve_room(RoomRef::Id(*room_id)).await?;
-            Context::new(
-                ContextId::new(format!("room:{room_id}")),
-                format!("room · {}", room.name),
-            )
+    let Some(current) = contexts.last() else {
+        return Ok(Context::root());
+    };
+    let mut segments: Vec<String> = Vec::new();
+    for context in contexts {
+        match context {
+            // ponytail: root only shows when it is the whole breadcrumb.
+            ReplContext::Root => {}
+            ReplContext::Room(room_id) => {
+                let room = service.resolve_room(RoomRef::Id(*room_id)).await?;
+                segments.push(format!("room::{}", room.name));
+            }
+            ReplContext::Dm { agent_name, .. } => segments.push(format!("dm::{agent_name}")),
+            ReplContext::Thread {
+                conversation_id,
+                room_id,
+                agent_name,
+                ..
+            } => {
+                segments.push(format!(
+                    "thread::{}",
+                    thread_label(service, *room_id, *conversation_id).await?
+                ));
+                segments.push(agent_name.clone());
+            }
         }
+    }
+    if segments.is_empty() {
+        return Ok(Context::root());
+    }
+    let id = match current {
+        ReplContext::Root => ContextId::root(),
+        ReplContext::Room(room_id) => ContextId::new(format!("room:{room_id}")),
         ReplContext::Dm {
             conversation_id,
             agent_id,
-            agent_name,
-        } => Context::new(
-            ContextId::new(format!("dm:{conversation_id}:{agent_id}")),
-            format!("dm · {agent_name}"),
-        ),
+            ..
+        } => ContextId::new(format!("dm:{conversation_id}:{agent_id}")),
         ReplContext::Thread {
             conversation_id,
             agent_id,
-            agent_name,
             ..
-        } => Context::new(
-            ContextId::new(format!("thread:{conversation_id}:{agent_id}")),
-            format!("thread · {agent_name}"),
-        ),
-    })
+        } => ContextId::new(format!("thread:{conversation_id}:{agent_id}")),
+    };
+    Ok(Context::new(id, segments.join(" > ")))
+}
+
+/// Thread title for the breadcrumb, falling back to `untitled` when the Thread
+/// carries no title.
+async fn thread_label<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+    thread_id: ConversationId,
+) -> Result<String, CliError> {
+    Ok(service
+        .list_threads(RoomRef::Id(room_id))
+        .await?
+        .into_iter()
+        .find(|thread| thread.id == thread_id)
+        .and_then(|thread| thread.title)
+        .unwrap_or_else(|| "untitled".into()))
 }
 
 async fn print_repl_status<R: crate::application::CollaborationRuntime>(

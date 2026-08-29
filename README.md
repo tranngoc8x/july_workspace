@@ -19,6 +19,8 @@ Instead of putting another supervisor LLM in front of Claude, Codex, or other co
 
 July is intended for developers who work across multiple repositories and want coding agents to behave more like a persistent engineering team rather than isolated chat sessions.
 
+Hướng dẫn tiếng Việt: [docs/21-USER-GUIDE-VI.md](docs/21-USER-GUIDE-VI.md)
+
 ---
 
 ## Installation

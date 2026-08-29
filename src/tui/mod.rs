@@ -2,7 +2,10 @@ use std::fmt;
 use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -14,6 +17,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Transcript rows moved per wheel notch.
+const WHEEL_ROWS: u16 = 3;
 
 pub mod app;
 mod markdown;
@@ -78,7 +84,9 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             raw_mode,
             active: true,
         };
-        if let Err(operation) = execute!(guard.writer, EnterAlternateScreen, Hide) {
+        if let Err(operation) =
+            execute!(guard.writer, EnterAlternateScreen, EnableMouseCapture, Hide)
+        {
             return match guard.restore() {
                 Ok(()) => Err(ShellError::Operation(operation)),
                 Err(restore) => Err(ShellError::OperationAndRestore { operation, restore }),
@@ -94,7 +102,7 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
         self.active = false;
 
         let show = execute!(self.writer, Show);
-        let leave = execute!(self.writer, LeaveAlternateScreen);
+        let leave = execute!(self.writer, DisableMouseCapture, LeaveAlternateScreen);
         let raw = self.raw_mode.disable();
         let mut errors = Vec::new();
         if let Err(error) = show {
@@ -214,6 +222,12 @@ pub async fn run_app(
                         )?;
                         dirty = true;
                     }
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        if let Some(event) = scroll_event(mouse) {
+                            dispatch_all(app.reduce(event), &mut dispatch)?;
+                            dirty = true;
+                        }
+                    }
                     Some(Ok(Event::Key(key))) => {
                         dispatch_all(app.reduce(app::AppEvent::Key(key)), &mut dispatch)?;
                         dirty = true;
@@ -223,6 +237,11 @@ pub async fn run_app(
                     None => break,
                 },
                 _ = frames.tick() => {
+                    if app.turn_active() {
+                        // Advance the working spinner while the agent is busy.
+                        app.reduce(app::AppEvent::Tick);
+                        dirty = true;
+                    }
                     if dirty {
                         draw_inactive(&mut terminal, &app)?;
                         dirty = false;
@@ -255,6 +274,19 @@ pub async fn run_app(
     }
 }
 
+/// Map a wheel event onto a transcript scroll, ignoring other mouse input.
+fn scroll_event(mouse: MouseEvent) -> Option<app::AppEvent> {
+    let up = match mouse.kind {
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+    Some(app::AppEvent::Scroll {
+        up,
+        rows: WHEEL_ROWS,
+    })
+}
+
 fn dispatch_all(
     commands: Vec<app::AppCommand>,
     dispatch: &mut impl FnMut(app::AppCommand) -> io::Result<()>,
@@ -279,6 +311,13 @@ fn handle_event<B: Backend>(
     event: Event,
 ) -> Result<bool, B::Error> {
     match event {
+        Event::Mouse(mouse) => {
+            if let Some(scroll) = scroll_event(mouse) {
+                app.reduce(scroll);
+                draw_inactive(terminal, app)?;
+            }
+            Ok(false)
+        }
         Event::Resize(width, height) => {
             terminal.autoresize()?;
             app.reduce(app::AppEvent::Resize { width, height });

@@ -1,10 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{App, PermissionModal};
+use super::app::{App, PermissionModal, TurnState};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -20,11 +20,20 @@ pub fn render(frame: &mut Frame, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
-    let status = app.status().map_or_else(
-        || app.context().label().to_owned(),
-        |status| format!("{} — {status}", app.context().label()),
-    );
-    frame.render_widget(Paragraph::new(status), areas[0]);
+    let (dot_color, turn_label) = match app.turn_state() {
+        TurnState::Idle => (Color::Green, "idle"),
+        TurnState::Active => (Color::Yellow, "working"),
+        TurnState::Cancelling => (Color::Magenta, "cancelling"),
+        TurnState::CancelAcknowledged => (Color::DarkGray, "cancelled"),
+    };
+    // ponytail: the dot and the transcript spinner already report turn state, so
+    // the header carries no command output.
+    let header = vec![
+        Span::styled("● ", Style::default().fg(dot_color)),
+        Span::raw(app.context().label().to_owned()),
+        Span::styled(format!(" ({turn_label})"), Style::default().fg(dot_color)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(header)), areas[0]);
 
     frame.render_widget(
         Paragraph::new(app.transcript_text())
@@ -37,10 +46,16 @@ pub fn render(frame: &mut Frame, app: &App) {
     let input_area = input.inner(areas[2]);
     frame.render_widget(input, areas[2]);
     frame.render_widget(app.input_widget(), input_area);
-    frame.render_widget(
-        Paragraph::new("Enter send · Alt+Enter newline · Esc exit"),
-        areas[3],
+    let footer = app.error().map_or_else(
+        || Line::from("Enter send · Alt+Enter newline · wheel/PgUp scroll · Esc exit"),
+        |error| {
+            Line::from(Span::styled(
+                format!("! {error}"),
+                Style::default().fg(Color::Red),
+            ))
+        },
     );
+    frame.render_widget(Paragraph::new(footer), areas[3]);
 
     if let Some(permission) = app.permission() {
         let width = area.width.saturating_sub(4).min(60);
@@ -147,14 +162,15 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
+        // Spacer rows sit between transcript lines, so the tail starts at "7".
         assert_eq!(
             terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "5"
+            "7"
         );
     }
 
     #[test]
-    fn page_up_from_a_tall_transcript_renders_earlier_wrapped_rows() {
+    fn scrolling_up_from_a_tall_transcript_renders_earlier_wrapped_rows() {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
             width: 20,
@@ -162,21 +178,16 @@ mod tests {
         });
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        )));
-        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        )));
+        for _ in 0..2 {
+            app.reduce(AppEvent::Scroll { up: true, rows: 1 });
+        }
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         assert_eq!(
             terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "3"
+            "6"
         );
     }
 
@@ -190,10 +201,7 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         for _ in 0..2 {
-            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::PageUp,
-                crossterm::event::KeyModifiers::NONE,
-            )));
+            app.reduce(AppEvent::Scroll { up: true, rows: 1 });
         }
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta("  \n10  \n11".into())));
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
@@ -202,7 +210,7 @@ mod tests {
 
         assert_eq!(
             terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "3"
+            "6"
         );
     }
 
@@ -216,6 +224,7 @@ mod tests {
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "aaaaa 0 aaaaa 1 aaaaa 2 bbbbb 3 bbbbb 4 bbbbb 5 ccccc 6 ccccc 7 ccccc 8".into(),
         )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -227,10 +236,7 @@ mod tests {
         assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), " ");
         assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "4");
 
-        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        )));
+        app.reduce(AppEvent::Scroll { up: true, rows: 1 });
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         assert_eq!(

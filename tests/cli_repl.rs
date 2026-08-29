@@ -693,9 +693,8 @@ fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() 
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &[]);
 
-    let output = workspace.repl(
-        "/dm codex\n/dm\n/dm \n/room \n/status extra\n /status\n1\n/unknown exact\n1\n/quit\n",
-    );
+    let output = workspace
+        .repl("/dm codex\n/dm\n/dm \n/room \n/status extra\n /status\n/unknown exact\n1\n/quit\n");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert_eq!(stderr(&output).matches("invalid command\n").count(), 4);
@@ -707,15 +706,16 @@ fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() 
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(messages.len(), 4);
-    assert!(messages.iter().any(|message| message == " /status"));
+    assert_eq!(messages.len(), 2);
+    // Leading blanks route to the command, so " /status" never reaches the agent.
+    assert!(!messages.iter().any(|message| message.trim() == "/status"));
     assert!(messages.iter().any(|message| message == "/unknown exact"));
     assert_eq!(
         messages
             .iter()
             .filter(|message| message.as_str() == "fixture reply")
             .count(),
-        2
+        1
     );
 }
 
@@ -876,7 +876,10 @@ async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permissio
     let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
     let mut app = App::new(Context::root());
 
-    for (input, expected_label) in [("/room vna", "room · vna"), ("/dm codex", "dm · codex")] {
+    for (input, expected_label) in [
+        ("/room vna", "room::vna"),
+        ("/dm codex", "room::vna > dm::codex"),
+    ] {
         let event = bridge.execute(tui_command(&mut app, input)).await.unwrap();
         app.reduce(event);
         assert_eq!(app.context().label(), expected_label);
@@ -898,8 +901,11 @@ async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permissio
     assert_eq!(app.context(), &active_dm);
 
     for (input, expected_label) in [
-        ("/back".to_owned(), "room · vna"),
-        (format!("/thread {thread} --agent codex"), "thread · codex"),
+        ("/back".to_owned(), "room::vna"),
+        (
+            format!("/thread {thread} --agent codex"),
+            "room::vna > thread::work > codex",
+        ),
     ] {
         let event = bridge.execute(tui_command(&mut app, &input)).await.unwrap();
         app.reduce(event);
