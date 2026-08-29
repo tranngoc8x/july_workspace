@@ -758,11 +758,10 @@ Thread → merge into Work
 
 ---
 
-## 20. Recommended scope
+## 20. Recommended implementation strategy
 
-Vì token AI còn hạn chế, nên làm MVP:
+Ưu tiên triển khai theo incremental rollout để giảm rủi ro:
 
-```text
 1. @agent parser
 2. multiple @agents
 3. unified dispatcher
@@ -771,12 +770,9 @@ Vì token AI còn hạn chế, nên làm MVP:
 6. /work navigation
 7. hide /thread from normal UX
 8. update /help
-9. basic tests
-```
+9. regression tests
 
-Hoãn toàn bộ domain migration.
-
-Đây là cách lấy phần lớn UX improvement với ít thay đổi kiến trúc nhất.
+Sau khi UX mới ổn định, mới đánh giá việc merge Thread vào Work ở domain/storage.
 
 ---
 
@@ -784,12 +780,12 @@ Hoãn toàn bộ domain migration.
 
 Đã triển khai theo 7 phase độc lập, mỗi phase một commit.
 
-| Phase | Commit | Nội dung |
-|---|---|---|
-| 1-3 | `72948e6` | `@mention` parser + Rule B (1 agent → direct work) + Rule C (nhiều agent → Work trong Room) |
-| 4 | `f8f7cc4` | `/work` thành navigation entry point |
-| 5-6 | `f38142c` | Ẩn `/thread` khỏi `/help`, `/help` dạy `@`, Rule D cho plain prompt trong Room |
-| 7 | `86372b2` | `@` completion trong TUI (Tab + footer picker) |
+| Phase | Commit    | Nội dung                                                                                    |
+| ----- | --------- | ------------------------------------------------------------------------------------------- |
+| 1-3   | `72948e6` | `@mention` parser + Rule B (1 agent → direct work) + Rule C (nhiều agent → Work trong Room) |
+| 4     | `f8f7cc4` | `/work` thành navigation entry point                                                        |
+| 5-6   | `f38142c` | Ẩn `/thread` khỏi `/help`, `/help` dạy `@`, Rule D cho plain prompt trong Room              |
+| 7     | `86372b2` | `@` completion trong TUI (Tab + footer picker)                                              |
 
 ### Acceptance criteria
 
@@ -820,9 +816,39 @@ Hoãn toàn bộ domain migration.
   tường minh, và việc thêm không im lặng.
 - **Work owner (§12.7)**: mention đầu tiên nhận turn; các agent còn lại vào
   Work với tư cách member. Chưa broadcast prompt cho tất cả.
+- **Rule C chưa resume (§4)**: plan viết "create/resume collaboration Work",
+  hiện mỗi lần mention nhiều agent đều tạo Work mới. Rule B thì resume đúng
+  (`get_or_create_dm`). Chưa có khoá tự nhiên để resume một Work đa agent —
+  xem "Câu hỏi mở" bên dưới. Hành vi hiện tại được khoá bằng
+  `repl_two_mention_created_works_keep_separate_transcripts`.
 - **`@` completion**: hoàn thành ở cuối input, snapshot danh sách agent lúc
   mở session (agent được cấu hình ngoài phiên làm việc).
 
+### Regression tests (§17)
+
+| Case §17 | Test |
+|---|---|
+| Single-agent routing | `repl_single_mention_opens_direct_work_and_sends_the_prompt`, `repl_bare_mention_enters_direct_work_without_sending_anything` |
+| Single-agent resume | `repl_repeated_mention_resumes_the_same_direct_work` |
+| Multi-agent routing | `repl_multiple_mentions_create_a_work_in_the_room_and_auto_enter_it` |
+| Current Work | `repl_plain_prompt_inside_work_stays_in_that_work` |
+| Room prompt | `repl_plain_room_prompt_offers_targets_instead_of_a_command_error` |
+| Auto-enter | `repl_work_lists_room_work_and_opens_one_without_thread` |
+| Isolation | `repl_two_mention_created_works_keep_separate_transcripts` |
+| Compatibility | Toàn bộ suite cũ giữ nguyên, xanh |
+
+### Câu hỏi mở
+
+Rule C nên resume theo khoá nào? Hai lựa chọn deterministic:
+
+```text
+a) chỉ resume khi đang ở trong Work có đúng tập participants đó
+b) resume Work mở gần nhất trong Room có đúng tập agent members đó
+```
+
+(b) khớp plan hơn nhưng nhét việc mới vào Work cũ. Chưa chọn.
+
 ### Chưa làm (đúng như §19)
 
-Không đụng schema, không merge Work + Thread, `/dm` vẫn còn.
+Không đụng schema, không merge Work + Thread (xem
+`docs/23-THREAD-WORK-MERGE-ASSESSMENT.md`), `/dm` vẫn còn.
