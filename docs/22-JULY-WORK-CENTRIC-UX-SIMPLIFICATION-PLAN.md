@@ -777,3 +777,52 @@ Vì token AI còn hạn chế, nên làm MVP:
 Hoãn toàn bộ domain migration.
 
 Đây là cách lấy phần lớn UX improvement với ít thay đổi kiến trúc nhất.
+
+---
+
+## 21. Review — 29/08/2026
+
+Đã triển khai theo 7 phase độc lập, mỗi phase một commit.
+
+| Phase | Commit | Nội dung |
+|---|---|---|
+| 1-3 | `72948e6` | `@mention` parser + Rule B (1 agent → direct work) + Rule C (nhiều agent → Work trong Room) |
+| 4 | `f8f7cc4` | `/work` thành navigation entry point |
+| 5-6 | `f38142c` | Ẩn `/thread` khỏi `/help`, `/help` dạy `@`, Rule D cho plain prompt trong Room |
+| 7 | `86372b2` | `@` completion trong TUI (Tab + footer picker) |
+
+### Acceptance criteria
+
+```text
+[x] user can start single-agent work with @agent prompt
+[x] user can start multi-agent work with multiple @mentions
+[x] new work contexts auto-enter
+[x] user never needs /thread before sending a prompt
+[x] Room is not treated as shared conversation context
+[~] plain Room prompt produces target picker instead of error
+[x] /work lists and opens work contexts
+[x] Thread is hidden from default help/palette
+[x] Thread domain/storage is not removed in this phase
+[x] @ completion uses configured agents
+[x] routing is deterministic
+[x] no supervisor LLM is introduced
+[x] results/context isolation invariants remain intact
+```
+
+### Khác biệt so với plan
+
+- **Target picker (§3, Rule D)**: hiện là danh sách gợi ý chứ chưa phải
+  selector tương tác. Plain prompt trong Room in ra từng agent member kèm
+  chính prompt đó đã gắn `@`, người dùng chọn bằng cách gõ lại. Selector
+  dạng popup cần widget mới trong TUI — hoãn.
+- **Room membership (§13)**: mention một agent chưa là member sẽ tự thêm và
+  in dòng `member <name> <room>` thay vì hỏi Yes/No. Mention là chủ đích
+  tường minh, và việc thêm không im lặng.
+- **Work owner (§12.7)**: mention đầu tiên nhận turn; các agent còn lại vào
+  Work với tư cách member. Chưa broadcast prompt cho tất cả.
+- **`@` completion**: hoàn thành ở cuối input, snapshot danh sách agent lúc
+  mở session (agent được cấu hình ngoài phiên làm việc).
+
+### Chưa làm (đúng như §19)
+
+Không đụng schema, không merge Work + Thread, `/dm` vẫn còn.
