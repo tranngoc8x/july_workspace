@@ -1764,3 +1764,94 @@ fn repl_two_mention_created_works_keep_separate_transcripts() {
         );
     }
 }
+
+#[test]
+fn repl_mentioning_the_same_agents_inside_a_work_continues_it() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &codex);
+    workspace.add_member(&room, &pay);
+
+    // The second mention names the same pair, in the other order, from inside
+    // the work it created.
+    let output = workspace
+        .repl("/room vna\n@codex @pay refund flow\n1\n@pay @codex also partial refund\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let threads: Vec<String> = connection
+        .prepare("SELECT id FROM conversations WHERE type = 'thread'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(threads.len(), 1, "the repeated mention resumed the work");
+    assert_eq!(
+        workspace
+            .messages(threads[0].parse().unwrap())
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "refund flow",
+            "fixture reply",
+            "also partial refund",
+            "fixture reply"
+        ]
+    );
+}
+
+#[test]
+fn repl_mentioning_a_different_set_inside_a_work_still_creates_one() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    let ops = workspace.seed_acp_agent("ops", &[]);
+    workspace.add_member(&room, &codex);
+    workspace.add_member(&room, &pay);
+    workspace.add_member(&room, &ops);
+
+    let output = workspace
+        .repl("/room vna\n@codex @pay refund flow\n1\n@codex @ops callback retry\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let threads: i64 = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM conversations WHERE type = 'thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(threads, 2, "a different set of agents is a different work");
+}
+
+#[test]
+fn repl_mentioning_the_open_agent_inside_direct_work_continues_it() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("@codex one\n1\n@codex two\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let conversation: String = connection
+        .query_row(
+            "SELECT id FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        workspace
+            .messages(conversation.parse().unwrap())
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "fixture reply", "two", "fixture reply"]
+    );
+}
