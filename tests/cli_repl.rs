@@ -1476,3 +1476,122 @@ fn repl_broken_stdout_exits_without_a_panic() {
     }
     assert_eq!(status.unwrap().code(), Some(1));
 }
+
+#[test]
+fn repl_single_mention_opens_direct_work_and_sends_the_prompt() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("@codex fix callback retry\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let conversation: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT id FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let messages = workspace.messages(conversation.parse().unwrap());
+    assert_eq!(
+        messages
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["fix callback retry", "fixture reply"]
+    );
+}
+
+#[test]
+fn repl_bare_mention_enters_direct_work_without_sending_anything() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("@codex\n/status\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).contains("\tcodex\t"));
+    let conversation: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT id FROM conversations WHERE type = 'dm'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(workspace.messages(conversation.parse().unwrap()).is_empty());
+}
+
+#[test]
+fn repl_multiple_mentions_create_a_work_in_the_room_and_auto_enter_it() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &codex);
+
+    let output = workspace.repl("/room vna\n@codex @pay implement refund flow\n1\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    // `pay` was not a member yet: the mention adds it and says so.
+    assert!(stdout_output.contains(&format!("member\tpay\t{}\n", room.id)));
+    assert!(stdout_output.contains("\timplement refund flow\n"));
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let (thread, title): (String, String) = connection
+        .query_row(
+            "SELECT id, title FROM conversations WHERE type = 'thread'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "implement refund flow");
+    let thread_id: ConversationId = thread.parse().unwrap();
+    assert_eq!(
+        workspace
+            .messages(thread_id)
+            .iter()
+            .map(|(body, _)| body.as_str())
+            .collect::<Vec<_>>(),
+        ["implement refund flow", "fixture reply"]
+    );
+    let members: Vec<String> = connection
+        .prepare(
+            "SELECT member_id FROM conversation_members \
+             WHERE conversation_id = ? AND member_type = 'agent' AND left_at IS NULL",
+        )
+        .unwrap()
+        .query_map([&thread], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(members.len(), 2);
+    assert!(members.contains(&codex.id.to_string()));
+    assert!(members.contains(&pay.id.to_string()));
+}
+
+#[test]
+fn repl_multiple_mentions_outside_a_room_report_where_work_lives() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+    workspace.seed_acp_agent("pay", &[]);
+
+    let output = workspace.repl("@codex @pay implement refund flow\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("work with several agents needs a room"));
+}
+
+#[test]
+fn repl_unknown_mention_is_reported_and_keeps_the_context() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("@codex hello\n1\n@nobody hi\n/status\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("agent nobody does not exist"));
+    assert_eq!(stdout(&output).matches("\tcodex\t").count(), 1);
+}
