@@ -1104,6 +1104,24 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     });
                 }
                 drain_repl_turn(chat, input, stdout, tui_events).await?;
+            } else if let Some(room_id) = contexts.last().unwrap().room_id() {
+                // Rule D: a Room launches work, it is not a conversation. Name
+                // the targets instead of reporting a command error.
+                match room_member_names(service, room_id).await {
+                    Ok(names) if names.is_empty() => repl_write(
+                        stderr,
+                        format_args!(
+                            "no agents in this room yet; add one with: july room member add\n"
+                        ),
+                    )?,
+                    Ok(names) => {
+                        repl_write(stdout, format_args!("who should work on this?\n"))?;
+                        for name in names {
+                            repl_write(stdout, format_args!("  @{name} {line}\n"))?;
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
             } else {
                 repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
             }
@@ -1740,6 +1758,25 @@ async fn enter_repl_thread<R: crate::application::CollaborationRuntime>(
             recover_repl_context(service, workspace, contexts, live, error).await?,
         )),
     }
+}
+
+/// Active agent members of a Room, by name, in listing order.
+async fn room_member_names<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+) -> Result<Vec<String>, CliError> {
+    let members = service.list_room_members(RoomRef::Id(room_id)).await?;
+    let agents = service.list_agents().await?;
+    Ok(members
+        .into_iter()
+        .filter(|member| member.left_at.is_none())
+        .filter_map(|member| {
+            agents
+                .iter()
+                .find(|agent| agent.id == member.agent_id)
+                .map(|agent| agent.name.clone())
+        })
+        .collect())
 }
 
 /// `<work> [--agent <agent>]`: enter an existing Work of the current Room.

@@ -1622,3 +1622,36 @@ fn repl_work_lists_room_work_and_opens_one_without_thread() {
         ["support partial refund too", "fixture reply"]
     );
 }
+
+#[test]
+fn repl_plain_room_prompt_offers_targets_instead_of_a_command_error() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &codex);
+    workspace.add_member(&room, &pay);
+
+    let output = workspace.repl("/room vna\ninvestigate refund issue\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains("who should work on this?\n"));
+    assert!(stdout_output.contains("  @codex investigate refund issue\n"));
+    assert!(stdout_output.contains("  @pay investigate refund issue\n"));
+    assert!(!stderr(&output).contains("invalid command"));
+}
+
+#[test]
+fn repl_help_teaches_mentions_and_hides_threads() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_room("vna");
+
+    let output = workspace.repl("/room vna\n/help\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains("@cashpoint @pay implement refund flow"));
+    assert!(stdout_output.contains("/work [work]"));
+    assert!(!stdout_output.contains("/thread"));
+}
