@@ -1166,6 +1166,32 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
+            // In a Room, `/work` is the list of Works; inside one, its items.
+            "/work"
+                if arguments.is_empty() && contexts.last().unwrap().conversation_id().is_none() =>
+            {
+                let room_id = contexts
+                    .last()
+                    .unwrap()
+                    .room_id()
+                    .expect("room scope owns a room");
+                match service.list_threads(RoomRef::Id(room_id)).await {
+                    Ok(threads) => {
+                        for thread in threads {
+                            repl_write(
+                                stdout,
+                                format_args!(
+                                    "{}\t{}\t{}\n",
+                                    thread.id,
+                                    thread.status,
+                                    thread.title.as_deref().unwrap_or("untitled"),
+                                ),
+                            )?;
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
             "/work" if arguments.is_empty() => {
                 let conversation_id = contexts
                     .last()
@@ -1401,71 +1427,13 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
-            "/thread" if !arguments.is_empty() => {
-                let fields: Vec<_> = arguments.split_whitespace().collect();
-                let (thread, agent) = match fields.as_slice() {
-                    [thread] => (*thread, None),
-                    [thread, flag, agent] if *flag == "--agent" => (*thread, Some(*agent)),
-                    _ => {
-                        repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
-                        continue;
-                    }
-                };
-                let thread_id = match thread_id(thread) {
-                    Ok(thread_id) => thread_id,
-                    Err(error) => {
-                        repl_write(stderr, format_args!("{error}\n"))?;
-                        continue;
-                    }
-                };
-                let agent = match resolve_thread_agent(service, thread_id, agent).await {
-                    Ok(agent) => agent,
-                    Err(error) => {
-                        repl_write(stderr, format_args!("{error}\n"))?;
-                        continue;
-                    }
-                };
-                // A Thread is always entered from its Room.
-                let room_id = contexts
-                    .last()
-                    .unwrap()
-                    .room_id()
-                    .expect("room and thread scopes own a room");
-                if let Err(error) = require_thread_in_room(service, room_id, thread_id).await {
+            "/thread" | "/work" if !arguments.is_empty() => {
+                if let Some(error) = open_repl_work(
+                    service, workspace, contexts, registered, live, arguments, stdout,
+                )
+                .await?
+                {
                     repl_write(stderr, format_args!("{error}\n"))?;
-                    continue;
-                }
-                if !registered.contains(&agent.id) {
-                    if let Err(error) = register_acp_agent(workspace, &agent).await {
-                        repl_write(stderr, format_args!("{error}\n"))?;
-                        continue;
-                    }
-                    registered.insert(agent.id);
-                }
-                if let Err(error) = close_repl_context(live).await {
-                    repl_write(stderr, format_args!("{error}\n"))?;
-                    continue;
-                }
-                match open_repl_thread(workspace, &agent, thread_id, room_id).await {
-                    Ok((context, chat)) => {
-                        contexts.push(context);
-                        *live = Some(chat);
-                        repl_write(
-                            stdout,
-                            format_args!("thread\t{thread_id}\t{}\n", agent.name),
-                        )?;
-                    }
-                    Err(error) => {
-                        if let Err(restore) =
-                            restore_repl_context(service, workspace, contexts, live).await
-                        {
-                            return Err(CliError::OperationAndRestore {
-                                operation: Box::new(error),
-                                restore: restore.to_string(),
-                            });
-                        }
-                        repl_write(stderr, format_args!("{error}\n"))?;
-                    }
                 }
             }
             "/dm" if !arguments.is_empty() => {
@@ -1515,7 +1483,8 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             // A registered command with arguments it does not accept.
             _ => repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?,
         }
-        navigated = matches!(spec.name, "/room" | "/thread" | "/dm" | "/back");
+        navigated = matches!(spec.name, "/room" | "/thread" | "/dm" | "/back")
+            || (spec.name == "/work" && !arguments.is_empty());
     }
 }
 
@@ -1771,6 +1740,54 @@ async fn enter_repl_thread<R: crate::application::CollaborationRuntime>(
             recover_repl_context(service, workspace, contexts, live, error).await?,
         )),
     }
+}
+
+/// `<work> [--agent <agent>]`: enter an existing Work of the current Room.
+/// Backs both `/work <id>` and the legacy `/thread <id>`.
+#[allow(clippy::too_many_arguments)]
+async fn open_repl_work<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &mut Vec<ReplContext>,
+    registered: &mut HashSet<AgentId>,
+    live: &mut Option<ReplChat>,
+    arguments: &str,
+    stdout: &mut impl Write,
+) -> Result<Option<CliError>, CliError> {
+    let fields: Vec<_> = arguments.split_whitespace().collect();
+    let (work, agent) = match fields.as_slice() {
+        [work] => (*work, None),
+        [work, flag, agent] if *flag == "--agent" => (*work, Some(*agent)),
+        _ => return Ok(Some(CliError::InvalidCommand)),
+    };
+    let thread_id = match thread_id(work) {
+        Ok(thread_id) => thread_id,
+        Err(error) => return Ok(Some(error)),
+    };
+    let agent = match resolve_thread_agent(service, thread_id, agent).await {
+        Ok(agent) => agent,
+        Err(error) => return Ok(Some(error)),
+    };
+    // A Work is always entered from its Room.
+    let room_id = contexts
+        .last()
+        .unwrap()
+        .room_id()
+        .expect("room and thread scopes own a room");
+    if let Err(error) = require_thread_in_room(service, room_id, thread_id).await {
+        return Ok(Some(error));
+    }
+    let entered = enter_repl_thread(
+        service, workspace, contexts, registered, live, &agent, thread_id, room_id,
+    )
+    .await?;
+    if entered.is_none() {
+        repl_write(
+            stdout,
+            format_args!("thread\t{thread_id}\t{}\n", agent.name),
+        )?;
+    }
+    Ok(entered)
 }
 
 /// A failed switch must leave the previous context live; if even that fails the
