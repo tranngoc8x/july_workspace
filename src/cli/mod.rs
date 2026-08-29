@@ -1854,10 +1854,7 @@ async fn open_repl_work<R: crate::application::CollaborationRuntime>(
     )
     .await?;
     if entered.is_none() {
-        repl_write(
-            stdout,
-            format_args!("thread\t{thread_id}\t{}\n", agent.name),
-        )?;
+        repl_write(stdout, format_args!("work\t{thread_id}\t{}\n", agent.name))?;
     }
     Ok(entered)
 }
@@ -2249,7 +2246,7 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
                 .map(|binding| binding.status.to_string())
                 .unwrap_or_else(|| "unbound".into());
             let kind = match context {
-                ReplContext::Thread { .. } => "thread",
+                ReplContext::Thread { .. } => "work",
                 _ => "dm",
             };
             repl_write(

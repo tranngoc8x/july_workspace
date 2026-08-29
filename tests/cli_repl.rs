@@ -368,7 +368,7 @@ fn repl_root_commands_are_nonfatal_and_do_not_mutate_rooms() {
     assert!(stderr(&output).contains("already at root\n"));
     assert!(
         stderr(&output)
-            .contains("/members is unavailable in root context (available in: room, thread)\n")
+            .contains("/members is unavailable in root context (available in: room, work)\n")
     );
     assert_eq!(workspace.rooms(), 0);
 }
@@ -399,7 +399,7 @@ fn repl_help_is_context_aware_and_explains_one_command() {
     assert!(thread_help.contains("/publish <result> [--to <thread>]"));
     // Detailed help comes from the same registry metadata.
     assert!(stdout_output.contains("usage\n  /thread <thread> [--agent <agent>]"));
-    assert!(stdout_output.contains("contexts\n  room, thread"));
+    assert!(stdout_output.contains("contexts\n  room, work"));
     assert!(stderr(&output).contains("unknown command: nope\n"));
 }
 
@@ -456,7 +456,7 @@ fn repl_thread_new_creates_a_thread_in_the_current_room() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
         stderr(&output)
-            .contains("/thread new is unavailable in root context (available in: room, thread)\n")
+            .contains("/thread new is unavailable in root context (available in: room, work)\n")
     );
     assert_eq!(stderr(&output).matches("invalid command\n").count(), 1);
 
@@ -493,7 +493,7 @@ fn repl_inspection_commands_report_workspace_state_without_mutating_it() {
     assert!(stdout_output.contains(&format!("{}\tcodex\t", codex.id)));
     assert!(
         stderr(&output)
-            .contains("/work is unavailable in root context (available in: room, thread)\n")
+            .contains("/work is unavailable in root context (available in: room, work)\n")
     );
     assert!(stdout_output.contains("\tSettlement\t"));
     assert!(stdout_output.contains(&format!("{result_id}\t")));
@@ -690,7 +690,7 @@ fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
         stderr(&output)
-            .contains("/members is unavailable in dm context (available in: room, thread)\n")
+            .contains("/members is unavailable in dm context (available in: room, work)\n")
     );
     assert!(stderr(&output).contains("agent missing does not exist\n"));
     assert!(stdout(&output).contains("dm\t"));
@@ -756,8 +756,8 @@ fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout_output = stdout(&output);
-    assert!(stdout_output.contains(&format!("thread\t{settlement}\tcodex\n")));
-    assert!(stdout_output.contains(&format!("thread\t{refunds}\tcodex\n")));
+    assert!(stdout_output.contains(&format!("work\t{settlement}\tcodex\n")));
+    assert!(stdout_output.contains(&format!("work\t{refunds}\tcodex\n")));
 
     let dm_conversation: String = Connection::open(&workspace.database)
         .unwrap()
@@ -803,9 +803,7 @@ fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
         .lines()
         .find(|line| {
             let fields: Vec<_> = line.split('\t').collect();
-            fields.len() == 5
-                && fields[0].ends_with("thread")
-                && fields[1] == settlement.to_string()
+            fields.len() == 5 && fields[0].ends_with("work") && fields[1] == settlement.to_string()
         })
         .unwrap_or_else(|| panic!("missing thread status in stdout: {stdout_output}"));
     let fields: Vec<_> = status.split('\t').collect();
@@ -1198,12 +1196,10 @@ fn repl_publish_resolves_the_single_downstream_target() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(
-        stderr(&output)
-            .contains("/publish is unavailable in root context (available in: thread)\n")
+        stderr(&output).contains("/publish is unavailable in root context (available in: work)\n")
     );
     assert!(
-        stderr(&output)
-            .contains("/publish is unavailable in room context (available in: thread)\n")
+        stderr(&output).contains("/publish is unavailable in room context (available in: work)\n")
     );
     assert!(stderr(&output).contains("usage: july dm <agent>"));
     let published = stdout(&output)
@@ -1430,7 +1426,7 @@ fn repl_sigint_during_thread_permission_cancels_the_turn_and_keeps_the_context()
         .write_all(b"/status\n/quit\n")
         .unwrap();
     let status = output.read_until(b"active\n");
-    assert!(status.contains(&format!("thread\t{settlement}\tcodex\t")));
+    assert!(status.contains(&format!("work\t{settlement}\tcodex\t")));
 
     let exit = wait_for_exit(&mut child, Duration::from_secs(2));
     if exit.is_none() {
@@ -1631,7 +1627,7 @@ fn repl_work_lists_room_work_and_opens_one_without_thread() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout_output = stdout(&output);
     assert!(stdout_output.contains(&format!("{refunds}\topen\tRefund flow\n")));
-    assert!(stdout_output.contains(&format!("thread\t{refunds}\tcodex\n")));
+    assert!(stdout_output.contains(&format!("work\t{refunds}\tcodex\n")));
     assert_eq!(
         workspace
             .messages(refunds)

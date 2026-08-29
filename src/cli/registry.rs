@@ -7,7 +7,8 @@
 use std::fmt;
 
 /// Explicit interactive scopes. There is deliberately no generic
-/// `Conversation` scope: DM and Thread differ in what they expose.
+/// `Conversation` scope: direct work and Work differ in what they expose.
+/// `Thread` is the internal name of the scope users see as `work`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandScope {
     Root,
@@ -24,7 +25,7 @@ impl CommandScope {
             Self::Root => "root",
             Self::Room => "room",
             Self::Dm => "dm",
-            Self::Thread => "thread",
+            Self::Thread => "work",
         }
     }
 }
@@ -442,6 +443,6 @@ mod tests {
     fn detailed_help_reports_registry_metadata() {
         let rendered = help_command(find("exit").unwrap());
         assert!(rendered.contains("aliases\n  /quit"));
-        assert!(rendered.contains("contexts\n  root, room, dm, thread"));
+        assert!(rendered.contains("contexts\n  root, room, dm, work"));
     }
 }
