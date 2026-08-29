@@ -550,9 +550,8 @@ Quy tắc bổ sung:
 | `/help [command]` | mọi context | Xem help theo context |
 | `/exit`, `/quit` | mọi context | Thoát July |
 
-Một số output và nhãn context vẫn dùng chữ `thread` — đó là tên nội bộ của
-Work. Ví dụ `/work <id>` xác nhận bằng `thread\t<work-id>\t<agent>`, và
-`/help work` ghi `contexts: room, thread`.
+`/work <id>` xác nhận bằng `work\t<work-id>\t<agent>`; `/status` trong một Work
+in `work\t<work-id>\t<agent>\t<binding-id>\t<trạng thái>`.
 
 Hai command legacy vẫn chạy nhưng không còn xuất hiện trong `/help`:
 `/thread <id> [--agent <agent>]` (tương đương `/work <id>`) và
@@ -823,18 +822,9 @@ Command surface hiện tại không có:
 Các giới hạn này là chủ ý của phiên bản hiện tại, không phải bước cấu hình còn
 thiếu.
 
-Hai giới hạn của giao diện, không phải chủ ý:
-
-- Plain prompt trong Room in ra danh sách gợi ý chứ chưa phải selector bấm
-  chọn được; bạn chọn bằng cách gõ lại một dòng.
-- **Trong full-screen TUI, output của các command inspection (`/rooms`,
-  `/agents`, `/members`, `/work`, `/results`, `/status`) hiện không hiển thị.**
-  Chúng chạy và trả kết quả bình thường ở line REPL. Muốn xem trong lúc chờ
-  bản sửa, chạy qua pipe:
-
-  ```bash
-  printf '/room VNA\n/work\n/quit\n' | july
-  ```
+Một giới hạn của giao diện, không phải chủ ý: plain prompt trong Room in ra
+danh sách gợi ý chứ chưa phải selector bấm chọn được; bạn chọn bằng cách gõ
+lại một dòng.
 
 ## 15. Cheat sheet
 
