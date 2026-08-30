@@ -6,13 +6,17 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
     MouseEventKind,
 };
+#[cfg(not(windows))]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
-use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::{Terminal, style::Color};
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +30,13 @@ mod markdown;
 pub mod ui;
 
 use app::{App, Context};
+
+pub(crate) const AGENT_COLOR: Color = Color::Rgb(208, 215, 222);
+pub(crate) const USER_COLOR: Color = Color::Rgb(121, 192, 255);
+pub(crate) const COMMAND_OUTPUT_COLOR: Color = Color::Rgb(126, 231, 135);
+pub(crate) const SYSTEM_COLOR: Color = Color::Rgb(227, 179, 65);
+pub(crate) const ERROR_COLOR: Color = Color::Rgb(255, 123, 114);
+pub(crate) const CODE_COLOR: Color = Color::Rgb(13, 205, 205);
 
 /// Failure from the terminal operation, restoration, or both.
 #[derive(Debug)]
@@ -74,6 +85,8 @@ struct TerminalGuard<W: Write, R: RawMode> {
     writer: W,
     raw_mode: R,
     active: bool,
+    #[cfg(not(windows))]
+    keyboard_enhanced: bool,
 }
 
 impl<W: Write, R: RawMode> TerminalGuard<W, R> {
@@ -83,6 +96,8 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             writer,
             raw_mode,
             active: true,
+            #[cfg(not(windows))]
+            keyboard_enhanced: false,
         };
         if let Err(operation) =
             execute!(guard.writer, EnterAlternateScreen, EnableMouseCapture, Hide)
@@ -91,6 +106,19 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
                 Ok(()) => Err(ShellError::Operation(operation)),
                 Err(restore) => Err(ShellError::OperationAndRestore { operation, restore }),
             };
+        }
+        #[cfg(not(windows))]
+        {
+            guard.keyboard_enhanced = true;
+            if let Err(operation) = execute!(
+                guard.writer,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            ) {
+                return match guard.restore() {
+                    Ok(()) => Err(ShellError::Operation(operation)),
+                    Err(restore) => Err(ShellError::OperationAndRestore { operation, restore }),
+                };
+            }
         }
         Ok(guard)
     }
@@ -101,10 +129,21 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
         }
         self.active = false;
 
+        #[cfg(not(windows))]
+        let keyboard = if self.keyboard_enhanced {
+            self.keyboard_enhanced = false;
+            execute!(self.writer, PopKeyboardEnhancementFlags)
+        } else {
+            Ok(())
+        };
         let show = execute!(self.writer, Show);
         let leave = execute!(self.writer, DisableMouseCapture, LeaveAlternateScreen);
         let raw = self.raw_mode.disable();
         let mut errors = Vec::new();
+        #[cfg(not(windows))]
+        if let Err(error) = keyboard {
+            errors.push(format!("restore keyboard input failed: {error}"));
+        }
         if let Err(error) = show {
             errors.push(format!("show cursor failed: {error}"));
         }
@@ -496,7 +535,11 @@ mod tests {
 
         let output = output.borrow();
         assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049h"));
+        #[cfg(not(windows))]
+        assert!(output.windows(5).any(|bytes| bytes == b"\x1b[>1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25l"));
+        #[cfg(not(windows))]
+        assert!(output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
         assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         assert_eq!(*calls.borrow(), ["enable", "disable"]);
@@ -555,6 +598,8 @@ mod tests {
 
         assert!(result.is_err());
         let output = output.borrow();
+        #[cfg(not(windows))]
+        assert!(output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
         assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         assert_eq!(*calls.borrow(), ["enable", "disable"]);

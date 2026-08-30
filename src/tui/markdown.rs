@@ -1,13 +1,20 @@
 use std::borrow::Cow;
 
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use tui_markdown::{Options, StyleSheet, from_str_with_options};
+
+use super::{AGENT_COLOR, CODE_COLOR};
 
 #[derive(Clone, Copy)]
 struct JulyStyleSheet;
 
 impl StyleSheet for JulyStyleSheet {
+    fn code(&self) -> Style {
+        Style::new().fg(CODE_COLOR)
+    }
+
     fn code_block_fence(&self) -> &str {
         ""
     }
@@ -23,7 +30,11 @@ pub(super) fn render(markdown: &str) -> Text<'static> {
             .into_iter()
             .map(|line| Line {
                 alignment: line.alignment,
-                style: line.style,
+                style: if line.width() == 0 {
+                    line.style
+                } else {
+                    Style::new().fg(AGENT_COLOR).patch(line.style)
+                },
                 spans: line
                     .spans
                     .into_iter()
@@ -82,8 +93,14 @@ impl MarkdownStream {
         }
     }
 
-    pub(super) fn push_plain(&mut self, text: String) {
-        self.completed.push(Text::from(text));
+    pub(super) fn push_plain(&mut self, text: String, color: Color) {
+        let style = Style::new().fg(color);
+        let lines = Text::from(text)
+            .lines
+            .into_iter()
+            .map(|line| line.patch_style(style))
+            .collect::<Vec<_>>();
+        self.completed.push(Text::from(lines));
     }
 
     pub(super) fn tail(&self) -> &str {
@@ -162,6 +179,8 @@ fn markdown_options() -> MarkdownOptions {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
+
     use super::MarkdownStream;
 
     fn completed(chunks: impl IntoIterator<Item = String>) -> ratatui::text::Text<'static> {
@@ -171,6 +190,24 @@ mod tests {
         }
         stream.finish();
         stream.text()
+    }
+
+    #[test]
+    fn agent_body_and_inline_code_use_the_palette_without_hiding_markdown_styles() {
+        let rendered = super::render("result `code`\n\n> quote");
+        let foreground = |content: &str| {
+            rendered.lines.iter().find_map(|line| {
+                line.spans.iter().find_map(|span| {
+                    (span.content == content)
+                        .then(|| rendered.style.patch(line.style).patch(span.style).fg)
+                        .flatten()
+                })
+            })
+        };
+
+        assert_eq!(foreground("result "), Some(Color::Rgb(208, 215, 222)));
+        assert_eq!(foreground("code"), Some(Color::Rgb(13, 205, 205)));
+        assert_eq!(foreground("quote"), Some(Color::Green));
     }
 
     #[test]
