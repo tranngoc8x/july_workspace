@@ -2,16 +2,20 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use super::markdown::MarkdownStream;
+use super::{COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
 use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
 use crate::domain::{PermissionOption, PermissionOutcome};
 
 pub const CHAT_BATCH_LIMIT: usize = 32;
+const NON_INPUT_ROWS: u16 = 3;
+pub(crate) const INPUT_HORIZONTAL_MARGIN: u16 = 1;
+pub(crate) const INPUT_VERTICAL_MARGIN: u16 = 1;
 
 /// Braille frames for the "agent is working" indicator.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -200,8 +204,15 @@ impl PermissionModal {
 /// `TextArea` underlines the cursor line by default, which reads as the typed
 /// text being underlined; the input keeps a plain line style instead.
 fn new_input() -> TextArea<'static> {
-    let mut input = TextArea::default();
+    input_with("")
+}
+
+fn input_with(text: &str) -> TextArea<'static> {
+    let mut input = TextArea::from(text.split('\n'));
     input.set_cursor_line_style(Style::default());
+    input.set_wrap_mode(WrapMode::WordOrGlyph);
+    input.move_cursor(CursorMove::Bottom);
+    input.move_cursor(CursorMove::End);
     input
 }
 
@@ -217,6 +228,9 @@ pub struct App {
     permission: Option<PermissionModal>,
     error: Option<String>,
     agents: Vec<String>,
+    prompt_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: Option<String>,
     tick: usize,
     exit_requested: bool,
 }
@@ -235,6 +249,9 @@ impl App {
             permission: None,
             error: None,
             agents: Vec::new(),
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: None,
             tick: 0,
             exit_requested: false,
         }
@@ -250,6 +267,23 @@ impl App {
 
     pub(crate) fn input_widget(&self) -> &TextArea<'static> {
         &self.input
+    }
+
+    pub(crate) fn input_height(&self) -> u16 {
+        let width = self
+            .viewport
+            .width
+            .saturating_sub(INPUT_HORIZONTAL_MARGIN.saturating_mul(2))
+            .max(1);
+        let visual_rows = Paragraph::new(self.input())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        let content_rows = u16::try_from(visual_rows.max(self.input.lines().len()))
+            .unwrap_or(u16::MAX)
+            .max(1);
+        content_rows
+            .saturating_add(INPUT_VERTICAL_MARGIN.saturating_mul(2))
+            .min(self.viewport.height.saturating_sub(NON_INPUT_ROWS).max(1))
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -302,7 +336,7 @@ impl App {
             }
             lines.push(Line::from(Span::styled(
                 format!("{frame} {label}…"),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(SYSTEM_COLOR),
             )));
         }
         Text {
@@ -355,7 +389,26 @@ impl App {
 
     pub fn reduce(&mut self, event: AppEvent) -> Vec<AppCommand> {
         match event {
-            AppEvent::Key(key) => self.reduce_key(key),
+            AppEvent::Key(key) => {
+                let old_input_height = self.input_height();
+                let old_max_scroll = self.max_scroll_offset();
+                let was_following_tail = self.follow_tail;
+                let commands = self.reduce_key(key);
+                if self.input_height() != old_input_height {
+                    let new_max_scroll = self.max_scroll_offset();
+                    if !was_following_tail {
+                        self.scroll_offset = if new_max_scroll >= old_max_scroll {
+                            self.scroll_offset
+                                .saturating_add(new_max_scroll - old_max_scroll)
+                        } else {
+                            self.scroll_offset
+                                .saturating_sub(old_max_scroll - new_max_scroll)
+                        };
+                    }
+                    self.clamp_scroll(new_max_scroll);
+                }
+                commands
+            }
             AppEvent::Resize { width, height } => {
                 self.viewport = Viewport::new(width, height);
                 let max_scroll = self.max_scroll_offset();
@@ -436,6 +489,20 @@ impl App {
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_by(1, false);
             }
+            KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
+                let cursor = self.input.cursor();
+                self.input.input(key);
+                if self.input.cursor() == cursor {
+                    self.history_up();
+                }
+            }
+            KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
+                let cursor = self.input.cursor();
+                self.input.input(key);
+                if self.input.cursor() == cursor {
+                    self.history_down();
+                }
+            }
             KeyCode::Home => self.scroll_by(usize::MAX, true),
             KeyCode::End => {
                 self.scroll_offset = 0;
@@ -443,6 +510,16 @@ impl App {
             }
             KeyCode::Tab if key.modifiers == KeyModifiers::NONE => self.complete_mention(),
             KeyCode::Enter if key.modifiers == KeyModifiers::NONE => return self.submit(),
+            KeyCode::Enter => {
+                self.input.insert_newline();
+                self.history_index = None;
+                self.history_draft = None;
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.insert_newline();
+                self.history_index = None;
+                self.history_draft = None;
+            }
             KeyCode::Esc => self.exit_requested = true,
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.turn == TurnState::Idle && self.input().is_empty() {
@@ -450,7 +527,12 @@ impl App {
                 }
             }
             _ => {
+                let before = self.input();
                 self.input.input(key);
+                if self.input() != before {
+                    self.history_index = None;
+                    self.history_draft = None;
+                }
             }
         }
         Vec::new()
@@ -518,6 +600,8 @@ impl App {
             }
             TurnState::Idle if !self.input().is_empty() => {
                 self.input = new_input();
+                self.history_index = None;
+                self.history_draft = None;
                 Vec::new()
             }
             TurnState::Idle => {
@@ -585,6 +669,34 @@ impl App {
         }
     }
 
+    fn history_up(&mut self) {
+        let Some(last) = self.prompt_history.len().checked_sub(1) else {
+            return;
+        };
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => {
+                self.history_draft = Some(self.input());
+                last
+            }
+        };
+        self.history_index = Some(index);
+        self.input = input_with(&self.prompt_history[index]);
+    }
+
+    fn history_down(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 < self.prompt_history.len() {
+            self.history_index = Some(index + 1);
+            self.input = input_with(&self.prompt_history[index + 1]);
+        } else {
+            self.history_index = None;
+            self.input = input_with(self.history_draft.take().as_deref().unwrap_or(""));
+        }
+    }
+
     fn submit(&mut self) -> Vec<AppCommand> {
         if self.pending.is_some() || self.turn != TurnState::Idle {
             return Vec::new();
@@ -598,6 +710,9 @@ impl App {
         // Leading blanks must not turn a command into chat.
         let command = text.trim_start().starts_with('/');
 
+        self.prompt_history.push(text.clone());
+        self.history_index = None;
+        self.history_draft = None;
         self.input = new_input();
         self.freeze_stream();
         self.markdown.push_plain(
@@ -605,6 +720,7 @@ impl App {
                 .map(|line| format!("› {line}"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            USER_COLOR,
         );
         self.turn = TurnState::Active;
         let context = self.context.id.clone();
@@ -637,7 +753,7 @@ impl App {
                 // Command output belongs in the transcript: it can be long,
                 // and the footer is one line.
                 self.freeze_stream();
-                self.markdown.push_plain(output);
+                self.markdown.push_plain(output, COMMAND_OUTPUT_COLOR);
                 self.turn = TurnState::Idle;
             }
             CommandResult::Failed(error) => {
@@ -687,12 +803,13 @@ impl App {
             ChatEvent::TurnFailed(failure) => {
                 self.freeze_stream();
                 self.markdown
-                    .push_plain(format!("error: {}", failure_label(failure)));
+                    .push_plain(format!("error: {}", failure_label(failure)), ERROR_COLOR);
                 self.finish_turn();
             }
             ChatEvent::Disconnected(reason) => {
                 self.freeze_stream();
-                self.markdown.push_plain(format!("error: {reason}"));
+                self.markdown
+                    .push_plain(format!("error: {reason}"), ERROR_COLOR);
                 self.finish_turn();
             }
             ChatEvent::PermissionRequested {
@@ -745,7 +862,12 @@ impl App {
 
     /// Rows the transcript pane owns: the frame minus header, input and hints.
     fn transcript_rows(&self) -> usize {
-        usize::from(self.viewport.height.saturating_sub(5)).max(1)
+        usize::from(
+            self.viewport
+                .height
+                .saturating_sub(self.input_height().saturating_add(2)),
+        )
+        .max(1)
     }
 
     fn clamp_scroll(&mut self, max_scroll: usize) {
@@ -786,6 +908,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use ratatui::style::Color;
 
     use super::*;
     use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
@@ -799,12 +922,76 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::ALT)
     }
 
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
     fn ctrl_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
     fn repeat_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat)
+    }
+
+    fn foreground_of(text: &Text<'_>, content: &str) -> Option<Color> {
+        text.lines.iter().find_map(|line| {
+            line.spans.iter().find_map(|span| {
+                span.content
+                    .contains(content)
+                    .then(|| text.style.patch(line.style).patch(span.style).fg)
+                    .flatten()
+            })
+        })
+    }
+
+    #[test]
+    fn transcript_sources_use_distinct_palette_colors() {
+        let mut app = App::new(Context::root());
+        for character in "/help".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Output {
+                context: Context::root(),
+                output: "command output".into(),
+            },
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "agent response".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::Disconnected("offline".into())));
+
+        let transcript = app.transcript_text();
+        assert_eq!(
+            foreground_of(&transcript, "› /help"),
+            Some(Color::Rgb(121, 192, 255))
+        );
+        assert_eq!(
+            foreground_of(&transcript, "command output"),
+            Some(Color::Rgb(126, 231, 135))
+        );
+        assert_eq!(
+            foreground_of(&transcript, "agent response"),
+            Some(Color::Rgb(208, 215, 222))
+        );
+        assert_eq!(
+            foreground_of(&transcript, "error: offline"),
+            Some(Color::Rgb(255, 123, 114))
+        );
+    }
+
+    #[test]
+    fn active_turn_spinner_uses_the_system_palette_color() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("response".into())));
+
+        assert_eq!(
+            foreground_of(&app.transcript_text(), "working"),
+            Some(Color::Rgb(227, 179, 65))
+        );
     }
 
     #[test]
@@ -843,6 +1030,93 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_keeps_a_newline_in_the_exact_submitted_text() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Key(key(KeyCode::Char('a'))));
+        app.reduce(AppEvent::Key(shift_key(KeyCode::Enter)));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('b'))));
+
+        assert_eq!(app.input(), "a\nb");
+        app.reduce(AppEvent::Key(alt_key(KeyCode::Char('j'))));
+        assert_eq!(app.input(), "a\nb");
+    }
+
+    #[test]
+    fn legacy_ctrl_enter_ctrl_j_keeps_a_newline() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Key(key(KeyCode::Char('a'))));
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('j'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('b'))));
+
+        assert_eq!(app.input(), "a\nb");
+    }
+
+    #[test]
+    fn arrow_keys_recall_submitted_prompts_and_restore_the_draft() {
+        let mut app = App::new(Context::root());
+        for prompt in ["first", "second"] {
+            for character in prompt.chars() {
+                app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+            }
+            app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+            app.reduce(AppEvent::CommandFinished {
+                context: ContextId::root(),
+                result: CommandResult::Submitted,
+            });
+            app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        }
+        for character in "draft".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        assert_eq!(app.input(), "second");
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        assert_eq!(app.input(), "first");
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        assert_eq!(app.input(), "second");
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        assert_eq!(app.input(), "draft");
+        app.reduce(AppEvent::Key(key(KeyCode::Char('!'))));
+        assert_eq!(app.input(), "draft!");
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('?'))));
+        assert_eq!(app.input(), "second?");
+    }
+
+    #[test]
+    fn arrow_keys_move_the_multiline_cursor_before_opening_history() {
+        let mut app = App::new(Context::root());
+        for character in "saved".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Submitted,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        for character in "top".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
+        for character in "bottom".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        assert_eq!(app.input(), "top\nbottom");
+        assert_eq!(app.input.cursor().0, 0);
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        assert_eq!(app.input.cursor().0, 1);
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        assert_eq!(app.input(), "saved");
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        assert_eq!(app.input(), "top\nbottom");
+    }
+
+    #[test]
     fn viewport_scroll_disables_follow_tail_until_end_and_resize_clamps_it() {
         let mut app = App::new(Context::root());
 
@@ -867,6 +1141,46 @@ mod tests {
         assert_eq!(app.viewport(), Viewport::new(80, 24));
         assert_eq!(app.scroll_offset(), 0);
         assert!(app.follow_tail());
+    }
+
+    #[test]
+    fn shrinking_input_clamps_the_transcript_scroll() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 10,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "one two three four five six seven eight nine ten".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        for _ in 0..4 {
+            app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Home)));
+
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+
+        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
+    }
+
+    #[test]
+    fn growing_input_preserves_the_manually_scrolled_transcript_row() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            (0..20).map(|row| format!("{row}  \n")).collect(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        app.reduce(AppEvent::Scroll { up: true, rows: 2 });
+        let visible_row = app.transcript_scroll();
+
+        app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
+
+        assert_eq!(app.transcript_scroll(), visible_row);
     }
 
     #[test]
@@ -1115,7 +1429,7 @@ mod tests {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
             width: 4,
-            height: 7,
+            height: 8,
         });
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "1234567890123456".into(),
@@ -1204,7 +1518,7 @@ mod tests {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
             width: 4,
-            height: 7,
+            height: 6,
         });
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
             "1234567890123456".into(),
@@ -1215,7 +1529,7 @@ mod tests {
         }
 
         assert_eq!(app.scroll_offset(), app.max_scroll_offset());
-        assert_eq!(app.scroll_offset(), 2);
+        assert_eq!(app.scroll_offset(), 3);
     }
 
     #[test]

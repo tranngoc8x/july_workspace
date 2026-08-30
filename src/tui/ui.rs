@@ -1,10 +1,13 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use super::app::{App, PermissionModal, TurnState};
+use super::app::{App, INPUT_HORIZONTAL_MARGIN, INPUT_VERTICAL_MARGIN, PermissionModal, TurnState};
+use super::{ERROR_COLOR, SYSTEM_COLOR};
+
+const INPUT_BACKGROUND_COLOR: Color = Color::Rgb(48, 54, 61);
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -16,13 +19,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(3),
+        Constraint::Length(app.input_height()),
         Constraint::Length(1),
     ])
     .split(area);
     let (dot_color, turn_label) = match app.turn_state() {
         TurnState::Idle => (Color::Green, "idle"),
-        TurnState::Active => (Color::Yellow, "working"),
+        TurnState::Active => (SYSTEM_COLOR, "working"),
         TurnState::Cancelling => (Color::Magenta, "cancelling"),
         TurnState::CancelAcknowledged => (Color::DarkGray, "cancelled"),
     };
@@ -42,22 +45,27 @@ pub fn render(frame: &mut Frame, app: &App) {
         areas[1],
     );
 
-    let input = Block::bordered().title("input");
-    let input_area = input.inner(areas[2]);
-    frame.render_widget(input, areas[2]);
+    let input_area = areas[2].inner(Margin {
+        horizontal: INPUT_HORIZONTAL_MARGIN,
+        vertical: INPUT_VERTICAL_MARGIN,
+    });
+    frame.render_widget(
+        Block::default().style(Style::default().bg(INPUT_BACKGROUND_COLOR)),
+        areas[2],
+    );
     frame.render_widget(app.input_widget(), input_area);
     let completions = app.completions();
     let footer = match (app.error(), completions.is_empty()) {
         (Some(error), _) => Line::from(Span::styled(
             format!("! {error}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(ERROR_COLOR),
         )),
         // While an `@` is being typed, the footer is the agent picker.
         (None, false) => Line::from(Span::styled(
             format!("Tab  {}", completions.join("  ")),
             Style::default().fg(Color::Cyan),
         )),
-        (None, true) => Line::from("Enter send · Alt+Enter newline · wheel/PgUp scroll · Esc exit"),
+        (None, true) => Line::from("July workspace · Esc exit"),
     };
     frame.render_widget(Paragraph::new(footer), areas[3]);
 
@@ -67,7 +75,8 @@ pub fn render(frame: &mut Frame, app: &App) {
             .height
             .saturating_sub(2)
             .min((permission.options().len() as u16).saturating_add(7))
-            .max(5);
+            .max(5)
+            .min(area.height);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -133,6 +142,7 @@ fn permission_scroll(permission: &PermissionModal, lines: &[Line<'_>], area: Rec
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
 
     use crate::application::ChatEvent;
     use crate::domain::PermissionOption;
@@ -154,6 +164,151 @@ mod tests {
     }
 
     #[test]
+    fn input_surface_has_horizontal_and_vertical_padding() {
+        let mut app = App::new(Context::root());
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        app.reduce(AppEvent::Resize {
+            width: 30,
+            height: 12,
+        });
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(app.input_height(), 3);
+        assert_eq!(buffer.cell((0, 9)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((1, 9)).unwrap().symbol(), "a");
+        for y in 8..=10 {
+            assert_eq!(buffer.cell((0, y)).unwrap().bg, Color::Rgb(48, 54, 61));
+            assert_eq!(buffer.cell((1, y)).unwrap().bg, Color::Rgb(48, 54, 61));
+        }
+    }
+
+    #[test]
+    fn input_grows_past_five_rows_until_terminal_space_is_full() {
+        let mut app = App::new(Context::root());
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+        app.reduce(AppEvent::Resize {
+            width: 30,
+            height: 12,
+        });
+
+        for _ in 0..7 {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::ALT,
+            )));
+        }
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(app.input_height(), 9);
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 2)).unwrap().bg,
+            Color::Rgb(48, 54, 61)
+        );
+
+        for _ in 0..4 {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::ALT,
+            )));
+        }
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(app.input_height(), 9);
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 2)).unwrap().bg,
+            Color::Rgb(48, 54, 61)
+        );
+    }
+
+    #[test]
+    fn long_input_soft_wraps_and_grows() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 12,
+            height: 10,
+        });
+        for character in "abcdefghijkl".chars() {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+
+        assert_eq!(app.input_height(), 4);
+    }
+
+    #[test]
+    fn arrow_up_moves_within_a_soft_wrapped_line() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 12,
+            height: 10,
+        });
+        for character in "abcdefghijkl".chars() {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('X'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.input(), "abXcdefghijkl");
+    }
+
+    #[test]
+    fn minimum_layout_still_renders_the_editor() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 12,
+            height: 6,
+        });
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(
+            terminal.backend().buffer().cell((1, 3)).unwrap().symbol(),
+            "a"
+        );
+    }
+
+    #[test]
+    fn minimum_layout_bounds_the_permission_modal() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "permission-small".to_owned().into(),
+            prompt: "Allow?".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+    }
+
+    #[test]
     fn tall_transcript_follows_the_actual_tail() {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
@@ -166,7 +321,7 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        // Spacer rows sit between transcript lines, so the tail starts at "7".
+        // The five-row viewport starts at "7" and keeps the latest row visible.
         assert_eq!(
             terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
             "7"

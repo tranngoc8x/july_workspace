@@ -1,21 +1,25 @@
 #![cfg(unix)]
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use july_workspace::tui::{run_app, run_inactive_shell, with_terminal};
+use july_workspace::tui::{app::AppCommand, run_app, run_inactive_shell, with_terminal};
 
 const CHILD_MODE: &str = "JULY_TUI_TEST_CHILD";
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h";
 const LEAVE_SCREEN: &[u8] = b"\x1b[?1049l";
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+const PUSH_KEYBOARD: &[u8] = b"\x1b[>1u";
+const POP_KEYBOARD: &[u8] = b"\x1b[<1u";
 
 #[test]
 fn terminal_child() {
@@ -47,6 +51,27 @@ fn terminal_child() {
             .unwrap()
             .block_on(run_app(Vec::new(), |_| Ok(()), || Ok(None)))
             .unwrap(),
+        "active-shift-enter" => {
+            let submitted = Rc::new(Cell::new(false));
+            let observed = submitted.clone();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(run_app(
+                    Vec::new(),
+                    move |command| {
+                        if let AppCommand::Submit { text, .. } = command {
+                            assert_eq!(text, "a\nb");
+                            observed.set(true);
+                        }
+                        Ok(())
+                    },
+                    || Ok(None),
+                ))
+                .unwrap();
+            assert!(submitted.get());
+        }
         mode => panic!("unknown child mode: {mode}"),
     }
 }
@@ -79,6 +104,16 @@ fn active_pty_ctrl_c_restores_terminal() {
     let mut child = spawn_pty("active");
     child.wait_for(ENTER_SCREEN);
     child.master.write_all(b"\x03").unwrap();
+    assert_restored(child, None);
+}
+
+#[test]
+fn enhanced_shift_enter_reaches_the_reducer_as_a_newline() {
+    let mut child = spawn_pty("active-shift-enter");
+    child.wait_for(PUSH_KEYBOARD);
+    child.master.write_all(b"a\x1b[13;2ub\r").unwrap();
+    child.wait_for(b"working");
+    child.master.write_all(b"\x03\x03").unwrap();
     assert_restored(child, None);
 }
 
@@ -359,6 +394,14 @@ fn assert_restored(child: PtyChild, context: Option<String>) {
         "{context} never entered alternate screen"
     );
     assert!(contains(&output, HIDE_CURSOR), "{context} never hid cursor");
+    assert!(
+        contains(&output, PUSH_KEYBOARD),
+        "{context} never enabled keyboard enhancement"
+    );
+    assert!(
+        contains(&output, POP_KEYBOARD),
+        "{context} never restored keyboard input"
+    );
     assert!(
         contains(&output, SHOW_CURSOR),
         "{context} never restored cursor"

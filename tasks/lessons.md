@@ -4,3 +4,6 @@
 - Khi thêm aggregate/lifecycle transaction, phải tìm và xóa hoặc thu hẹp mọi public primitive cũ có thể ghi từng phần; đồng thời chuyển toàn bộ caller và fixture sang invariant-preserving path trước khi báo hoàn tất.
 - Khi đổi hướng hoặc thay dependency sau một prototype, phải gỡ import, call site, test và lockfile của prototype trong cùng một bước rồi chạy `cargo check`; không để worktree ở trạng thái nửa migration.
 - Khi Sếp yêu cầu “hướng dẫn sử dụng” trong một repository cụ thể, mặc định đối tượng là sản phẩm của repository đó; phải đọc ngữ cảnh workspace trước, không hỏi lệch sang công cụ nội bộ như Beads hay Ponytail.
+- Với phím modifier trong TUI, unit test tạo `KeyEvent` thủ công không chứng minh terminal thật phát ra event đó; phải kiểm tra protocol/capability và có verification qua PTY hoặc event capture trước khi báo hỗ trợ.
+- Với editor tự giãn, không tự biến giới hạn UX tạm thời thành giới hạn sản phẩm; nếu Sếp yêu cầu bỏ max cố định thì chỉ giữ giới hạn vật lý của viewport và để widget cuộn nội bộ khi hết chỗ.
+- Khi đang ở approval gate, phải nói rõ thay đổi chưa được áp dụng; không để Sếp hiểu bản thiết kế vừa trình bày là trạng thái UI đã chạy.
