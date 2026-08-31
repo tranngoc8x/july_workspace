@@ -1079,6 +1079,39 @@ async fn inactive_tui_bridge_buffers_raw_events_while_execute_waits_for_its_comp
 }
 
 #[tokio::test]
+async fn inactive_tui_bridge_keeps_the_context_after_a_failed_turn() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--protocol-error"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(Context::root());
+
+    let opened = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+
+    for prompt in ["first failed turn", "second failed turn"] {
+        let submitted = bridge.execute(tui_command(&mut app, prompt)).await.unwrap();
+        app.reduce(submitted);
+        let failed = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            failed,
+            AppEvent::Chat(ChatEvent::TurnFailed(
+                july_workspace::application::ChatFailureKind::Protocol
+            ))
+        ));
+        app.reduce(failed);
+    }
+
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn tui_bridge_delivers_the_selected_permission_without_text_input() {
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &[]);

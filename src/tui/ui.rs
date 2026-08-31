@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             format!("Tab  {}", completions.join("  ")),
             Style::default().fg(Color::Cyan),
         )),
-        (None, true) => Line::from("July workspace · Esc exit"),
+        (None, true) => Line::from("July workspace · /exit to leave"),
     };
     frame.render_widget(Paragraph::new(footer), areas[3]);
 

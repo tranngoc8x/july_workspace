@@ -520,7 +520,7 @@ impl App {
                 self.history_index = None;
                 self.history_draft = None;
             }
-            KeyCode::Esc => self.exit_requested = true,
+            KeyCode::Esc => {}
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.turn == TurnState::Idle && self.input().is_empty() {
                     self.exit_requested = true;
@@ -1638,6 +1638,14 @@ mod tests {
         );
         assert!(app.permission().is_none());
         assert_eq!(app.error(), Some("permission request had no choices"));
+    }
+
+    #[test]
+    fn escape_outside_permission_does_not_request_exit() {
+        let mut app = App::new(Context::root());
+
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Esc))).is_empty());
+        assert!(!app.exit_requested());
     }
 
     #[test]

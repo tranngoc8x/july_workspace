@@ -476,7 +476,7 @@ TUI và line REPL dùng cùng context model và cùng slash-command registry.
 | `Alt+Enter` | Xuống dòng trong editor |
 | `PageUp` / `PageDown` | Cuộn transcript |
 | `End` | Trở lại cuối transcript và bật follow-tail |
-| `Esc` | Thoát TUI khi không có permission modal |
+| `Esc` | Hủy thao tác theo context; không thoát July |
 | `Ctrl-D` | Thoát khi turn idle và input trống |
 | `Ctrl-C` khi input có chữ | Xóa input |
 | `Ctrl-C` khi idle và input trống | Thoát TUI |
