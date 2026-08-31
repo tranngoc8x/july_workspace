@@ -1,5 +1,7 @@
 # Lessons
 
+- Khi thiết kế autocomplete trong editor mà `Enter` hiện đang submit, phải chốt precedence rõ: lần đầu accept suggestion và thêm space, lần sau mới submit; đồng thời quyết định riêng trường hợp nhiều candidate để không nuốt `Enter` vô ích.
+- Khi một thuật ngữ gần giống từ khóa sản phẩm có thể dẫn tới hai luồng UX khác nhau (ví dụ `motion`/`mention`), phải xác nhận nghĩa trước khi chốt plan; sau khi xác nhận thì sửa ngay task scope, không giữ assumption cũ.
 - Khi Sếp nói “làm tiếp” sau khi phase trước đã được báo hoàn tất, phải kiểm tra Git/Beads và thực hiện task kế tiếp theo thứ tự; không tự suy diễn thiết kế ghi “future Phase” thành lý do defer nếu prerequisite đã hoàn tất.
 - Khi thêm aggregate/lifecycle transaction, phải tìm và xóa hoặc thu hẹp mọi public primitive cũ có thể ghi từng phần; đồng thời chuyển toàn bộ caller và fixture sang invariant-preserving path trước khi báo hoàn tất.
 - Khi đổi hướng hoặc thay dependency sau một prototype, phải gỡ import, call site, test và lockfile của prototype trong cùng một bước rồi chạy `cargo check`; không để worktree ở trạng thái nửa migration.
