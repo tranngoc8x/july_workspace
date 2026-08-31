@@ -102,6 +102,13 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/prompt":
         session_id = message["params"]["sessionId"]
+        if "--protocol-error" in sys.argv:
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Prompt failed"},
+            })
+            continue
         if "--auth-error" in sys.argv:
             send({
                 "jsonrpc": "2.0",

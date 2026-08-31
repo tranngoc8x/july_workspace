@@ -367,9 +367,8 @@ fn handle_event<B: Backend>(
         }
         Event::Key(key)
             if key.kind.is_press()
-                && (key.code == KeyCode::Esc
-                    || key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                && key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
         {
             Ok(true)
         }
@@ -454,7 +453,7 @@ mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::rc::Rc;
 
-    use crossterm::event::Event;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -617,6 +616,21 @@ mod tests {
         assert_eq!(terminal.get_frame().area().width, 120);
         assert_eq!(terminal.get_frame().area().height, 40);
         assert_eq!(app.viewport(), super::app::Viewport::new(120, 40));
+    }
+
+    #[test]
+    fn escape_does_not_exit_the_inactive_shell() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut app = super::App::new(Context::root());
+
+        let should_exit = handle_event(
+            &mut terminal,
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        )
+        .unwrap();
+
+        assert!(!should_exit);
     }
 
     #[test]

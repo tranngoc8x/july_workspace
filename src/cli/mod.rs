@@ -1087,7 +1087,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         result: crate::tui::app::CommandResult::Submitted,
                     });
                 }
-                drain_repl_turn(chat, input, stdout, tui_events).await?;
+                drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
                 continue;
             }
             if matches!(
@@ -1105,7 +1105,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         result: crate::tui::app::CommandResult::Submitted,
                     });
                 }
-                drain_repl_turn(chat, input, stdout, tui_events).await?;
+                drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
             } else if let Some(room_id) = contexts.last().unwrap().room_id() {
                 // Rule D: a Room launches work, it is not a conversation. Name
                 // the targets instead of reporting a command error.
@@ -2006,6 +2006,7 @@ async fn drain_repl_turn<C: ChatContext>(
     service: &mut C,
     input: &mut mpsc::UnboundedReceiver<ReplInput>,
     stdout: &mut impl Write,
+    stderr: &mut impl Write,
     tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
 ) -> Result<(), CliError> {
     let mut cancelled = false;
@@ -2034,7 +2035,12 @@ async fn drain_repl_turn<C: ChatContext>(
                         permission = Some((request_id, options));
                     }
                     ChatEvent::TurnCompleted => return Ok(()),
-                    ChatEvent::TurnFailed(failure) => return Err(turn_failed(failure)),
+                    ChatEvent::TurnFailed(failure) => {
+                        if tui_events.is_none() {
+                            repl_write(stderr, format_args!("{}\n", turn_failed(failure)))?;
+                        }
+                        return Ok(());
+                    }
                     ChatEvent::Disconnected(reason) => return Err(CliError::Disconnected(reason)),
                 }
             }
