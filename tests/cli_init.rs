@@ -1,4 +1,4 @@
-//! `july init` validates scripting input before selecting or installing adapters.
+//! `july setup` validates scripting input before selecting or installing adapters.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -38,9 +38,9 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn init_rejects_an_unknown_adapter_id_before_touching_the_network() {
+fn setup_rejects_an_unknown_adapter_id_before_touching_the_network() {
     let workspace = TestWorkspace::new();
-    let output = workspace.run(&["init", "--adapters", "khong-ton-tai"]);
+    let output = workspace.run(&["setup", "--adapters", "khong-ton-tai"]);
 
     assert!(!output.status.success());
     assert!(
@@ -55,15 +55,37 @@ fn init_rejects_an_unknown_adapter_id_before_touching_the_network() {
 }
 
 #[test]
-fn init_rejects_an_empty_adapter_list() {
+fn setup_rejects_an_empty_adapter_list() {
     let workspace = TestWorkspace::new();
 
-    assert!(!workspace.run(&["init", "--adapters", ""]).status.success());
+    let output = workspace.run(&["setup", "--adapters", ""]);
+    assert!(!output.status.success());
 }
 
 #[test]
-fn init_usage_error_when_the_flag_has_no_value() {
+fn setup_usage_error_when_the_flag_has_no_value() {
     let workspace = TestWorkspace::new();
 
-    assert!(!workspace.run(&["init", "--adapters"]).status.success());
+    let output = workspace.run(&["setup", "--adapters"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("usage: july setup"));
+}
+
+#[test]
+fn init_no_longer_accepts_adapter_setup_flags() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&["init", "--adapters", "codex"]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("usage: july init"));
+    assert!(!workspace.home.join("adapters/node_modules").exists());
+}
+
+#[test]
+fn init_requires_an_interactive_terminal() {
+    let workspace = TestWorkspace::new();
+    let output = workspace.run(&["init"]);
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("july init cần terminal tương tác"));
 }

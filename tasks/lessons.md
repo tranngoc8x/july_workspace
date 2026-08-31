@@ -9,3 +9,4 @@
 - Khi đang ở approval gate, phải nói rõ thay đổi chưa được áp dụng; không để Sếp hiểu bản thiết kế vừa trình bày là trạng thái UI đã chạy.
 - Khi Sếp yêu cầu bỏ `Esc` để chỉ thoát bằng lệnh nhưng sau đó giữ các compatibility exit (`/quit`, `Ctrl-D`, `Ctrl-C`, EOF), phải giới hạn thay đổi vào global `Esc`; không diễn giải thành xóa mọi đường thoát không phải `/exit`.
 - Khi bổ sung onboarding command trong CLI đã có `init`, phải chốt rõ command mapping trước khi thiết kế: command cũ có thể được đổi tên và `init` được tái sử dụng cho project-local setup, không tự mặc định nhét wizard vào `agent add`.
+- Khi sinh agent name từ tên thư mục Unicode, “remove Unicode” không đồng nghĩa xóa cả chữ: phải chuyển chữ Latin có dấu về ASCII không dấu (ví dụ `Dự án` → `Du_an`), chỉ loại ký tự không có dạng Latin tương đương.

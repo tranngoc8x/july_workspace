@@ -12,6 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use july_workspace::tui::{app::AppCommand, run_app, run_inactive_shell, with_terminal};
+use rusqlite::Connection;
+use serde_json::json;
 
 const CHILD_MODE: &str = "JULY_TUI_TEST_CHILD";
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h";
@@ -144,6 +146,124 @@ fn no_argument_binary_uses_tui_when_both_streams_are_terminals() {
     child.master.write_all(b"\x03").unwrap();
     assert_restored(child, None);
     let _ = std::fs::remove_file(database);
+}
+
+#[test]
+fn project_init_uses_the_folder_default_and_an_installed_adapter() {
+    let base = std::env::temp_dir().join(format!("july-project-init-{}", ulid::Ulid::generate()));
+    let project = base.join("Dự án Thanh Toán");
+    let home = base.join("home");
+    let database = base.join("workspace.db");
+    let executable = base.join("codex-acp");
+    std::fs::create_dir_all(home.join("adapters")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(&executable, "#!/bin/sh\n").unwrap();
+    std::fs::write(
+        home.join("adapters/identities.json"),
+        json!({
+            "codex": {
+                "name": "codex-acp",
+                "version": "1.6.2",
+                "bin": executable,
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_july"));
+    command
+        .arg("init")
+        .env("JULY_HOME", &home)
+        .env("JULY_WORKSPACE_DB", &database)
+        .current_dir(&project);
+    let mut child = spawn_pty_command(command);
+    child.wait_for("Tên agent [Du_an_Thanh_Toan]:".as_bytes());
+    child.master.write_all(b"\r").unwrap();
+    child.wait_for(b"codex");
+    child.master.write_all(b"\r").unwrap();
+
+    let initial = child.initial_termios;
+    let (status, output, restored) = child.finish();
+    assert!(
+        status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        !contains(&output, b"claude"),
+        "listed an uninstalled adapter"
+    );
+    assert_eq!(restored.c_lflag, initial.c_lflag, "terminal local flags");
+
+    let connection = Connection::open(&database).unwrap();
+    let (name, project_root): (String, String) = connection
+        .query_row("SELECT name, project_root FROM agents", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(name, "Du_an_Thanh_Toan");
+    assert_eq!(
+        project_root,
+        project.canonicalize().unwrap().to_string_lossy()
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
+    let base = std::env::temp_dir().join(format!("july-project-init-{}", ulid::Ulid::generate()));
+    let project = base.join("project");
+    let home = base.join("home");
+    let database = base.join("workspace.db");
+    let codex = base.join("codex-acp");
+    let claude = base.join("claude-acp");
+    std::fs::create_dir_all(home.join("adapters")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(&codex, "#!/bin/sh\n").unwrap();
+    std::fs::write(&claude, "#!/bin/sh\n").unwrap();
+    std::fs::write(
+        home.join("adapters/identities.json"),
+        json!({
+            "codex": { "name": "codex-acp", "version": "1.6.2", "bin": codex },
+            "claude": { "name": "claude-agent-acp", "version": "0.70.0", "bin": claude },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_july"));
+    command
+        .arg("init")
+        .env("JULY_HOME", &home)
+        .env("JULY_WORKSPACE_DB", &database)
+        .current_dir(&project);
+    let mut child = spawn_pty_command(command);
+    child.wait_for("Tên agent [project]:".as_bytes());
+    child.master.write_all("Sếp Agent\r".as_bytes()).unwrap();
+    child.wait_for(b"claude");
+    child.master.write_all(b"\x1b[B\r").unwrap();
+
+    let (status, output, _) = child.finish();
+    assert!(
+        status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output)
+    );
+    let connection = Connection::open(&database).unwrap();
+    let (name, config): (String, String) = connection
+        .query_row(
+            "SELECT name, transport_config_json FROM agents",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "Sếp Agent");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&config).unwrap()["expected_agent_name"],
+        "claude-agent-acp"
+    );
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 #[test]

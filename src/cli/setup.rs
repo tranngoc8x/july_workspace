@@ -1,4 +1,4 @@
-//! Màn hình onboarding cài ACP adapter.
+//! Màn hình `july setup` cài ACP adapter.
 
 use super::CliError;
 use super::keys::{Key, RawMode, decode};
@@ -66,7 +66,7 @@ impl Selection {
 }
 
 /// Chạy màn hình onboarding, hoặc đi đường không tương tác khi được chỉ định.
-pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliError> {
+pub(crate) async fn run_setup(adapters: Option<Vec<String>>) -> Result<(), CliError> {
     let store = AdapterStore::open_default()?;
     let chosen = match adapters {
         Some(ids) => resolve_ids(&ids)?,
@@ -82,7 +82,7 @@ pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliErr
             None => {
                 println!(
                     "stdin không phải terminal, dùng mặc định: codex, claude.\n\
-                     Chỉ định khác bằng july init --adapters <ids>"
+                     Chỉ định khác bằng july setup --adapters <ids>"
                 );
                 resolve_ids(&["codex".into(), "claude".into()])?
             }
@@ -122,11 +122,11 @@ pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliErr
     }
 
     if failures.is_empty() {
-        println!("Xong. Tạo agent bằng: july agent add <tên> --project <đường dẫn> --adapter <id>");
+        println!("Xong. Tạo agent cho thư mục hiện tại bằng: july init");
         return Ok(());
     }
     Err(CliError::Runtime(format!(
-        "các adapter sau chưa dùng được: {}. Chạy lại july init để thử tiếp",
+        "các adapter sau chưa dùng được: {}. Chạy lại july setup để thử tiếp",
         failures.join(", ")
     )))
 }

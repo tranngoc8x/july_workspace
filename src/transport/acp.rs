@@ -978,7 +978,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Spawn adapter, gửi `initialize`, đọc danh tính nó tự khai, rồi dừng.
 ///
-/// Dùng ở `july init` để `expected_agent_name` và `expected_agent_version`
+/// Dùng ở `july setup` để `expected_agent_name` và `expected_agent_version`
 /// trong `AcpAgentConfig` là giá trị thật chứ không phải phỏng đoán.
 pub async fn probe_agent_identity(
     executable: &Path,
