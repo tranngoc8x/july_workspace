@@ -8,7 +8,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use super::markdown::MarkdownStream;
-use super::{COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
+use super::{CODE_COLOR, COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
 use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
 use crate::domain::{PermissionOption, PermissionOutcome};
 
@@ -317,9 +317,10 @@ impl App {
         let mut rest = text.lines.into_iter().peekable();
         while let Some(line) = rest.next() {
             let spaced = line.width() > 0
-                && rest
-                    .peek()
-                    .is_some_and(|next: &Line<'static>| next.width() > 0);
+                && line.style.fg != Some(CODE_COLOR)
+                && rest.peek().is_some_and(|next: &Line<'static>| {
+                    next.width() > 0 && next.style.fg != Some(CODE_COLOR)
+                });
             lines.push(line);
             if spaced {
                 lines.push(Line::default());
@@ -980,6 +981,27 @@ mod tests {
         assert_eq!(
             foreground_of(&transcript, "error: offline"),
             Some(Color::Rgb(255, 123, 114))
+        );
+    }
+
+    #[test]
+    fn fenced_curl_keeps_its_line_continuations_copyable() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            r#"```sh
+curl --request POST 'https://example.com/v1/orders' \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"Tony"}'
+```"#
+                .into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+
+        assert_eq!(
+            app.transcript(),
+            r#"curl --request POST 'https://example.com/v1/orders' \
+  --header 'Content-Type: application/json' \
+  --data '{"name":"Tony"}'"#
         );
     }
 
