@@ -697,7 +697,7 @@ impl App {
         let Some((prefix, matches)) = self.active_completion() else {
             return false;
         };
-        if matches.iter().any(|name| *name == prefix.as_str()) {
+        if matches.contains(&prefix.as_str()) {
             self.input.insert_str(" ");
             return true;
         }
