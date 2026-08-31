@@ -646,10 +646,18 @@ impl App {
         if input.contains('\n') {
             return None;
         }
-        input
-            .trim_start()
-            .starts_with('/')
-            .then(|| input.trim_start().to_owned())
+        let prefix = input.trim_start();
+        if !prefix.starts_with('/')
+            || (prefix.chars().next_back().is_some_and(char::is_whitespace)
+                && self
+                    .context
+                    .commands()
+                    .iter()
+                    .any(|name| name == prefix.trim_end()))
+        {
+            return None;
+        }
+        Some(prefix.to_owned())
     }
 
     fn active_completion(&self) -> Option<(String, Vec<&str>)> {
@@ -689,6 +697,10 @@ impl App {
         let Some((prefix, matches)) = self.active_completion() else {
             return false;
         };
+        if matches.iter().any(|name| *name == prefix.as_str()) {
+            self.input.insert_str(" ");
+            return true;
+        }
         let first = matches[0];
         let shared = matches.iter().skip(1).fold(first.len(), |shared, other| {
             let mut end = 0;
@@ -1529,6 +1541,32 @@ curl --request POST 'https://example.com/v1/orders' \
         assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
         assert_eq!(app.input(), "/status ");
         assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
+    }
+
+    #[test]
+    fn exact_command_beats_a_longer_command_for_tab_and_enter() {
+        let commands = ["/thread", "/thread new"];
+        let mut tab = app_with_commands(&commands);
+        for character in "/thread".chars() {
+            tab.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        tab.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(tab.input(), "/thread ");
+        assert!(tab.completions().is_empty());
+
+        let mut enter = app_with_commands(&commands);
+        for character in "/thread".chars() {
+            enter.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert!(enter.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(enter.input(), "/thread ");
+        assert_eq!(
+            enter.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/thread ".into(),
+            }]
+        );
     }
 
     #[test]
