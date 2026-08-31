@@ -11,7 +11,10 @@ use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use july_workspace::tui::{app::AppCommand, run_app, run_inactive_shell, with_terminal};
+use july_workspace::tui::{
+    app::{AppCommand, Context},
+    run_app, run_inactive_shell, with_terminal,
+};
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -51,7 +54,12 @@ fn terminal_child() {
             .enable_time()
             .build()
             .unwrap()
-            .block_on(run_app(Vec::new(), |_| Ok(()), || Ok(None)))
+            .block_on(run_app(
+                Context::root(),
+                Vec::new(),
+                |_| Ok(()),
+                || Ok(None),
+            ))
             .unwrap(),
         "active-shift-enter" => {
             let submitted = Rc::new(Cell::new(false));
@@ -61,6 +69,7 @@ fn terminal_child() {
                 .build()
                 .unwrap()
                 .block_on(run_app(
+                    Context::root(),
                     Vec::new(),
                     move |command| {
                         if let AppCommand::Submit { text, .. } = command {

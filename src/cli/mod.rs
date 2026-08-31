@@ -924,7 +924,9 @@ const fn use_tui(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
 async fn run_tui_repl(database: PathBuf) -> Result<(), CliError> {
     let bridge = std::cell::RefCell::new(InactiveTuiBridge::open(database).await?);
     let agents = bridge.borrow().agents();
+    let initial_context = bridge.borrow().initial_context();
     let interaction = crate::tui::run_app(
+        initial_context,
         agents,
         |command| bridge.borrow().dispatch(command).map_err(io::Error::other),
         || {
@@ -2227,7 +2229,7 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
     use crate::tui::app::{Context, ContextId};
 
     let Some(current) = contexts.last() else {
-        return Ok(Context::root());
+        return Ok(attach_visible_commands(Context::root(), CommandScope::Root));
     };
     let mut segments: Vec<String> = Vec::new();
     for context in contexts {
@@ -2254,7 +2256,7 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
         }
     }
     if segments.is_empty() {
-        return Ok(Context::root());
+        return Ok(attach_visible_commands(Context::root(), CommandScope::Root));
     }
     let id = match current {
         ReplContext::Root => ContextId::root(),
@@ -2270,7 +2272,23 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
             ..
         } => ContextId::new(format!("thread:{conversation_id}:{agent_id}")),
     };
-    Ok(Context::new(id, segments.join(" > ")))
+    Ok(attach_visible_commands(
+        Context::new(id, segments.join(" > ")),
+        current.scope(),
+    ))
+}
+
+fn visible_command_names(scope: CommandScope) -> Vec<String> {
+    registry::visible_for_scope(scope)
+        .map(|spec| spec.name.to_owned())
+        .collect()
+}
+
+fn attach_visible_commands(
+    context: crate::tui::app::Context,
+    scope: CommandScope,
+) -> crate::tui::app::Context {
+    context.with_commands(visible_command_names(scope))
 }
 
 /// Thread title for the breadcrumb, falling back to `untitled` when the Thread
@@ -2425,6 +2443,10 @@ impl InactiveTuiBridge {
 
     pub fn agents(&self) -> Vec<String> {
         self.agents.clone()
+    }
+
+    pub fn initial_context(&self) -> crate::tui::app::Context {
+        attach_visible_commands(crate::tui::app::Context::root(), CommandScope::Root)
     }
 
     pub async fn execute(

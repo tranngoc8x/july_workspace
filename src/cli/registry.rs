@@ -429,6 +429,49 @@ mod tests {
     }
 
     #[test]
+    fn visible_commands_are_canonical_scope_filtered_and_not_hidden() {
+        let names = |scope| {
+            visible_for_scope(scope)
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            names(CommandScope::Root),
+            [
+                "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/help", "/exit"
+            ]
+        );
+        assert_eq!(
+            names(CommandScope::Room),
+            [
+                "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/status",
+                "/help", "/exit"
+            ]
+        );
+        assert_eq!(
+            names(CommandScope::Dm),
+            [
+                "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/restart", "/help",
+                "/exit"
+            ]
+        );
+        assert_eq!(
+            names(CommandScope::Thread),
+            [
+                "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/results",
+                "/status", "/publish", "/restart", "/help", "/exit"
+            ]
+        );
+        for scope in CommandScope::ALL {
+            let visible = names(*scope);
+            assert!(!visible.contains(&"/quit"));
+            assert!(!visible.contains(&"/thread"));
+            assert!(!visible.contains(&"/thread new"));
+        }
+    }
+
+    #[test]
     fn help_teaches_mentions_and_no_longer_advertises_threads() {
         let room = help(Room);
         assert!(room.contains("@cashpoint @pay implement refund flow"));
