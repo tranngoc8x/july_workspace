@@ -283,12 +283,18 @@ fn tui_command(app: &mut App, input: &str) -> AppCommand {
             KeyModifiers::NONE,
         )));
     }
-    app.reduce(AppEvent::Key(KeyEvent::new(
-        KeyCode::Enter,
-        KeyModifiers::NONE,
-    )))
-    .pop()
-    .expect("non-blank input emits one command")
+    for _ in 0..2 {
+        if let Some(command) = app
+            .reduce(AppEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .pop()
+        {
+            return command;
+        }
+    }
+    panic!("non-blank input did not emit a command after completion");
 }
 
 #[cfg(unix)]
