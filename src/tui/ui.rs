@@ -60,9 +60,9 @@ pub fn render(frame: &mut Frame, app: &App) {
             format!("! {error}"),
             Style::default().fg(ERROR_COLOR),
         )),
-        // While an `@` is being typed, the footer is the agent picker.
+        // While a `/` command or `@` mention is being typed, the footer lists matches.
         (None, false) => Line::from(Span::styled(
-            format!("Tab  {}", completions.join("  ")),
+            format!("Enter/Tab  {}", completions.join("  ")),
             Style::default().fg(Color::Cyan),
         )),
         (None, true) => Line::from("July workspace · /exit to leave"),
@@ -146,11 +146,85 @@ mod tests {
 
     use crate::application::ChatEvent;
     use crate::domain::PermissionOption;
-    use crate::tui::app::{App, AppEvent, Context};
+    use crate::tui::ERROR_COLOR;
+    use crate::tui::app::{App, AppEvent, CommandResult, Context, ContextId};
 
     use super::render;
 
     const TALL_MARKDOWN: &str = "0  \n1  \n2  \n3  \n4  \n5  \n6  \n7  \n8  \n9";
+
+    fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
+        (0..terminal.backend().buffer().area.width)
+            .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn footer_renders_default_mentions_commands_and_error_priority() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        let app = App::new(Context::root());
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert_eq!(row(&terminal, 11), "July workspace · /exit to leave");
+
+        let mut commands =
+            App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
+        for character in "/d".chars() {
+            commands.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        terminal.draw(|frame| render(frame, &commands)).unwrap();
+        assert_eq!(row(&terminal, 11), "Enter/Tab  /dm");
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 11)).unwrap().fg,
+            Color::Cyan
+        );
+
+        let mut mentions = App::new(Context::root());
+        mentions.reduce(AppEvent::Agents(vec![
+            "cashpoint".into(),
+            "cashflow".into(),
+        ]));
+        for character in "@cash".chars() {
+            mentions.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        terminal.draw(|frame| render(frame, &mentions)).unwrap();
+        assert_eq!(row(&terminal, 11), "Enter/Tab  cashpoint  cashflow");
+
+        let mut error =
+            App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
+        error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        error.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Failed("boom".into()),
+        });
+        for character in "/d".chars() {
+            error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        terminal.draw(|frame| render(frame, &error)).unwrap();
+        assert_eq!(row(&terminal, 11), "! boom");
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 11)).unwrap().fg,
+            ERROR_COLOR
+        );
+    }
 
     #[test]
     fn tiny_terminal_render_is_bounded_and_keeps_the_july_label() {
