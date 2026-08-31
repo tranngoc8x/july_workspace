@@ -633,6 +633,9 @@ impl App {
     /// ponytail: completion follows the caret only at the end of the input,
     /// which is where mentions are typed; mid-line editing skips it.
     fn mention_prefix(&self) -> Option<String> {
+        if !self.cursor_is_at_input_end() {
+            return None;
+        }
         let input = self.input();
         let word = input.split_whitespace().next_back()?;
         if !input.ends_with(word) {
@@ -642,6 +645,9 @@ impl App {
     }
 
     fn command_prefix(&self) -> Option<String> {
+        if !self.cursor_is_at_input_end() {
+            return None;
+        }
         let input = self.input();
         if input.contains('\n') {
             return None;
@@ -658,6 +664,14 @@ impl App {
             return None;
         }
         Some(prefix.to_owned())
+    }
+
+    fn cursor_is_at_input_end(&self) -> bool {
+        let lines = self.input.lines();
+        let Some(last) = lines.last() else {
+            return false;
+        };
+        self.input.cursor() == (lines.len() - 1, last.chars().count())
     }
 
     fn active_completion(&self) -> Option<(String, Vec<&str>)> {
@@ -1567,6 +1581,33 @@ curl --request POST 'https://example.com/v1/orders' \
                 input: "/thread ".into(),
             }]
         );
+    }
+
+    #[test]
+    fn slash_completion_is_inactive_away_from_the_input_end() {
+        let mut app = app_with_commands(&["/status"]);
+        for character in "/stat".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Left)));
+
+        assert!(app.completions().is_empty());
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "/stat");
+    }
+
+    #[test]
+    fn mention_completion_is_inactive_away_from_the_input_end() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Agents(vec!["cashflow".into()]));
+        for character in "@cashf".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Left)));
+
+        assert!(app.completions().is_empty());
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "@cashf");
     }
 
     #[test]
