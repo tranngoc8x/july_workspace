@@ -520,8 +520,14 @@ impl App {
                 self.scroll_offset = 0;
                 self.follow_tail = true;
             }
-            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => self.complete_mention(),
-            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => return self.submit(),
+            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
+                self.complete();
+            }
+            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
+                if !self.complete() {
+                    return self.submit();
+                }
+            }
             KeyCode::Enter => {
                 self.input.insert_newline();
                 self.history_index = None;
@@ -635,28 +641,55 @@ impl App {
         word.strip_prefix('@').map(str::to_owned)
     }
 
-    /// Agent names that match what is being typed after `@`.
-    pub fn completions(&self) -> Vec<&str> {
-        let Some(prefix) = self.mention_prefix() else {
-            return Vec::new();
-        };
-        self.agents
+    fn command_prefix(&self) -> Option<String> {
+        let input = self.input();
+        if input.contains('\n') {
+            return None;
+        }
+        input
+            .trim_start()
+            .starts_with('/')
+            .then(|| input.trim_start().to_owned())
+    }
+
+    fn active_completion(&self) -> Option<(String, Vec<&str>)> {
+        if let Some(prefix) = self.command_prefix() {
+            let matches: Vec<_> = self
+                .context
+                .commands()
+                .iter()
+                .map(String::as_str)
+                .filter(|name| name.starts_with(&prefix))
+                .collect();
+            if !matches.is_empty() {
+                return Some((prefix, matches));
+            }
+        }
+
+        let prefix = self.mention_prefix()?;
+        let matches: Vec<_> = self
+            .agents
             .iter()
             .filter(|agent| agent.starts_with(&prefix) && agent.len() > prefix.len())
             .map(String::as_str)
-            .collect()
+            .collect();
+        (!matches.is_empty()).then_some((prefix, matches))
     }
 
-    /// Tab: extend the `@` prefix by the single match, or by the longest
-    /// prefix every match shares.
-    fn complete_mention(&mut self) {
-        let Some(prefix) = self.mention_prefix() else {
-            return;
+    /// Candidate names for the one-line completion footer.
+    pub fn completions(&self) -> Vec<&str> {
+        self.active_completion()
+            .map(|(_, matches)| matches)
+            .unwrap_or_default()
+    }
+
+    /// Extend the current slash command or `@` mention by its shared prefix.
+    /// Returns whether candidates were active, including ambiguous no-ops.
+    fn complete(&mut self) -> bool {
+        let Some((prefix, matches)) = self.active_completion() else {
+            return false;
         };
-        let matches = self.completions();
-        let Some(first) = matches.first() else {
-            return;
-        };
+        let first = matches[0];
         let shared = matches.iter().skip(1).fold(first.len(), |shared, other| {
             let mut end = 0;
             for (index, character) in first[..shared].char_indices() {
@@ -670,15 +703,15 @@ impl App {
             }
             end
         });
-        let completion = first[prefix.len()..shared].to_owned();
-        if completion.is_empty() {
-            return;
-        }
+        let suffix = first[prefix.len()..shared].to_owned();
         let single = matches.len() == 1;
-        self.input.insert_str(completion);
+        if !suffix.is_empty() {
+            self.input.insert_str(suffix);
+        }
         if single {
             self.input.insert_str(" ");
         }
+        true
     }
 
     fn history_up(&mut self) {
@@ -932,6 +965,12 @@ mod tests {
 
     fn alt_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn app_with_commands(commands: &[&str]) -> App {
+        App::new(
+            Context::root().with_commands(commands.iter().map(|name| (*name).into()).collect()),
+        )
     }
 
     fn shift_key(code: KeyCode) -> KeyEvent {
@@ -1338,6 +1377,7 @@ curl --request POST 'https://example.com/v1/orders' \
         app.reduce(AppEvent::Key(key(KeyCode::Char('/'))));
         app.reduce(AppEvent::Key(key(KeyCode::Char('d'))));
         app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
 
         app.reduce(AppEvent::CommandFinished {
             context: ContextId::root(),
@@ -1399,6 +1439,110 @@ curl --request POST 'https://example.com/v1/orders' \
         app.reduce(AppEvent::Key(key(KeyCode::Tab)));
         assert_eq!(app.input(), "hello @cashflow ");
         assert!(app.completions().is_empty());
+    }
+
+    #[test]
+    fn unique_command_uses_first_enter_to_complete_and_second_to_submit() {
+        let mut app = app_with_commands(&["/status", "/start"]);
+        for character in "/stat".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.input(), "/status ");
+        assert!(app.completions().is_empty());
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/status ".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ambiguous_command_without_more_common_prefix_consumes_enter() {
+        let mut app = app_with_commands(&["/status", "/start"]);
+        for character in "/sta".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.input(), "/sta");
+        assert_eq!(app.completions(), ["/status", "/start"]);
+        assert!(!app.turn_active());
+    }
+
+    #[test]
+    fn tab_completes_shared_prefix_and_unique_command() {
+        let mut app = app_with_commands(&["/status", "/start"]);
+        for character in "/st".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "/sta");
+
+        app.reduce(AppEvent::Key(key(KeyCode::Char('t'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(app.input(), "/status ");
+    }
+
+    #[test]
+    fn slash_completion_preserves_leading_blanks_and_supports_multiword_names() {
+        let mut leading = app_with_commands(&["/status"]);
+        for character in "  /stat".chars() {
+            leading.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        leading.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(leading.input(), "  /status ");
+
+        let mut multiword = app_with_commands(&["/work new"]);
+        for character in "/work n".chars() {
+            multiword.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        multiword.reduce(AppEvent::Key(key(KeyCode::Tab)));
+        assert_eq!(multiword.input(), "/work new ");
+    }
+
+    #[test]
+    fn slash_completion_ignores_arguments_and_multiline_input() {
+        let mut argument = app_with_commands(&["/status"]);
+        for character in "/status argument".chars() {
+            argument.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert!(argument.completions().is_empty());
+
+        let mut multiline = app_with_commands(&["/status"]);
+        for character in "/stat".chars() {
+            multiline.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        multiline.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
+        assert!(multiline.completions().is_empty());
+    }
+
+    #[test]
+    fn exact_command_enter_appends_space_before_submit() {
+        let mut app = app_with_commands(&["/status"]);
+        for character in "/status".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.input(), "/status ");
+        assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
+    }
+
+    #[test]
+    fn enter_completes_agent_mention() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Agents(vec![
+            "cashpoint".into(),
+            "cashflow".into(),
+        ]));
+        for character in "@cashf".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+        assert_eq!(app.input(), "@cashflow ");
     }
 
     #[test]
