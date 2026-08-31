@@ -45,6 +45,7 @@ impl fmt::Display for ContextId {
 pub struct Context {
     id: ContextId,
     label: String,
+    commands: Vec<String>,
 }
 
 impl Context {
@@ -52,6 +53,7 @@ impl Context {
         Self {
             id,
             label: label.into(),
+            commands: Vec::new(),
         }
     }
 
@@ -65,6 +67,15 @@ impl Context {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    pub fn with_commands(mut self, commands: Vec<String>) -> Self {
+        self.commands = commands;
+        self
+    }
+
+    pub fn commands(&self) -> &[String] {
+        &self.commands
     }
 }
 
@@ -1247,6 +1258,14 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
+    fn context_carries_visible_commands() {
+        let context = Context::new(ContextId::new("dm:01"), "dm · Ada")
+            .with_commands(vec!["/dm".into(), "/restart".into()]);
+
+        assert_eq!(context.commands(), ["/dm", "/restart"]);
+    }
+
+    #[test]
     fn only_one_submit_can_be_pending_at_a_time() {
         let mut app = App::new(Context::root());
 
@@ -1292,17 +1311,21 @@ curl --request POST 'https://example.com/v1/orders' \
 
     #[test]
     fn stale_command_result_cannot_replace_the_active_context() {
-        let mut app = App::new(Context::root());
+        let original = Context::root().with_commands(vec!["/dm".into(), "/status".into()]);
+        let mut app = App::new(original.clone());
         app.reduce(AppEvent::Key(key(KeyCode::Char('/'))));
         app.reduce(AppEvent::Key(key(KeyCode::Char('d'))));
         app.reduce(AppEvent::Key(key(KeyCode::Enter)));
 
         app.reduce(AppEvent::CommandFinished {
             context: ContextId::new("dm:stale"),
-            result: CommandResult::Context(Context::new(ContextId::new("dm:stale"), "dm · stale")),
+            result: CommandResult::Context(
+                Context::new(ContextId::new("dm:stale"), "dm · stale")
+                    .with_commands(vec!["/dm".into(), "/restart".into()]),
+            ),
         });
 
-        assert_eq!(app.context(), &Context::root());
+        assert_eq!(app.context(), &original);
         assert_eq!(
             app.error(),
             Some("ignored stale command result for dm:stale")
@@ -1310,19 +1333,22 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
-    fn matching_context_result_replaces_the_label_and_leaves_no_active_turn() {
-        let mut app = App::new(Context::root());
+    fn matching_context_result_replaces_label_and_commands_atomically() {
+        let mut app = App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
         app.reduce(AppEvent::Key(key(KeyCode::Char('/'))));
         app.reduce(AppEvent::Key(key(KeyCode::Char('d'))));
         app.reduce(AppEvent::Key(key(KeyCode::Enter)));
 
         app.reduce(AppEvent::CommandFinished {
             context: ContextId::root(),
-            result: CommandResult::Context(Context::new(ContextId::new("dm:01"), "dm · Ada")),
+            result: CommandResult::Context(
+                Context::new(ContextId::new("dm:01"), "dm · Ada")
+                    .with_commands(vec!["/dm".into(), "/restart".into()]),
+            ),
         });
 
         assert_eq!(app.context().label(), "dm · Ada");
-        assert!(!app.turn_active());
+        assert_eq!(app.context().commands(), ["/dm", "/restart"]);
     }
 
     #[test]

@@ -876,6 +876,58 @@ fn repl_thread_switch_failures_leave_the_previous_context_active() {
 }
 
 #[tokio::test]
+async fn inactive_tui_bridge_projects_visible_commands_for_root_room_dm_and_work() {
+    const ROOT: &[&str] = &[
+        "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/help", "/exit",
+    ];
+    const ROOM: &[&str] = &[
+        "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/status", "/help",
+        "/exit",
+    ];
+    const DM: &[&str] = &[
+        "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/restart", "/help", "/exit",
+    ];
+    const WORK: &[&str] = &[
+        "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/results", "/status",
+        "/publish", "/restart", "/help", "/exit",
+    ];
+
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_agent("codex");
+    workspace.add_member(&room, &agent);
+    let thread = workspace.seed_thread(&room, "work", &[&agent]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let names = |app: &App| app.context().commands().to_vec();
+
+    assert_eq!(
+        names(&app),
+        ROOT.iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+    for (input, expected) in [
+        ("/room vna".to_owned(), ROOM),
+        ("/dm codex".to_owned(), DM),
+        ("/back".to_owned(), ROOM),
+        (format!("/thread {thread} --agent codex"), WORK),
+    ] {
+        let event = bridge.execute(tui_command(&mut app, &input)).await.unwrap();
+        app.reduce(event);
+        assert_eq!(
+            names(&app),
+            expected
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permission_event() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("vna");
