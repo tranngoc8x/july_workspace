@@ -284,14 +284,14 @@ fn tui_command(app: &mut App, input: &str) -> AppCommand {
         )));
     }
     for _ in 0..2 {
-        if let Some(command) = app
-            .reduce(AppEvent::Key(KeyEvent::new(
-                KeyCode::Enter,
-                KeyModifiers::NONE,
-            )))
-            .pop()
-        {
-            return command;
+        let commands = app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        match commands.as_slice() {
+            [] => {}
+            [command] => return command.clone(),
+            _ => panic!("completion emitted {} commands", commands.len()),
         }
     }
     panic!("non-blank input did not emit a command after completion");
