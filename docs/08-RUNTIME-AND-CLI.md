@@ -34,15 +34,28 @@ full-screen TUI over the same controller and services.
 ### Adapter onboarding
 
 ```bash
-july init [--adapters <ids>]
+july setup [--adapters <ids>]
 ```
 
-`july init` chọn và cài ACP adapter vào `~/.july/adapters`, xác minh ACP
+`july setup` chọn và cài ACP adapter vào `~/.july/adapters`, xác minh ACP
 handshake, rồi ghi danh tính đã xác minh vào `identities.json`. Màn hình chọn
 tương tác chỉ chạy trên Unix; automation hoặc stdin không phải terminal dùng
 `--adapters codex,claude` để chọn rõ adapter cần cài. Khi không chỉ định
-`--adapters` và stdin không phải terminal, `july init` tự cài mặc định
+`--adapters` và stdin không phải terminal, `july setup` tự cài mặc định
 `codex` và `claude`.
+
+### Current-project onboarding
+
+```bash
+cd /absolute/path/to/project
+july init
+```
+
+`july init` lấy thư mục hiện tại làm project, gợi ý tên Agent từ tên thư mục
+(chữ Latin Unicode được chuyển về không dấu, khoảng trắng thành `_`), rồi cho
+chọn một adapter đã được `july setup` cài và xác minh. Enter ở prompt tên dùng
+tên gợi ý; tên được nhập thủ công được giữ nguyên. Command này cần terminal
+tương tác. Dùng `july agent add ...` cho script hoặc automation.
 
 ### Agents
 
@@ -75,7 +88,7 @@ hatch. It keeps the same logical agent and its unrelated fields intact.
 and transcripts are left untouched; it does not free the agent name. Use
 `july agent update` to fix a wrong transport configuration.
 
-Nâng cấp một adapter (ví dụ chạy lại `july init` để cài bản mới hơn) **không**
+Nâng cấp một adapter (ví dụ chạy lại `july setup` để cài bản mới hơn) **không**
 tự cập nhật các agent đã tạo từ adapter đó trước đây. `transport_config` đã
 lưu vẫn giữ `expected_agent_version` cũ; nếu version đó không còn khớp với
 adapter thật, `july dm <agent>` sẽ thất bại ngay ở bước handshake ACP. Sau khi

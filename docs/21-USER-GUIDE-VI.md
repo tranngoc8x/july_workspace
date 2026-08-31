@@ -150,7 +150,7 @@ Không đặt hai biến này nếu bạn muốn dùng dữ liệu mặc định
 Chạy onboarding tương tác:
 
 ```bash
-july init
+july setup
 ```
 
 Trong màn hình chọn adapter:
@@ -163,13 +163,13 @@ Trong màn hình chọn adapter:
 Để chạy không tương tác hoặc chỉ cài một adapter:
 
 ```bash
-july init --adapters codex
+july setup --adapters codex
 ```
 
 Nhiều adapter được phân tách bằng dấu phẩy:
 
 ```bash
-july init --adapters codex,claude
+july setup --adapters codex,claude
 ```
 
 Nếu stdin không phải TTY và không có `--adapters`, July mặc định chọn
@@ -180,10 +180,22 @@ Một adapter thành công sẽ có dòng xác minh, sau đó July in hướng d
 ```text
 Đang cài codex (@agentclientprotocol/codex-acp <version>)
   đã xác minh: <agent-name> <agent-version>
-Xong. Tạo agent bằng: july agent add <tên> --project <đường dẫn> --adapter <id>
+Xong. Tạo agent cho thư mục hiện tại bằng: july init
 ```
 
 ### Bước 2: Thêm project agent
+
+```bash
+cd /absolute/path/to/cashpoint
+july init
+```
+
+July hiển thị tên mặc định lấy từ tên thư mục hiện tại. Chữ Latin Unicode được
+chuyển về không dấu và khoảng trắng thành `_`; ví dụ `Dự án Thanh Toán` thành
+`Du_an_Thanh_Toan`. Nhấn `Enter` để dùng tên mặc định, hoặc nhập tên khác. Sau
+đó dùng `↑` / `↓` và `Enter` để chọn một adapter đã cài.
+
+Cho script hoặc automation, dùng dạng đầy đủ không tương tác:
 
 ```bash
 july agent add cashpoint \
@@ -328,7 +340,7 @@ Chỉ dùng `--json` một lần.
 
 ### Cập nhật Agent sau khi nâng cấp adapter
 
-Chạy lại `july init` có thể nâng package adapter, nhưng không tự thay
+Chạy lại `july setup` có thể nâng package adapter, nhưng không tự thay
 `transport_config` đã lưu trong Agent. Sau khi nâng adapter, đồng bộ từng Agent:
 
 ```bash
@@ -703,6 +715,7 @@ Shape để viết script:
 Không dùng `--json` với:
 
 - `july init`;
+- `july setup`;
 - `july` không đối số;
 - `july dm`;
 - `july thread open`.
@@ -729,7 +742,7 @@ Sau đó dùng:
 Bạn mới truyền `--runtime` hoặc thiếu adapter config. Chạy:
 
 ```bash
-july init --adapters codex
+july setup --adapters codex
 july agent add <name> --project <path> --adapter codex
 ```
 
@@ -738,7 +751,7 @@ july agent add <name> --project <path> --adapter codex
 Chạy lại:
 
 ```bash
-july init --adapters <adapter-id>
+july setup --adapters <adapter-id>
 ```
 
 Kiểm tra npm có trên `PATH` với adapter npm, hoặc Cargo có trên `PATH` với
@@ -747,12 +760,12 @@ Kiểm tra npm có trên `PATH` với adapter npm, hoặc Cargo có trên `PATH`
 ### `authentication required`
 
 Đăng nhập vào provider/runtime tương ứng ngoài July, sau đó mở lại việc.
-July init xác minh ACP identity và protocol; nó không đăng nhập tài khoản model
+`july setup` xác minh ACP identity và protocol; nó không đăng nhập tài khoản model
 thay bạn.
 
 ### Adapter identity/version mismatch
 
-Nếu vừa chạy lại `july init`, cập nhật Agent đang dùng adapter đó:
+Nếu vừa chạy lại `july setup`, cập nhật Agent đang dùng adapter đó:
 
 ```bash
 july agent update <agent> --adapter <adapter-id>
@@ -830,7 +843,7 @@ lại một dòng.
 
 ```bash
 # Onboarding
-july init --adapters codex
+july setup --adapters codex
 july agent add cashpoint --project /path/to/cashpoint --adapter codex
 
 # Agent

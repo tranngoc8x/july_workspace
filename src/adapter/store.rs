@@ -9,7 +9,7 @@ use thiserror::Error;
 
 const IDENTITIES: &str = "identities.json";
 
-/// Danh tính thật của một adapter, ghi lại sau khi `july init` xác minh handshake.
+/// Danh tính thật của một adapter, ghi lại sau khi `july setup` xác minh handshake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdapterIdentity {
     pub name: String,
@@ -21,15 +21,15 @@ pub struct AdapterIdentity {
 pub enum AdapterError {
     #[error("biến môi trường HOME chưa được thiết lập")]
     MissingHome,
-    #[error("adapter `{0}` không có trong danh mục; xem `july init` để biết danh sách")]
+    #[error("adapter `{0}` không có trong danh mục; xem `july setup` để biết danh sách")]
     UnknownAdapter(String),
-    #[error("adapter `{id}` chưa được cài; chạy `july init` để cài")]
+    #[error("adapter `{id}` chưa được cài; chạy `july setup` để cài")]
     NotInstalled { id: String },
     #[error("tên agent `{0}` không hợp lệ: không được chứa `/` hay `..`")]
     InvalidAgentName(String),
-    #[error("adapter `{id}` đã cài nhưng chưa xác minh được danh tính; chạy lại `july init`")]
+    #[error("adapter `{id}` đã cài nhưng chưa xác minh được danh tính; chạy lại `july setup`")]
     NotVerified { id: String },
-    #[error("không tìm thấy `{tool}` trên PATH; cài `{tool}` rồi chạy lại `july init`")]
+    #[error("không tìm thấy `{tool}` trên PATH; cài `{tool}` rồi chạy lại `july setup`")]
     ToolMissing { tool: &'static str },
     #[error("cài adapter `{id}` thất bại: `{tool}` kết thúc với {status}")]
     InstallFailed {

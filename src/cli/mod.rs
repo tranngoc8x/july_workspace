@@ -1,4 +1,4 @@
-use crate::adapter::AdapterStore;
+use crate::adapter::{ADAPTERS, AdapterSpec, AdapterStore};
 use crate::application::{
     AddAgent, AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind,
     ChatPermissionRequestId, CollaborationError, CollaborationService, CreateRoom, CreateThread,
@@ -27,16 +27,17 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, oneshot};
 
-mod init;
 mod keys;
 mod mention;
 pub mod registry;
+mod setup;
 
 use registry::CommandScope;
 
 const LOCAL_USER_ID: &str = "local-user";
 const USAGE: &str = "usage: july dm <agent>";
-const INIT_USAGE: &str = "usage: july init [--adapters <ids>]      cài ACP adapter";
+const PROJECT_INIT_USAGE: &str = "usage: july init";
+const SETUP_USAGE: &str = "usage: july setup [--adapters <ids>]      cài ACP adapter";
 const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]\n\
                           usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]\n\
                           usage: july agent update <agent> --adapter <id>\n\
@@ -59,13 +60,17 @@ pub enum CliError {
     #[error(transparent)]
     Adapter(#[from] crate::adapter::AdapterError),
     #[error(
-        "agent dùng transport acp cần --adapter <id> hoặc --config <file>; chạy july init để xem adapter đã cài"
+        "agent dùng transport acp cần --adapter <id> hoặc --config <file>; chạy july setup để xem adapter đã cài"
     )]
     MissingAdapter,
     #[error("chưa chọn adapter nào; chọn ít nhất một để july có thể chạy agent")]
     NoAdapterSelected,
-    #[error("{INIT_USAGE}")]
-    InitUsage,
+    #[error("{SETUP_USAGE}")]
+    SetupUsage,
+    #[error("{PROJECT_INIT_USAGE}")]
+    ProjectInitUsage,
+    #[error("chưa có adapter đã cài; chạy july setup trước")]
+    NoInstalledAdapters,
     #[error("{AGENT_USAGE}")]
     AgentUsage,
     #[error(transparent)]
@@ -123,7 +128,8 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
     let result = match command {
         Command::Repl => run_repl().await,
         Command::Version { json } => run_version(json),
-        Command::Init { adapters } => init::run_init(adapters).await,
+        Command::Setup { adapters } => setup::run_setup(adapters).await,
+        Command::ProjectInit => run_project_init().await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Agent { operation, .. } => run_agent(operation, json).await,
@@ -154,7 +160,8 @@ impl CliError {
     fn error_code(&self) -> &'static str {
         match self {
             Self::Usage
-            | Self::InitUsage
+            | Self::SetupUsage
+            | Self::ProjectInitUsage
             | Self::AgentUsage
             | Self::InvalidAgentName
             | Self::InvalidUtf8 => "usage",
@@ -162,6 +169,7 @@ impl CliError {
             Self::Adapter(_) => "adapter",
             Self::MissingAdapter => "missing_adapter",
             Self::NoAdapterSelected => "no_adapter_selected",
+            Self::NoInstalledAdapters => "no_installed_adapters",
             Self::Io(_) => "io_error",
             Self::Runtime(_) | Self::Bootstrap(_) | Self::DirectMessage(_) => "runtime_error",
             Self::Collaboration(error) => match error {
@@ -210,9 +218,10 @@ enum Command {
     Version {
         json: bool,
     },
-    Init {
+    Setup {
         adapters: Option<Vec<String>>,
     },
+    ProjectInit,
     Dm(String),
     ThreadOpen {
         thread_id: ConversationId,
@@ -494,7 +503,9 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
             [_, agent] if !json => Ok(Command::Dm(positional(agent)?)),
             _ => Err(CliError::Usage),
         },
-        Some("init") => parse_init(args, json),
+        Some("setup") => parse_setup(args, json),
+        Some("init") if args.len() == 1 && !json => Ok(Command::ProjectInit),
+        Some("init") => Err(CliError::ProjectInitUsage),
         Some("agent") => parse_agent(args, json),
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
@@ -507,16 +518,16 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
     }
 }
 
-fn parse_init(args: Vec<String>, json: bool) -> Result<Command, CliError> {
+fn parse_setup(args: Vec<String>, json: bool) -> Result<Command, CliError> {
     if json {
-        return Err(CliError::InitUsage);
+        return Err(CliError::SetupUsage);
     }
     match args.as_slice() {
-        [_] => Ok(Command::Init { adapters: None }),
-        [_, flag, list] if flag == "--adapters" => Ok(Command::Init {
+        [_] => Ok(Command::Setup { adapters: None }),
+        [_, flag, list] if flag == "--adapters" => Ok(Command::Setup {
             adapters: Some(list.split(',').map(str::to_owned).collect()),
         }),
-        _ => Err(CliError::InitUsage),
+        _ => Err(CliError::SetupUsage),
     }
 }
 
@@ -761,6 +772,69 @@ fn positional(value: &str) -> Result<String, CliError> {
         return Err(CliError::Usage);
     }
     Ok(value.into())
+}
+
+fn default_agent_name(directory: &str) -> String {
+    let mut name = String::new();
+    for character in directory.chars() {
+        if character.is_whitespace() || character == '_' {
+            if !name.is_empty() && !name.ends_with('_') {
+                name.push('_');
+            }
+        } else if character.is_ascii_alphanumeric() || character == '-' {
+            name.push(character);
+        } else if character == '.' {
+            if !name.ends_with('.') {
+                name.push('.');
+            }
+        } else if let Some(character) = latin_ascii(character) {
+            name.push(character);
+        }
+    }
+    while name.ends_with('_') {
+        name.pop();
+    }
+    if name.is_empty() || name == "." {
+        "agent".into()
+    } else {
+        name
+    }
+}
+
+fn latin_ascii(character: char) -> Option<char> {
+    Some(match character {
+        'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'ä' | 'å' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
+        | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
+        'À' | 'Á' | 'Ạ' | 'Ả' | 'Ã' | 'Ä' | 'Å' | 'Â' | 'Ầ' | 'Ấ' | 'Ậ' | 'Ẩ' | 'Ẫ' | 'Ă' | 'Ằ'
+        | 'Ắ' | 'Ặ' | 'Ẳ' | 'Ẵ' => 'A',
+        'ç' => 'c',
+        'Ç' => 'C',
+        'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ë' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
+            'e'
+        }
+        'È' | 'É' | 'Ẹ' | 'Ẻ' | 'Ẽ' | 'Ë' | 'Ê' | 'Ề' | 'Ế' | 'Ệ' | 'Ể' | 'Ễ' => {
+            'E'
+        }
+        'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' | 'î' | 'ï' => 'i',
+        'Ì' | 'Í' | 'Ị' | 'Ỉ' | 'Ĩ' | 'Î' | 'Ï' => 'I',
+        'ñ' => 'n',
+        'Ñ' => 'N',
+        'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ö' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ'
+        | 'ợ' | 'ở' | 'ỡ' => 'o',
+        'Ò' | 'Ó' | 'Ọ' | 'Ỏ' | 'Õ' | 'Ö' | 'Ô' | 'Ồ' | 'Ố' | 'Ộ' | 'Ổ' | 'Ỗ' | 'Ơ' | 'Ờ' | 'Ớ'
+        | 'Ợ' | 'Ở' | 'Ỡ' => 'O',
+        'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'û' | 'ü' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
+            'u'
+        }
+        'Ù' | 'Ú' | 'Ụ' | 'Ủ' | 'Ũ' | 'Û' | 'Ü' | 'Ư' | 'Ừ' | 'Ứ' | 'Ự' | 'Ử' | 'Ữ' => {
+            'U'
+        }
+        'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' | 'ÿ' => 'y',
+        'Ỳ' | 'Ý' | 'Ỵ' | 'Ỷ' | 'Ỹ' | 'Ÿ' => 'Y',
+        'đ' => 'd',
+        'Đ' => 'D',
+        _ => return None,
+    })
 }
 
 fn parse_description(args: &[String]) -> Result<Option<String>, CliError> {
@@ -2602,6 +2676,118 @@ async fn run_publish(
     }
 }
 
+async fn run_project_init() -> Result<(), CliError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(CliError::Runtime("july init cần terminal tương tác".into()));
+    }
+    let project = std::env::current_dir()?;
+    let directory = project
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("agent");
+    let default = default_agent_name(directory);
+    print!("Tên agent [{default}]: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input)? == 0 {
+        return Ok(());
+    }
+    let input = input.trim_end_matches(['\r', '\n']);
+    let name = if input.is_empty() {
+        default
+    } else {
+        input.to_owned()
+    };
+
+    let store = AdapterStore::open_default()?;
+    let adapters = installed_adapters(&store)?;
+    let Some(adapter) = select_adapter(&adapters)? else {
+        return Ok(());
+    };
+    run_agent(
+        AgentOperation::Add {
+            name,
+            project: project.to_str().ok_or(CliError::InvalidUtf8)?.to_owned(),
+            runtime: None,
+            transport: "acp".into(),
+            adapter: Some(adapter.into()),
+            config: None,
+        },
+        false,
+    )
+    .await
+}
+
+fn installed_adapters(store: &AdapterStore) -> Result<Vec<&'static AdapterSpec>, CliError> {
+    let identities = store.identities()?;
+    let adapters = ADAPTERS
+        .iter()
+        .filter(|spec| {
+            identities
+                .get(spec.id)
+                .is_some_and(|identity| identity.bin.is_file())
+        })
+        .collect::<Vec<_>>();
+    if adapters.is_empty() {
+        return Err(CliError::NoInstalledAdapters);
+    }
+    Ok(adapters)
+}
+
+fn select_adapter(adapters: &[&'static AdapterSpec]) -> Result<Option<&'static str>, CliError> {
+    use std::io::Read;
+
+    let Some(_raw_mode) = keys::RawMode::enable()? else {
+        return Err(CliError::Runtime("july init cần terminal tương tác".into()));
+    };
+    let mut selected = 0;
+    let mut first = true;
+    let mut buffer = Vec::new();
+    let mut chunk = [0; 16];
+    let mut stdin = io::stdin();
+    loop {
+        render_adapter_selection(adapters, selected, first)?;
+        first = false;
+        let read = stdin.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        while let Some((key, used)) = keys::decode(&buffer) {
+            buffer.drain(..used);
+            match key {
+                keys::Key::Up => selected = selected.saturating_sub(1),
+                keys::Key::Down => selected = (selected + 1).min(adapters.len() - 1),
+                keys::Key::Enter => {
+                    println!();
+                    return Ok(Some(adapters[selected].id));
+                }
+                keys::Key::Quit | keys::Key::Interrupt => return Ok(None),
+                keys::Key::Space | keys::Key::Other => {}
+            }
+        }
+    }
+}
+
+fn render_adapter_selection(
+    adapters: &[&AdapterSpec],
+    selected: usize,
+    first: bool,
+) -> Result<(), CliError> {
+    let mut out = io::stdout();
+    if !first {
+        write!(out, "\x1b[{}A", adapters.len() + 2)?;
+    }
+    write!(out, "\rChọn adapter:\r\n")?;
+    for (index, adapter) in adapters.iter().enumerate() {
+        let pointer = if index == selected { "❯" } else { " " };
+        write!(out, "  {pointer} {}\r\n", adapter.id)?;
+    }
+    write!(out, "  ↑↓ di chuyển · enter xác nhận · q thoát\r\n")?;
+    out.flush()?;
+    Ok(())
+}
+
 async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
@@ -3265,6 +3451,27 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::CliError;
+
+    #[test]
+    fn default_agent_name_transliterates_vietnamese_and_normalizes_separators() {
+        assert_eq!(
+            super::default_agent_name("Dự án Thanh Toán"),
+            "Du_an_Thanh_Toan"
+        );
+        assert_eq!(super::default_agent_name("Café & CRM"), "Cafe_CRM");
+        assert_eq!(super::default_agent_name("điện máy"), "dien_may");
+        assert_eq!(
+            super::default_agent_name("München façade España"),
+            "Munchen_facade_Espana"
+        );
+        assert_eq!(super::default_agent_name("foo...bar"), "foo.bar");
+    }
+
+    #[test]
+    fn default_agent_name_falls_back_when_no_ascii_name_remains() {
+        assert_eq!(super::default_agent_name("项目"), "agent");
+        assert_eq!(super::default_agent_name("..."), "agent");
+    }
 
     #[test]
     fn tui_dispatch_requires_both_standard_streams_to_be_terminals() {

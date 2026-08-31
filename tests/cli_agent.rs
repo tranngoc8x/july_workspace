@@ -293,7 +293,7 @@ fn agent_add_rejects_an_acp_agent_without_an_adapter_or_config() {
     assert!(!output.status.success());
     assert!(stderr(&output).contains("\"code\":\"missing_adapter\""));
     assert!(stderr(&output).contains(
-        "agent dùng transport acp cần --adapter <id> hoặc --config <file>; chạy july init để xem adapter đã cài"
+        "agent dùng transport acp cần --adapter <id> hoặc --config <file>; chạy july setup để xem adapter đã cài"
     ));
     assert_eq!(workspace.count("SELECT COUNT(*) FROM agents"), 0);
 }
@@ -374,7 +374,7 @@ fn agent_add_rejects_an_adapter_that_was_never_verified() {
     ]);
 
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("chạy lại `july init`"));
+    assert!(stderr(&output).contains("chạy lại `july setup`"));
 }
 
 #[test]
