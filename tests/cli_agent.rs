@@ -252,6 +252,15 @@ fn agent_list_show_and_remove_render_human_and_json() {
     assert_eq!(agents[1]["name"], "pay");
     assert_eq!(agents[1]["runtime"], "");
 
+    let listed = workspace.run(&["agent", "list"]);
+    let listed = stdout(&listed);
+    assert!(listed.starts_with("AGENT ID                    NAME"));
+    assert!(listed.contains("PROJECT"));
+    assert!(listed.contains("TRANSPORT"));
+    assert!(listed.contains("RUNTIME"));
+    assert!(listed.contains("STATUS\n"));
+    assert!(!listed.contains('\t'));
+
     let shown = workspace.run(&["agent", "show", "cashpoint"]);
     assert!(stdout(&shown).contains("cashpoint\t/work/cashpoint\tacp\tcodex\tactive"));
 

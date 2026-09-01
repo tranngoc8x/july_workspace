@@ -114,7 +114,11 @@ fn room_create_list_and_description_render_for_humans() {
     assert!(listed.status.success(), "stderr: {}", stderr(&listed));
     assert_eq!(
         stdout(&listed),
-        format!("{room_id}\tPayments\tSettlement work\tactive\n")
+        format!(
+            "ROOM ID                     NAME      DESCRIPTION      STATUS\n\
+             --------------------------  --------  ---------------  ------\n\
+             {room_id}  Payments  Settlement work  active\n"
+        )
     );
 }
 
@@ -137,14 +141,17 @@ fn room_members_accept_exact_names_and_typed_ids_and_retain_history() {
 
     let members = workspace.run(&["room", "members", "Payments"]);
     let member_output = stdout(&members);
-    let fields: Vec<_> = member_output.trim_end().split('\t').collect();
-    assert_eq!(fields[0], room_id);
-    assert_eq!(fields[1], agent.id.to_string());
-    assert_eq!(fields[2], "");
-    assert_eq!(fields[3], "1");
-    assert!(!fields[4].is_empty());
-    assert!(!fields[5].is_empty());
-    assert_eq!(fields[6], "left");
+    assert!(member_output.starts_with("ROOM ID"));
+    assert!(member_output.contains("AGENT ID"));
+    assert!(member_output.contains("ROLE"));
+    assert!(member_output.contains("GENERATION"));
+    assert!(member_output.contains("JOINED AT"));
+    assert!(member_output.contains("LEFT AT"));
+    assert!(member_output.contains("STATE\n"));
+    assert!(member_output.contains(&room_id));
+    assert!(member_output.contains(&agent.id.to_string()));
+    assert!(member_output.ends_with("left\n"));
+    assert!(!member_output.contains('\t'));
 }
 
 #[test]
