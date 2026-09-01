@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::app::{App, INPUT_HORIZONTAL_MARGIN, INPUT_VERTICAL_MARGIN, PermissionModal, TurnState};
 use super::{ERROR_COLOR, SYSTEM_COLOR};
@@ -55,17 +55,44 @@ pub fn render(frame: &mut Frame, app: &App) {
     );
     frame.render_widget(app.input_widget(), input_area);
     let completions = app.completions();
-    let footer = match (app.error(), completions.is_empty()) {
-        (Some(error), _) => Line::from(Span::styled(
+    let completion_visible = !completions.is_empty();
+    if completion_visible {
+        let height = u16::try_from(completions.len())
+            .unwrap_or(u16::MAX)
+            .min(areas[1].height);
+        let popup = Rect::new(
+            areas[1].x,
+            areas[1].bottom().saturating_sub(height),
+            areas[1].width,
+            height,
+        );
+        let mention = app.completion_is_mention();
+        let items = completions.iter().copied().map(|candidate| {
+            ListItem::new(if mention {
+                format!("@{candidate}")
+            } else {
+                candidate.to_owned()
+            })
+        });
+        let list = List::new(items)
+            .highlight_symbol("❯ ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut state = ListState::default();
+        state.select(Some(app.completion_selected()));
+        frame.render_widget(Clear, popup);
+        frame.render_stateful_widget(list, popup, &mut state);
+    }
+    let footer = match app.error() {
+        Some(error) => Line::from(Span::styled(
             format!("! {error}"),
             Style::default().fg(ERROR_COLOR),
         )),
-        // While a `/` command or `@` mention is being typed, the footer lists matches.
-        (None, false) => Line::from(Span::styled(
-            format!("Enter/Tab  {}", completions.join("  ")),
+        // While a `/` command or `@` mention is being typed, the footer explains selection.
+        None if completion_visible => Line::from(Span::styled(
+            "↑↓ select · Enter/Tab complete",
             Style::default().fg(Color::Cyan),
         )),
-        (None, true) => Line::from("July workspace · /exit to leave"),
+        None => Line::from("July workspace · /exit to leave"),
     };
     frame.render_widget(Paragraph::new(footer), areas[3]);
 
@@ -162,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_renders_default_mentions_commands_and_error_priority() {
+    fn completion_list_renders_commands_mentions_and_error_priority() {
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
 
         let app = App::new(Context::root());
@@ -170,7 +197,11 @@ mod tests {
         assert_eq!(row(&terminal, 11), "July workspace · /exit to leave");
 
         let mut commands =
-            App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
+            App::new(Context::root().with_commands(vec!["/dm".into(), "/debug".into()]));
+        commands.reduce(AppEvent::Resize {
+            width: 80,
+            height: 12,
+        });
         for character in "/d".chars() {
             commands.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char(character),
@@ -178,17 +209,30 @@ mod tests {
             )));
         }
         terminal.draw(|frame| render(frame, &commands)).unwrap();
-        assert_eq!(row(&terminal, 11), "Enter/Tab  /dm");
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 11)).unwrap().fg,
-            Color::Cyan
-        );
+        assert_eq!(row(&terminal, 6), "❯ /dm");
+        assert_eq!(row(&terminal, 7), "  /debug");
+        assert_eq!(row(&terminal, 11), "↑↓ select · Enter/Tab complete");
+
+        commands.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "completion-permission".to_owned().into(),
+            prompt: "Allow?".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+        terminal.draw(|frame| render(frame, &commands)).unwrap();
+        assert_eq!(row(&terminal, 11), "July workspace · /exit to leave");
 
         let mut mentions = App::new(Context::root());
         mentions.reduce(AppEvent::Agents(vec![
             "cashpoint".into(),
             "cashflow".into(),
         ]));
+        mentions.reduce(AppEvent::Resize {
+            width: 80,
+            height: 12,
+        });
         for character in "@cash".chars() {
             mentions.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Char(character),
@@ -196,7 +240,8 @@ mod tests {
             )));
         }
         terminal.draw(|frame| render(frame, &mentions)).unwrap();
-        assert_eq!(row(&terminal, 11), "Enter/Tab  cashpoint  cashflow");
+        assert_eq!(row(&terminal, 6), "❯ @cashpoint");
+        assert_eq!(row(&terminal, 7), "  @cashflow");
 
         let mut error =
             App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
@@ -220,6 +265,7 @@ mod tests {
         }
         terminal.draw(|frame| render(frame, &error)).unwrap();
         assert_eq!(row(&terminal, 11), "! boom");
+        assert!(!(1..11).any(|y| row(&terminal, y).contains("/dm")));
         assert_eq!(
             terminal.backend().buffer().cell((0, 11)).unwrap().fg,
             ERROR_COLOR
@@ -235,6 +281,39 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "J");
+    }
+
+    #[test]
+    fn completion_list_scrolls_inside_the_minimum_editor_layout() {
+        let mut app = App::new(Context::root().with_commands(vec![
+            "/alpha".into(),
+            "/beta".into(),
+            "/charlie".into(),
+        ]));
+        app.reduce(AppEvent::Resize {
+            width: 12,
+            height: 6,
+        });
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('/'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        for _ in 0..2 {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        assert_eq!(row(&terminal, 0), "● july (idle");
+        assert_eq!(row(&terminal, 1), "❯ /charlie");
+        assert_eq!(
+            terminal.backend().buffer().cell((1, 3)).unwrap().symbol(),
+            "/"
+        );
     }
 
     #[test]
