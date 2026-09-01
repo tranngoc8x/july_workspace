@@ -1232,11 +1232,15 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             }
             "/rooms" if arguments.is_empty() => match service.list_rooms().await {
                 Ok(rooms) => {
-                    for room in rooms {
-                        repl_write(
-                            stdout,
-                            format_args!("{}\t{}\t{}\n", room.id, room.name, room.status),
-                        )?;
+                    let output = render_table(
+                        ["ROOM ID", "NAME", "STATUS"],
+                        rooms
+                            .into_iter()
+                            .map(|room| [room.id.to_string(), room.name, room.status])
+                            .collect(),
+                    );
+                    if !output.is_empty() {
+                        repl_write(stdout, format_args!("{output}\n"))?;
                     }
                 }
                 Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
@@ -1246,19 +1250,22 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("{NO_AGENTS}\n"))?
                 }
                 Ok(agents) => {
-                    for agent in agents {
-                        repl_write(
-                            stdout,
-                            format_args!(
-                                "{}\t{}\t{}\t{}\t{}\n",
-                                agent.id,
-                                agent.name,
-                                agent.project_root,
-                                agent.transport_type,
-                                agent.status
-                            ),
-                        )?;
-                    }
+                    let output = render_table(
+                        ["AGENT ID", "NAME", "PROJECT", "TRANSPORT", "STATUS"],
+                        agents
+                            .into_iter()
+                            .map(|agent| {
+                                [
+                                    agent.id.to_string(),
+                                    agent.name,
+                                    agent.project_root,
+                                    agent.transport_type,
+                                    agent.status,
+                                ]
+                            })
+                            .collect(),
+                    );
+                    repl_write(stdout, format_args!("{output}\n"))?;
                 }
                 Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
@@ -1273,16 +1280,21 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     .expect("room scope owns a room");
                 match service.list_threads(RoomRef::Id(room_id)).await {
                     Ok(threads) => {
-                        for thread in threads {
-                            repl_write(
-                                stdout,
-                                format_args!(
-                                    "{}\t{}\t{}\n",
-                                    thread.id,
-                                    thread.status,
-                                    thread.title.as_deref().unwrap_or("untitled"),
-                                ),
-                            )?;
+                        let output = render_table(
+                            ["THREAD ID", "STATUS", "TITLE"],
+                            threads
+                                .into_iter()
+                                .map(|thread| {
+                                    [
+                                        thread.id.to_string(),
+                                        thread.status,
+                                        thread.title.unwrap_or_else(|| "untitled".into()),
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        if !output.is_empty() {
+                            repl_write(stdout, format_args!("{output}\n"))?;
                         }
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
@@ -1296,19 +1308,24 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     .expect("thread scope owns a conversation");
                 match service.list_work_items(conversation_id).await {
                     Ok(work_items) => {
-                        for work in work_items {
-                            repl_write(
-                                stdout,
-                                format_args!(
-                                    "{}\t{}\t{}\t{}\n",
-                                    work.id,
-                                    work.status,
-                                    work.title,
-                                    work.owner_agent_id
-                                        .map(|agent| agent.to_string())
-                                        .unwrap_or_default(),
-                                ),
-                            )?;
+                        let output = render_table(
+                            ["WORK ID", "STATUS", "TITLE", "OWNER AGENT ID"],
+                            work_items
+                                .into_iter()
+                                .map(|work| {
+                                    [
+                                        work.id.to_string(),
+                                        work.status.to_string(),
+                                        work.title,
+                                        work.owner_agent_id
+                                            .map(|agent| agent.to_string())
+                                            .unwrap_or_default(),
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        if !output.is_empty() {
+                            repl_write(stdout, format_args!("{output}\n"))?;
                         }
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
@@ -1322,14 +1339,22 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     .expect("thread scope owns a conversation");
                 match service.list_work_results(conversation_id).await {
                     Ok(results) => {
-                        for result in results {
-                            repl_write(
-                                stdout,
-                                format_args!(
-                                    "{}\t{}\t{}\t{}\n",
-                                    result.id, result.work_id, result.status, result.summary,
-                                ),
-                            )?;
+                        let output = render_table(
+                            ["RESULT ID", "WORK ID", "STATUS", "SUMMARY"],
+                            results
+                                .into_iter()
+                                .map(|result| {
+                                    [
+                                        result.id.to_string(),
+                                        result.work_id.to_string(),
+                                        result.status,
+                                        result.summary,
+                                    ]
+                                })
+                                .collect(),
+                        );
+                        if !output.is_empty() {
+                            repl_write(stdout, format_args!("{output}\n"))?;
                         }
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
@@ -2865,11 +2890,29 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 if json_output {
                     Some(json!(agents.iter().map(agent_json).collect::<Vec<_>>()).to_string())
                 } else {
-                    let output = agents
-                        .iter()
-                        .map(|agent| render_agent(agent, false))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let output = render_table(
+                        [
+                            "AGENT ID",
+                            "NAME",
+                            "PROJECT",
+                            "TRANSPORT",
+                            "RUNTIME",
+                            "STATUS",
+                        ],
+                        agents
+                            .iter()
+                            .map(|agent| {
+                                [
+                                    agent.id.to_string(),
+                                    agent.name.clone(),
+                                    agent.project_root.clone(),
+                                    agent.transport_type.clone(),
+                                    agent_runtime(agent),
+                                    agent.status.clone(),
+                                ]
+                            })
+                            .collect(),
+                    );
                     (!output.is_empty()).then_some(output)
                 }
             }
@@ -2971,6 +3014,47 @@ fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
     )
 }
 
+fn render_table<const N: usize>(headers: [&str; N], rows: Vec<[String; N]>) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let headers = headers.map(str::to_owned);
+    let widths: [usize; N] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].width())
+            .chain([headers[column].width()])
+            .max()
+            .unwrap_or_default()
+    });
+    let render_row = |row: &[String; N]| {
+        row.iter()
+            .enumerate()
+            .map(|(column, value)| {
+                if column + 1 == N {
+                    value.clone()
+                } else {
+                    format!(
+                        "{value}{}",
+                        " ".repeat(widths[column].saturating_sub(value.width()))
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+
+    std::iter::once(render_row(&headers))
+        .chain(std::iter::once(render_row(
+            &widths.map(|width| "-".repeat(width)),
+        )))
+        .chain(rows.iter().map(render_row))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
@@ -3014,19 +3098,20 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
                         .collect();
                     Some(json!(rooms).to_string())
                 } else {
-                    let output = rooms
-                        .into_iter()
-                        .map(|room| {
-                            format!(
-                                "{}\t{}\t{}\t{}",
-                                room.id,
-                                room.name,
-                                room.description.unwrap_or_default(),
-                                room.status
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let output = render_table(
+                        ["ROOM ID", "NAME", "DESCRIPTION", "STATUS"],
+                        rooms
+                            .into_iter()
+                            .map(|room| {
+                                [
+                                    room.id.to_string(),
+                                    room.name,
+                                    room.description.unwrap_or_default(),
+                                    room.status,
+                                ]
+                            })
+                            .collect(),
+                    );
                     (!output.is_empty()).then_some(output)
                 }
             }
@@ -3168,20 +3253,21 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
                         .to_string(),
                     )
                 } else {
-                    let output = threads
-                        .into_iter()
-                        .map(|thread| {
-                            format!(
-                                "{}\t{}\t{}\t{}\t{}",
-                                thread.id,
-                                thread.room_id.map(|id| id.to_string()).unwrap_or_default(),
-                                thread.title.unwrap_or_default(),
-                                thread.goal.unwrap_or_default(),
-                                thread.status,
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let output = render_table(
+                        ["THREAD ID", "ROOM ID", "TITLE", "GOAL", "STATUS"],
+                        threads
+                            .into_iter()
+                            .map(|thread| {
+                                [
+                                    thread.id.to_string(),
+                                    thread.room_id.map(|id| id.to_string()).unwrap_or_default(),
+                                    thread.title.unwrap_or_default(),
+                                    thread.goal.unwrap_or_default(),
+                                    thread.status,
+                                ]
+                            })
+                            .collect(),
+                    );
                     (!output.is_empty()).then_some(output)
                 }
             }
@@ -3224,22 +3310,32 @@ fn render_room_members(members: Vec<crate::domain::RoomMember>, json_output: boo
         )
         .to_string()
     } else {
-        members
-            .into_iter()
-            .map(|member| {
-                let state = membership_state(member.left_at.is_none());
-                format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{state}",
-                    member.room_id,
-                    member.agent_id,
-                    member.role.unwrap_or_default(),
-                    member.generation,
-                    member.joined_at,
-                    member.left_at.unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        render_table(
+            [
+                "ROOM ID",
+                "AGENT ID",
+                "ROLE",
+                "GENERATION",
+                "JOINED AT",
+                "LEFT AT",
+                "STATE",
+            ],
+            members
+                .into_iter()
+                .map(|member| {
+                    let state = membership_state(member.left_at.is_none());
+                    [
+                        member.room_id.to_string(),
+                        member.agent_id.to_string(),
+                        member.role.unwrap_or_default(),
+                        member.generation.to_string(),
+                        member.joined_at,
+                        member.left_at.unwrap_or_default(),
+                        state.to_owned(),
+                    ]
+                })
+                .collect(),
+        )
     }
 }
 
@@ -3267,25 +3363,36 @@ fn render_thread_members(
         )
         .to_string()
     } else {
-        members
-            .into_iter()
-            .map(|member| {
-                let state = membership_state(member.left_at.is_none());
-                let member_type = match member.member_type {
-                    MemberType::User => "user",
-                    MemberType::Agent => "agent",
-                };
-                format!(
-                    "{}\t{member_type}\t{}\t{}\t{}\t{}\t{state}",
-                    member.conversation_id,
-                    member.member_id,
-                    member.generation,
-                    member.joined_at,
-                    member.left_at.unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        render_table(
+            [
+                "THREAD ID",
+                "TYPE",
+                "MEMBER ID",
+                "GENERATION",
+                "JOINED AT",
+                "LEFT AT",
+                "STATE",
+            ],
+            members
+                .into_iter()
+                .map(|member| {
+                    let state = membership_state(member.left_at.is_none());
+                    let member_type = match member.member_type {
+                        MemberType::User => "user",
+                        MemberType::Agent => "agent",
+                    };
+                    [
+                        member.conversation_id.to_string(),
+                        member_type.to_owned(),
+                        member.member_id,
+                        member.generation.to_string(),
+                        member.joined_at,
+                        member.left_at.unwrap_or_default(),
+                        state.to_owned(),
+                    ]
+                })
+                .collect(),
+        )
     }
 }
 
@@ -3473,6 +3580,20 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::CliError;
+
+    #[test]
+    fn table_aligns_wide_unicode_by_terminal_width() {
+        assert_eq!(
+            super::render_table(
+                ["NAME", "STATUS"],
+                vec![
+                    ["支付".into(), "active".into()],
+                    ["Cashpoint".into(), "idle".into()],
+                ],
+            ),
+            "NAME       STATUS\n---------  ------\n支付       active\nCashpoint  idle"
+        );
+    }
 
     #[test]
     fn default_agent_name_transliterates_vietnamese_and_normalizes_separators() {

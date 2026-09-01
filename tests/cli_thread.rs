@@ -157,10 +157,18 @@ fn thread_create_and_list_render_durable_ids_for_humans_and_json() {
     assert!(json_primary_work.is_primary);
 
     let listed = workspace.run(&["thread", "list", "--room", &room_id]);
-    assert_eq!(
-        stdout(&listed),
-        format!("{}\t{room_id}\tSettlement\tClose books\topen\n", ids[0])
-    );
+    let listed_output = stdout(&listed);
+    assert!(listed_output.starts_with("THREAD ID"));
+    assert!(listed_output.contains("ROOM ID"));
+    assert!(listed_output.contains("TITLE"));
+    assert!(listed_output.contains("GOAL"));
+    assert!(listed_output.contains("STATUS\n"));
+    assert!(listed_output.contains(ids[0]));
+    assert!(listed_output.contains(&room_id));
+    assert!(listed_output.contains("Settlement"));
+    assert!(listed_output.contains("Close books"));
+    assert!(listed_output.ends_with("open\n"));
+    assert!(!listed_output.contains('\t'));
 
     let listed = json_stdout(&workspace.run(&["--json", "thread", "list", "--room", "Payments"]));
     assert_eq!(listed[0]["thread_id"], ids[0]);
@@ -277,6 +285,18 @@ fn thread_membership_preserves_user_and_agent_history_with_idempotent_changes() 
             ),
         ]
     );
+
+    let members = stdout(&workspace.run(&["thread", "members", &thread_id]));
+    assert!(members.starts_with("THREAD ID"));
+    assert!(members.contains("TYPE"));
+    assert!(members.contains("MEMBER ID"));
+    assert!(members.contains("GENERATION"));
+    assert!(members.contains("JOINED AT"));
+    assert!(members.contains("LEFT AT"));
+    assert!(members.contains("STATE\n"));
+    assert!(members.contains(&codex_id));
+    assert!(members.contains(&reviewer_id));
+    assert!(!members.contains('\t'));
 }
 
 #[test]

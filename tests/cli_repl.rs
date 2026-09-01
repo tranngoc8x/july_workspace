@@ -424,7 +424,14 @@ fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
 
     let codex = workspace.seed_acp_agent("codex", &[]);
     let listed = workspace.repl("/agents\n/quit\n");
-    assert!(stdout(&listed).contains(&format!("{}\tcodex\t", codex.id)));
+    let listed = stdout(&listed);
+    assert!(listed.contains("AGENT ID"));
+    assert!(listed.contains("NAME"));
+    assert!(listed.contains("PROJECT"));
+    assert!(listed.contains("TRANSPORT"));
+    assert!(listed.contains("STATUS\n"));
+    assert!(listed.contains(&codex.id.to_string()));
+    assert!(!listed.contains('\t'));
     // Listing an agent starts no session.
     assert_eq!(
         Connection::open(&workspace.database)
@@ -489,20 +496,30 @@ fn repl_inspection_commands_report_workspace_state_without_mutating_it() {
     let result_id = workspace.seed_result_in(settlement);
 
     let output = workspace.repl(&format!(
-        "/rooms\n/agents\n/work\n/room Operations\n/thread {settlement} --agent codex\n\
-         /work\n/results\n/quit\n"
+        "/rooms\n/agents\n/work\n/room Operations\n/members\n/work\n\
+         /thread {settlement} --agent codex\n/members\n/work\n/results\n/quit\n"
     ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout_output = stdout(&output);
-    assert!(stdout_output.contains(&format!("{}\tOperations\tactive\n", room.id)));
-    assert!(stdout_output.contains(&format!("{}\tcodex\t", codex.id)));
+    for header in [
+        "ROOM ID",
+        "AGENT ID",
+        "THREAD ID",
+        "WORK ID",
+        "RESULT ID",
+        "MEMBER ID",
+    ] {
+        assert!(stdout_output.contains(header), "missing header: {header}");
+    }
+    assert!(stdout_output.contains(&room.id.to_string()));
+    assert!(stdout_output.contains(&codex.id.to_string()));
     assert!(
         stderr(&output)
             .contains("/work is unavailable in root context (available in: room, work)\n")
     );
-    assert!(stdout_output.contains("\tSettlement\t"));
-    assert!(stdout_output.contains(&format!("{result_id}\t")));
+    assert!(stdout_output.contains("Settlement"));
+    assert!(stdout_output.contains(&result_id.to_string()));
     // Inspection is read-only.
     assert_eq!(workspace.rooms(), 1);
     assert!(workspace.messages(settlement).is_empty());
@@ -577,10 +594,16 @@ fn repl_room_stack_restores_context_and_lists_only_active_members() {
         2
     );
     assert!(stderr(&output).contains("room missing does not exist\n"));
-    assert!(stdout(&output).contains(&format!(
-        "{}\t{}\t\t1\t{NOW}\t\tactive\n",
-        payments.id, active.id
-    )));
+    let stdout_output = stdout(&output);
+    assert!(stdout_output.contains("ROOM ID"));
+    assert!(stdout_output.contains("AGENT ID"));
+    let active_member = stdout_output
+        .lines()
+        .find(|line| line.contains(&active.id.to_string()))
+        .unwrap();
+    assert!(active_member.starts_with(&payments.id.to_string()));
+    assert!(active_member.contains(NOW));
+    assert!(active_member.ends_with("active"));
     assert!(!stdout(&output).contains(&left.id.to_string()));
     assert_eq!(workspace.rooms(), 2);
 }
@@ -818,8 +841,18 @@ fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
     assert_eq!(fields[4], "active");
 
     // `/members` lists the Thread's active members only.
-    assert!(stdout_output.contains(&format!("{settlement}\tagent\t{}\t1\t", codex.id)));
-    assert!(stdout_output.contains(&format!("{settlement}\tuser\tlocal-user\t1\t")));
+    assert!(stdout_output.lines().any(|line| {
+        line.starts_with(&settlement.to_string())
+            && line.contains("agent")
+            && line.contains(&codex.id.to_string())
+            && line.ends_with("active")
+    }));
+    assert!(stdout_output.lines().any(|line| {
+        line.starts_with(&settlement.to_string())
+            && line.contains("user")
+            && line.contains("local-user")
+            && line.ends_with("active")
+    }));
 
     let connection = Connection::open(&workspace.database).unwrap();
     for conversation in [settlement.to_string(), refunds.to_string(), dm_conversation] {
@@ -1717,7 +1750,12 @@ fn repl_work_lists_room_work_and_opens_one_without_thread() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout_output = stdout(&output);
-    assert!(stdout_output.contains(&format!("{refunds}\topen\tRefund flow\n")));
+    assert!(stdout_output.contains("THREAD ID"));
+    assert!(stdout_output.lines().any(|line| {
+        line.starts_with(&refunds.to_string())
+            && line.contains("open")
+            && line.ends_with("Refund flow")
+    }));
     assert!(stdout_output.contains(&format!("work\t{refunds}\tcodex\n")));
     assert_eq!(
         workspace

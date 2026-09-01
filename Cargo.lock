@@ -987,6 +987,7 @@ dependencies = [
  "tracing",
  "tui-markdown",
  "ulid",
+ "unicode-width",
 ]
 
 [[package]]
