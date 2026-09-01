@@ -239,6 +239,7 @@ pub struct App {
     permission: Option<PermissionModal>,
     error: Option<String>,
     agents: Vec<String>,
+    completion_selected: usize,
     prompt_history: Vec<String>,
     history_index: Option<usize>,
     history_draft: Option<String>,
@@ -260,6 +261,7 @@ impl App {
             permission: None,
             error: None,
             agents: Vec::new(),
+            completion_selected: 0,
             prompt_history: Vec::new(),
             history_index: None,
             history_draft: None,
@@ -441,6 +443,7 @@ impl App {
             }
             AppEvent::Agents(agents) => {
                 self.agents = agents;
+                self.completion_selected = 0;
                 Vec::new()
             }
             AppEvent::Chat(event) => self.reduce_chat_content(std::iter::once(event)),
@@ -502,17 +505,21 @@ impl App {
                 self.scroll_by(1, false);
             }
             KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
-                let cursor = self.input.cursor();
-                self.input.input(key);
-                if self.input.cursor() == cursor {
-                    self.history_up();
+                if !self.move_completion(false) {
+                    let cursor = self.input.cursor();
+                    self.input.input(key);
+                    if self.input.cursor() == cursor {
+                        self.history_up();
+                    }
                 }
             }
             KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                let cursor = self.input.cursor();
-                self.input.input(key);
-                if self.input.cursor() == cursor {
-                    self.history_down();
+                if !self.move_completion(true) {
+                    let cursor = self.input.cursor();
+                    self.input.input(key);
+                    if self.input.cursor() == cursor {
+                        self.history_down();
+                    }
                 }
             }
             KeyCode::Home => self.scroll_by(usize::MAX, true),
@@ -530,11 +537,13 @@ impl App {
             }
             KeyCode::Enter => {
                 self.input.insert_newline();
+                self.completion_selected = 0;
                 self.history_index = None;
                 self.history_draft = None;
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.insert_newline();
+                self.completion_selected = 0;
                 self.history_index = None;
                 self.history_draft = None;
             }
@@ -548,6 +557,7 @@ impl App {
                 let before = self.input();
                 self.input.input(key);
                 if self.input() != before {
+                    self.completion_selected = 0;
                     self.history_index = None;
                     self.history_draft = None;
                 }
@@ -675,14 +685,20 @@ impl App {
     }
 
     fn active_completion(&self) -> Option<(String, Vec<&str>)> {
+        if self.error.is_some() || self.permission.is_some() {
+            return None;
+        }
         if let Some(prefix) = self.command_prefix() {
-            let matches: Vec<_> = self
+            let mut matches: Vec<_> = self
                 .context
                 .commands()
                 .iter()
                 .map(String::as_str)
                 .filter(|name| name.starts_with(&prefix))
                 .collect();
+            if let Some(exact) = matches.iter().position(|name| *name == prefix) {
+                matches.swap(0, exact);
+            }
             if !matches.is_empty() {
                 return Some((prefix, matches));
             }
@@ -698,45 +714,49 @@ impl App {
         (!matches.is_empty()).then_some((prefix, matches))
     }
 
-    /// Candidate names for the one-line completion footer.
+    /// Candidate names for the completion list.
     pub fn completions(&self) -> Vec<&str> {
         self.active_completion()
             .map(|(_, matches)| matches)
             .unwrap_or_default()
     }
 
-    /// Extend the current slash command or `@` mention by its shared prefix.
-    /// Returns whether candidates were active, including ambiguous no-ops.
+    pub(crate) fn completion_selected(&self) -> usize {
+        self.completion_selected
+            .min(self.completions().len().saturating_sub(1))
+    }
+
+    pub(crate) fn completion_is_mention(&self) -> bool {
+        self.mention_prefix().is_some()
+    }
+
+    fn move_completion(&mut self, down: bool) -> bool {
+        let count = self.completions().len();
+        if count == 0 {
+            return false;
+        }
+        let selected = self.completion_selected();
+        self.completion_selected = if down {
+            (selected + 1).min(count - 1)
+        } else {
+            selected.saturating_sub(1)
+        };
+        true
+    }
+
+    /// Complete the selected slash command or `@` mention candidate.
+    /// Returns whether candidates were active.
     fn complete(&mut self) -> bool {
         let Some((prefix, matches)) = self.active_completion() else {
             return false;
         };
-        if matches.contains(&prefix.as_str()) {
-            self.input.insert_str(" ");
-            return true;
-        }
-        let first = matches[0];
-        let shared = matches.iter().skip(1).fold(first.len(), |shared, other| {
-            let mut end = 0;
-            for (index, character) in first[..shared].char_indices() {
-                let next = index + character.len_utf8();
-                if other.len() < next
-                    || other.as_bytes()[index..next] != first.as_bytes()[index..next]
-                {
-                    break;
-                }
-                end = next;
-            }
-            end
-        });
-        let suffix = first[prefix.len()..shared].to_owned();
-        let single = matches.len() == 1;
+        let selected = matches[self.completion_selected.min(matches.len() - 1)];
+        let suffix = selected[prefix.len()..].to_owned();
         if !suffix.is_empty() {
             self.input.insert_str(suffix);
         }
-        if single {
-            self.input.insert_str(" ");
-        }
+        self.input.insert_str(" ");
+        self.completion_selected = 0;
         true
     }
 
@@ -753,6 +773,7 @@ impl App {
         };
         self.history_index = Some(index);
         self.input = input_with(&self.prompt_history[index]);
+        self.completion_selected = 0;
     }
 
     fn history_down(&mut self) {
@@ -766,6 +787,7 @@ impl App {
             self.history_index = None;
             self.input = input_with(self.history_draft.take().as_deref().unwrap_or(""));
         }
+        self.completion_selected = 0;
     }
 
     fn submit(&mut self) -> Vec<AppCommand> {
@@ -1183,6 +1205,22 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
+    fn recalled_prompt_resets_completion_selection() {
+        let mut app = app_with_commands(&["/start", "/status"]);
+        app.prompt_history.push("/st".into());
+        for character in "/st".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+
+        assert_eq!(app.input(), "/st");
+        assert_eq!(app.completion_selected(), 0);
+    }
+
+    #[test]
     fn arrow_keys_move_the_multiline_cursor_before_opening_history() {
         let mut app = App::new(Context::root());
         for character in "saved".chars() {
@@ -1436,7 +1474,7 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
-    fn tab_completes_an_agent_mention_and_the_footer_lists_the_candidates() {
+    fn tab_completes_the_selected_agent_mention() {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Agents(vec![
             "cashpoint".into(),
@@ -1452,18 +1490,13 @@ curl --request POST 'https://example.com/v1/orders' \
         app.reduce(AppEvent::Key(key(KeyCode::Tab)));
         assert_eq!(app.input(), "hello ");
 
-        // Several matches: complete only the prefix they share, and offer both.
+        // Several matches: the first candidate is selected by default.
         for character in "@cash".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
         assert_eq!(app.completions(), ["cashpoint", "cashflow"]);
         app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "hello @cash", "no shared prefix left to add");
-
-        // One match: complete it fully and leave a space for the next word.
-        app.reduce(AppEvent::Key(key(KeyCode::Char('f'))));
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "hello @cashflow ");
+        assert_eq!(app.input(), "hello @cashpoint ");
         assert!(app.completions().is_empty());
     }
 
@@ -1487,28 +1520,60 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
-    fn ambiguous_command_without_more_common_prefix_consumes_enter() {
+    fn enter_completes_the_default_command_candidate() {
         let mut app = app_with_commands(&["/status", "/start"]);
         for character in "/sta".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
 
         assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(app.input(), "/sta");
-        assert_eq!(app.completions(), ["/status", "/start"]);
+        assert_eq!(app.input(), "/status ");
+        assert!(app.completions().is_empty());
         assert!(!app.turn_active());
     }
 
     #[test]
-    fn tab_completes_shared_prefix_and_unique_command() {
+    fn down_selects_the_next_completion_for_enter() {
+        let mut app = app_with_commands(&["/start", "/status"]);
+        for character in "/st".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        app.reduce(AppEvent::Key(key(KeyCode::Down)));
+        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
+
+        assert_eq!(app.input(), "/status ");
+    }
+
+    #[test]
+    fn error_hides_completion_and_enter_submits_the_typed_input() {
+        let mut app = app_with_commands(&["/dm"]);
+        app.reduce(AppEvent::Key(key(KeyCode::Char('x'))));
+        assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Failed("boom".into()),
+        });
+        for character in "/d".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        assert!(app.completions().is_empty());
+        assert_eq!(
+            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/d".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tab_completes_the_default_command_candidate() {
         let mut app = app_with_commands(&["/status", "/start"]);
         for character in "/st".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "/sta");
-
-        app.reduce(AppEvent::Key(key(KeyCode::Char('t'))));
         app.reduce(AppEvent::Key(key(KeyCode::Tab)));
         assert_eq!(app.input(), "/status ");
     }
