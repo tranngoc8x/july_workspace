@@ -111,9 +111,43 @@ pub enum AppCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandResult {
     Submitted,
+    SubmittedWithContext(ContextSnapshot),
     Context(Context),
-    Output { context: Context, output: String },
+    ContextWithHistory(ContextSnapshot),
+    Output {
+        context: Context,
+        output: String,
+    },
     Failed(String),
+    FailedInContext {
+        error: String,
+        snapshot: ContextSnapshot,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryAuthor {
+    User,
+    Agent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoryEntry {
+    pub author: HistoryAuthor,
+    pub body: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct History {
+    pub entries: Vec<HistoryEntry>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextSnapshot {
+    pub context: Context,
+    pub history: Result<History, String>,
+    pub history_fallback: Option<HistoryEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,7 +343,8 @@ impl App {
 
     /// The transcript as plain text, for tests and diagnostics.
     pub fn transcript(&self) -> String {
-        self.transcript_text()
+        self.markdown
+            .text()
             .lines
             .iter()
             .map(|line| {
@@ -808,13 +843,7 @@ impl App {
         self.history_draft = None;
         self.input = new_input();
         self.freeze_stream();
-        self.markdown.push_plain(
-            text.lines()
-                .map(|line| format!("› {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            USER_COLOR,
-        );
+        self.push_user_entry(&text);
         self.turn = TurnState::Active;
         let context = self.context.id.clone();
         self.pending = Some(context.clone());
@@ -837,8 +866,15 @@ impl App {
         self.pending = None;
         match result {
             CommandResult::Submitted => {}
+            CommandResult::SubmittedWithContext(snapshot) => {
+                self.error = self.apply_snapshot(snapshot);
+            }
             CommandResult::Context(context) => {
                 self.context = context;
+                self.turn = TurnState::Idle;
+            }
+            CommandResult::ContextWithHistory(snapshot) => {
+                self.error = self.apply_snapshot(snapshot);
                 self.turn = TurnState::Idle;
             }
             CommandResult::Output { context, output } => {
@@ -853,7 +889,58 @@ impl App {
                 self.error = Some(error.trim_end().to_owned());
                 self.turn = TurnState::Idle;
             }
+            CommandResult::FailedInContext { error, snapshot } => {
+                let _ = self.apply_snapshot(snapshot);
+                self.error = Some(error.trim_end().to_owned());
+                self.turn = TurnState::Idle;
+            }
         }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: ContextSnapshot) -> Option<String> {
+        self.context = snapshot.context;
+        self.markdown = MarkdownStream::default();
+        self.scroll_offset = 0;
+        self.follow_tail = true;
+
+        match snapshot.history {
+            Ok(history) => {
+                if history.truncated {
+                    self.markdown
+                        .push_plain("… showing 50 most recent messages …".into(), SYSTEM_COLOR);
+                }
+                for entry in &history.entries {
+                    self.push_history_entry(entry);
+                }
+                None
+            }
+            Err(error) => {
+                if let Some(entry) = snapshot.history_fallback.as_ref() {
+                    self.push_history_entry(entry);
+                }
+                Some(error.trim_end().to_owned())
+            }
+        }
+    }
+
+    fn push_history_entry(&mut self, entry: &HistoryEntry) {
+        match entry.author {
+            HistoryAuthor::User => self.push_user_entry(&entry.body),
+            HistoryAuthor::Agent => {
+                self.markdown.push(&entry.body);
+                self.markdown.finish();
+            }
+        }
+    }
+
+    fn push_user_entry(&mut self, body: &str) {
+        self.markdown.push_plain(
+            body.lines()
+                .map(|line| format!("› {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            USER_COLOR,
+        );
     }
 
     fn reduce_chat_content(
@@ -1042,6 +1129,182 @@ mod tests {
                     .flatten()
             })
         })
+    }
+
+    fn snapshot(
+        context: Context,
+        history: Result<History, String>,
+        history_fallback: Option<HistoryEntry>,
+    ) -> ContextSnapshot {
+        ContextSnapshot {
+            context,
+            history,
+            history_fallback,
+        }
+    }
+
+    fn pending_app(context: Context, input: &str) -> App {
+        let mut app = App::new(context);
+        for character in input.chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app
+    }
+
+    #[test]
+    fn submitted_snapshot_replaces_routing_echo_once_and_keeps_turn_active() {
+        let mut app = pending_app(Context::root(), "@ada hello");
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::SubmittedWithContext(snapshot(
+                Context::new(ContextId::new("dm:01"), "dm::ada"),
+                Ok(History {
+                    entries: vec![HistoryEntry {
+                        author: HistoryAuthor::User,
+                        body: "hello".into(),
+                    }],
+                    truncated: false,
+                }),
+                Some(HistoryEntry {
+                    author: HistoryAuthor::User,
+                    body: "hello".into(),
+                }),
+            )),
+        });
+        assert_eq!(app.context().label(), "dm::ada");
+        assert_eq!(app.transcript().matches("› hello").count(), 1);
+        assert!(!app.transcript().contains("@ada"));
+        assert!(app.turn_active());
+    }
+
+    #[test]
+    fn context_history_replaces_old_text_in_order_with_exact_marker_color() {
+        let mut app = pending_app(Context::root(), "/dm ada");
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::ContextWithHistory(snapshot(
+                Context::new(ContextId::new("dm:01"), "dm::ada"),
+                Ok(History {
+                    entries: vec![
+                        HistoryEntry {
+                            author: HistoryAuthor::User,
+                            body: "question".into(),
+                        },
+                        HistoryEntry {
+                            author: HistoryAuthor::Agent,
+                            body: "**answer**".into(),
+                        },
+                    ],
+                    truncated: true,
+                }),
+                None,
+            )),
+        });
+        let transcript = app.transcript();
+        assert_eq!(
+            transcript.lines().next(),
+            Some("… showing 50 most recent messages …")
+        );
+        assert!(transcript.find("› question").unwrap() < transcript.find("answer").unwrap());
+        assert!(!transcript.contains("/dm ada"));
+        assert_eq!(
+            foreground_of(
+                &app.transcript_text(),
+                "… showing 50 most recent messages …"
+            ),
+            Some(SYSTEM_COLOR)
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_changes_neither_context_nor_transcript() {
+        let mut app = pending_app(Context::root(), "/dm ada");
+        let before = app.transcript();
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::new("stale"),
+            result: CommandResult::ContextWithHistory(snapshot(
+                Context::new(ContextId::new("dm:poison"), "poison"),
+                Ok(History {
+                    entries: vec![HistoryEntry {
+                        author: HistoryAuthor::Agent,
+                        body: "poison".into(),
+                    }],
+                    truncated: false,
+                }),
+                None,
+            )),
+        });
+        assert_eq!(app.context(), &Context::root());
+        assert_eq!(app.transcript(), before);
+        assert_eq!(app.error(), Some("ignored stale command result for stale"));
+    }
+
+    #[test]
+    fn history_failure_uses_fallback_and_trims_the_history_error() {
+        let mut app = pending_app(Context::root(), "@ada hello");
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::SubmittedWithContext(snapshot(
+                Context::new(ContextId::new("dm:01"), "dm::ada"),
+                Err("history unavailable\n".into()),
+                Some(HistoryEntry {
+                    author: HistoryAuthor::User,
+                    body: "hello".into(),
+                }),
+            )),
+        });
+        assert_eq!(app.transcript(), "› hello");
+        assert_eq!(app.error(), Some("history unavailable"));
+        assert!(app.turn_active());
+    }
+
+    #[test]
+    fn failed_in_context_prefers_send_error_and_has_no_unproven_fallback() {
+        let mut app = pending_app(Context::root(), "@ada hello");
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::FailedInContext {
+                error: "send failed\n".into(),
+                snapshot: snapshot(
+                    Context::new(ContextId::new("dm:01"), "dm::ada"),
+                    Err("history failed".into()),
+                    None,
+                ),
+            },
+        });
+        assert_eq!(app.context().label(), "dm::ada");
+        assert!(app.transcript().is_empty());
+        assert_eq!(app.error(), Some("send failed"));
+        assert_eq!(app.turn_state(), TurnState::Idle);
+    }
+
+    #[test]
+    fn empty_root_snapshot_clears_chat_but_preserves_prompt_history() {
+        let dm = Context::new(ContextId::new("dm:01"), "dm::ada");
+        let mut app = App::new(dm.clone());
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "old agent text".into(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        for character in "/back".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: dm.id().clone(),
+            result: CommandResult::ContextWithHistory(snapshot(
+                Context::root(),
+                Ok(History {
+                    entries: Vec::new(),
+                    truncated: false,
+                }),
+                None,
+            )),
+        });
+        assert!(app.transcript().is_empty());
+        app.reduce(AppEvent::Key(key(KeyCode::Up)));
+        assert_eq!(app.input(), "/back");
     }
 
     #[test]
