@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use july_workspace::application::ChatEvent;
 use july_workspace::cli::InactiveTuiBridge;
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, ResultId, Room, RoomId,
-    WorkItem, WorkItemId, WorkResult, WorkStatus,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, MemberType, Message, MessageId,
+    ResultId, Room, RoomId, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use july_workspace::storage::SqliteStore;
 use july_workspace::tui::app::{App, AppCommand, AppEvent, CommandResult, Context};
@@ -146,6 +146,29 @@ impl TestWorkspace {
             )
             .unwrap();
         thread.id
+    }
+
+    fn seed_message(
+        &self,
+        conversation_id: ConversationId,
+        sender_type: MemberType,
+        sender_id: &str,
+        body: &str,
+        created_at: &str,
+    ) {
+        SqliteStore::open(&self.database)
+            .unwrap()
+            .insert_message(&Message {
+                id: MessageId::new(),
+                conversation_id,
+                sender_type,
+                sender_id: sender_id.into(),
+                body: body.into(),
+                reply_to: None,
+                metadata: serde_json::Value::Null,
+                created_at: created_at.into(),
+            })
+            .unwrap();
     }
 
     /// An accepted Result in its own source Conversation, ready to publish.
@@ -1080,6 +1103,169 @@ async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permissio
     assert_ne!(bindings[0].0, bindings[1].0);
     assert_ne!(bindings[0].1, bindings[1].1);
 
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_agent("codex");
+    workspace.add_member(&room, &agent);
+    let thread = workspace.seed_thread(&room, "work", &[&agent]);
+    let dm = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .get_or_create_dm("local-user", agent.id, NOW)
+        .unwrap();
+    workspace.seed_message(
+        dm.id,
+        MemberType::User,
+        "local-user",
+        "dm-user",
+        "2026-09-01T10:00:01Z",
+    );
+    workspace.seed_message(
+        dm.id,
+        MemberType::Agent,
+        &agent.id.to_string(),
+        "dm-agent",
+        "2026-09-01T10:00:02Z",
+    );
+    workspace.seed_message(
+        thread,
+        MemberType::User,
+        "local-user",
+        "thread-user",
+        "2026-09-01T10:00:03Z",
+    );
+    workspace.seed_message(
+        thread,
+        MemberType::Agent,
+        &agent.id.to_string(),
+        "thread-agent",
+        "2026-09-01T10:00:04Z",
+    );
+
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let event = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert!(app.transcript().contains("dm-user"));
+    assert!(app.transcript().contains("dm-agent"));
+    assert!(!app.transcript().contains("thread-user"));
+
+    for input in [
+        "/back".to_owned(),
+        "/room vna".to_owned(),
+        format!("/thread {thread} --agent codex"),
+    ] {
+        let event = bridge.execute(tui_command(&mut app, &input)).await.unwrap();
+        app.reduce(event);
+    }
+    assert!(app.transcript().contains("thread-user"));
+    assert!(app.transcript().contains("thread-agent"));
+    assert!(!app.transcript().contains("dm-user"));
+
+    let event = bridge
+        .execute(tui_command(&mut app, "/back"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert!(app.transcript().is_empty());
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_mentions_hydrate_before_live_deltas() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+
+    let submitted = bridge
+        .execute(tui_command(&mut app, "@codex stripped prompt"))
+        .await
+        .unwrap();
+    app.reduce(submitted);
+    assert!(app.context().label().contains("dm::codex"));
+    assert_eq!(app.transcript().matches("› stripped prompt").count(), 1);
+    assert!(!app.transcript().contains("@codex"));
+
+    let next = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        next,
+        AppEvent::Chat(ChatEvent::TextDelta(ref text)) if text == "fixture reply"
+    ));
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_mention_installs_history_before_protocol_failure() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--protocol-error"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+
+    let submitted = bridge
+        .execute(tui_command(&mut app, "@codex persisted once"))
+        .await
+        .unwrap();
+    app.reduce(submitted);
+    assert!(app.context().label().contains("dm::codex"));
+    assert_eq!(app.transcript().matches("› persisted once").count(), 1);
+
+    let failed = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        failed,
+        AppEvent::Chat(ChatEvent::TurnFailed(
+            july_workspace::application::ChatFailureKind::Protocol
+        ))
+    ));
+    app.reduce(failed);
+    assert_eq!(app.transcript().matches("› persisted once").count(), 1);
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_bridge_unchanged_context_submission_does_not_reload_history() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &["--protocol-error"]);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/dm codex"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+        "local sentinel".into(),
+    )));
+    app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+
+    let submitted = bridge
+        .execute(tui_command(&mut app, "ordinary prompt"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        &submitted,
+        AppEvent::CommandFinished {
+            result: CommandResult::Submitted,
+            ..
+        }
+    ));
+    app.reduce(submitted);
+    assert!(app.transcript().contains("local sentinel"));
     bridge.shutdown().await.unwrap();
 }
 
