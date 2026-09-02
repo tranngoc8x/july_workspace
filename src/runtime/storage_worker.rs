@@ -1792,6 +1792,18 @@ impl DeliberationRuntime for StorageWorker {
     }
 }
 
+fn map_publish_error(error: StoreError) -> PublishError {
+    match error {
+        StoreError::PublishResultNotFound(id) => PublishError::ResultNotFound(id),
+        StoreError::WorkItemNotFound(id) => PublishError::WorkNotFound(id),
+        StoreError::PublishSourceNotFound(id) => PublishError::SourceNotFound(id),
+        StoreError::PublishTargetNotFound(id) => PublishError::TargetNotFound(id),
+        StoreError::PublishIdConflict(id) => PublishError::PublishIdConflict(id),
+        StoreError::InvalidPublishTimestamp => PublishError::InvalidTimestamp,
+        error => PublishError::Runtime(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1864,17 +1876,5 @@ mod tests {
             metadata: serde_json::Value::Null,
             created_at: "2026-09-01T10:00:00Z".into(),
         }
-    }
-}
-
-fn map_publish_error(error: StoreError) -> PublishError {
-    match error {
-        StoreError::PublishResultNotFound(id) => PublishError::ResultNotFound(id),
-        StoreError::WorkItemNotFound(id) => PublishError::WorkNotFound(id),
-        StoreError::PublishSourceNotFound(id) => PublishError::SourceNotFound(id),
-        StoreError::PublishTargetNotFound(id) => PublishError::TargetNotFound(id),
-        StoreError::PublishIdConflict(id) => PublishError::PublishIdConflict(id),
-        StoreError::InvalidPublishTimestamp => PublishError::InvalidTimestamp,
-        error => PublishError::Runtime(error.to_string()),
     }
 }
