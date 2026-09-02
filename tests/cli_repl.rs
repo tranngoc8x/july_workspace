@@ -1185,10 +1185,21 @@ async fn inactive_tui_bridge_mentions_hydrate_before_live_deltas() {
     let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
     let mut app = App::new(bridge.initial_context());
 
-    let submitted = bridge
-        .execute(tui_command(&mut app, "@codex stripped prompt"))
-        .await
+    bridge
+        .dispatch(tui_command(&mut app, "@codex stripped prompt"))
         .unwrap();
+    let submitted = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &submitted,
+        AppEvent::CommandFinished {
+            context,
+            result: CommandResult::SubmittedWithContext(_),
+        } if context == app.context().id()
+    ));
     app.reduce(submitted);
     assert!(app.context().label().contains("dm::codex"));
     assert_eq!(app.transcript().matches("› stripped prompt").count(), 1);
@@ -1213,10 +1224,21 @@ async fn inactive_tui_bridge_mention_installs_history_before_protocol_failure() 
     let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
     let mut app = App::new(bridge.initial_context());
 
-    let submitted = bridge
-        .execute(tui_command(&mut app, "@codex persisted once"))
-        .await
+    bridge
+        .dispatch(tui_command(&mut app, "@codex persisted once"))
         .unwrap();
+    let submitted = tokio::time::timeout(Duration::from_secs(1), bridge.next_event())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        &submitted,
+        AppEvent::CommandFinished {
+            context,
+            result: CommandResult::SubmittedWithContext(_),
+        } if context == app.context().id()
+    ));
     app.reduce(submitted);
     assert!(app.context().label().contains("dm::codex"));
     assert_eq!(app.transcript().matches("› persisted once").count(), 1);
