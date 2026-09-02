@@ -128,6 +128,7 @@ enum Command {
         ConversationId,
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
     ),
+    ListRecentMessages(ConversationId, usize, Reply<(Vec<Message>, bool)>),
     InsertCheckpoint(Checkpoint, oneshot::Sender<Result<(), StoreError>>),
     GetLatestCheckpoint(
         ConversationId,
@@ -409,6 +410,15 @@ impl StorageHandle {
         conversation_id: ConversationId,
     ) -> Result<Vec<Message>, RuntimeError> {
         self.request(|reply| Command::ListMessages(conversation_id, reply))
+            .await
+    }
+
+    pub(crate) async fn list_recent_messages(
+        &self,
+        conversation_id: ConversationId,
+        limit: usize,
+    ) -> Result<(Vec<Message>, bool), RuntimeError> {
+        self.request(|reply| Command::ListRecentMessages(conversation_id, limit, reply))
             .await
     }
 
@@ -1374,6 +1384,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::ListMessages(conversation_id, reply) => {
                 let _ = reply.send(store.list_messages(conversation_id));
             }
+            Command::ListRecentMessages(conversation_id, limit, reply) => {
+                let _ = reply.send(store.list_recent_messages_after(conversation_id, None, limit));
+            }
             Command::InsertCheckpoint(checkpoint, reply) => {
                 let _ = reply.send(store.insert_checkpoint(&checkpoint));
             }
@@ -1776,6 +1789,81 @@ impl DeliberationRuntime for StorageWorker {
             Command::ConvertDecisionToWork(decision_id, items, created_at, reply)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ConversationKind, MemberType};
+
+    #[tokio::test]
+    async fn bounded_recent_message_request_preserves_order_limit_and_conversation() {
+        let directory = std::env::temp_dir().join(format!(
+            "july-storage-worker-test-{}",
+            ulid::Ulid::generate()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.db");
+        let requested = conversation(ConversationId::new());
+        let unrelated = conversation(ConversationId::new());
+        let store = SqliteStore::open(&path).unwrap();
+        store.insert_conversation(&requested).unwrap();
+        store.insert_conversation(&unrelated).unwrap();
+        for number in 1_u128..=52 {
+            store
+                .insert_message(&message(number, requested.id))
+                .unwrap();
+        }
+        store.insert_message(&message(100, unrelated.id)).unwrap();
+        drop(store);
+
+        let mut worker = StorageWorker::open(&path).unwrap();
+        let (messages, truncated) = worker
+            .handle()
+            .list_recent_messages(requested.id, 50)
+            .await
+            .unwrap();
+
+        assert!(truncated);
+        assert_eq!(messages.len(), 50);
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.conversation_id == requested.id)
+        );
+        assert_eq!(messages.first().unwrap().body, "message-03");
+        assert_eq!(messages.last().unwrap().body, "message-52");
+        worker.shutdown().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn conversation(id: ConversationId) -> Conversation {
+        Conversation {
+            id,
+            kind: ConversationKind::Dm,
+            room_id: None,
+            title: None,
+            goal: None,
+            parent_conversation_id: None,
+            origin_conversation_id: None,
+            status: "open".into(),
+            created_at: "2026-09-01T10:00:00Z".into(),
+            updated_at: "2026-09-01T10:00:00Z".into(),
+        }
+    }
+
+    fn message(number: u128, conversation_id: ConversationId) -> Message {
+        Message {
+            id: ulid::Ulid::from(number).into(),
+            conversation_id,
+            sender_type: MemberType::User,
+            sender_id: "tony".into(),
+            body: format!("message-{number:02}"),
+            reply_to: None,
+            metadata: serde_json::Value::Null,
+            created_at: "2026-09-01T10:00:00Z".into(),
+        }
     }
 }
 
