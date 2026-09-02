@@ -35,6 +35,7 @@ mod setup;
 use registry::CommandScope;
 
 const LOCAL_USER_ID: &str = "local-user";
+const TUI_HISTORY_LIMIT: usize = 50;
 const USAGE: &str = "usage: july dm <agent>";
 const PROJECT_INIT_USAGE: &str = "usage: july init";
 const SETUP_USAGE: &str = "usage: july setup [--adapters <ids>]      cài ACP adapter";
@@ -1069,19 +1070,28 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
     } = state;
     let mut publish = PublishService::new(workspace.storage());
     let mut pending_origin = None;
-    // Navigation echoes duplicate the TUI breadcrumb, so they never become a status.
-    let mut navigated = false;
+    let mut context_changed = false;
     loop {
         if let Some(origin) = pending_origin.take() {
-            let context = project_repl_context(service, contexts).await?;
-            let result = match (stderr.take(), stdout.take()) {
-                (Some(error), _) => crate::tui::app::CommandResult::Failed(error),
-                (None, Some(output)) if !navigated => {
-                    crate::tui::app::CommandResult::Output { context, output }
+            let result = if context_changed {
+                let snapshot = project_context_snapshot(service, workspace, contexts, None).await?;
+                match stderr.take() {
+                    Some(error) => {
+                        crate::tui::app::CommandResult::FailedInContext { error, snapshot }
+                    }
+                    None => crate::tui::app::CommandResult::ContextWithHistory(snapshot),
                 }
-                (None, _) => crate::tui::app::CommandResult::Context(context),
+            } else {
+                let context = project_repl_context(service, contexts).await?;
+                match (stderr.take(), stdout.take()) {
+                    (Some(error), _) => crate::tui::app::CommandResult::Failed(error),
+                    (None, Some(output)) => {
+                        crate::tui::app::CommandResult::Output { context, output }
+                    }
+                    (None, None) => crate::tui::app::CommandResult::Context(context),
+                }
             };
-            navigated = false;
+            context_changed = false;
             if let Some(events) = tui_events {
                 let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
                     context: origin,
@@ -1091,6 +1101,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         } else {
             stderr.clear();
             stdout.clear();
+            context_changed = false;
         }
         repl_write(stdout, format_args!("> "))?;
         stdout.clear();
@@ -1129,6 +1140,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             close_repl_context(live).await?;
             return Ok(());
         };
+        let context_depth = contexts.len();
         let scope = contexts.last().unwrap().scope();
         let Some((spec, arguments)) = registry::resolve(&line) else {
             // Not a registered command: chat sends it, other contexts reject it.
@@ -1139,8 +1151,6 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             if let Some(parsed) = mention::parse(&line) {
                 let names: Vec<String> = parsed.agents.iter().map(|&n| n.to_owned()).collect();
                 let prompt = parsed.prompt.to_owned();
-                // A new context replaces the breadcrumb, so its echo is not a status.
-                navigated = true;
                 if let Some(error) = route_mentions(
                     service, workspace, contexts, registered, live, &names, &prompt, stdout,
                 )
@@ -1149,18 +1159,39 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
+                let entered = contexts.len() != context_depth;
+                context_changed = entered;
                 if prompt.is_empty() {
                     continue;
                 }
                 let chat = live.as_mut().expect("entered context has a live service");
-                if let Err(error) = chat.send(prompt, timestamp()).await {
+                if let Err(error) = chat.send(prompt.clone(), timestamp()).await {
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
                 if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
+                    use crate::tui::app::{CommandResult, HistoryAuthor, HistoryEntry};
+
+                    let result = if entered {
+                        context_changed = false;
+                        CommandResult::SubmittedWithContext(
+                            project_context_snapshot(
+                                service,
+                                workspace,
+                                contexts,
+                                Some(HistoryEntry {
+                                    author: HistoryAuthor::User,
+                                    body: prompt.clone(),
+                                }),
+                            )
+                            .await?,
+                        )
+                    } else {
+                        CommandResult::Submitted
+                    };
                     let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
                         context: origin,
-                        result: crate::tui::app::CommandResult::Submitted,
+                        result,
                     });
                 }
                 drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
@@ -1604,8 +1635,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             // A registered command with arguments it does not accept.
             _ => repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?,
         }
-        navigated = matches!(spec.name, "/room" | "/thread" | "/dm" | "/back")
-            || (spec.name == "/work" && !arguments.is_empty());
+        context_changed = contexts.len() != context_depth;
     }
 }
 
@@ -2301,6 +2331,46 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
         Context::new(id, segments.join(" > ")),
         current.scope(),
     ))
+}
+
+async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    contexts: &[ReplContext],
+    history_fallback: Option<crate::tui::app::HistoryEntry>,
+) -> Result<crate::tui::app::ContextSnapshot, CliError> {
+    use crate::tui::app::{ContextSnapshot, History, HistoryAuthor, HistoryEntry};
+
+    let context = project_repl_context(service, contexts).await?;
+    let history = match contexts.last().and_then(ReplContext::conversation_id) {
+        Some(conversation_id) => workspace
+            .storage()
+            .list_recent_messages(conversation_id, TUI_HISTORY_LIMIT)
+            .await
+            .map(|(messages, truncated)| History {
+                entries: messages
+                    .into_iter()
+                    .map(|message| HistoryEntry {
+                        author: match message.sender_type {
+                            MemberType::User => HistoryAuthor::User,
+                            MemberType::Agent => HistoryAuthor::Agent,
+                        },
+                        body: message.body,
+                    })
+                    .collect(),
+                truncated,
+            })
+            .map_err(|error| error.to_string()),
+        None => Ok(History {
+            entries: Vec::new(),
+            truncated: false,
+        }),
+    };
+    Ok(ContextSnapshot {
+        context,
+        history,
+        history_fallback,
+    })
 }
 
 fn visible_command_names(scope: CommandScope) -> Vec<String> {
