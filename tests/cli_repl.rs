@@ -2,8 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use july_workspace::application::ChatEvent;
 use july_workspace::cli::InactiveTuiBridge;
 use july_workspace::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, MemberType, Message, MessageId,
-    ResultId, Room, RoomId, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, Decision, DecisionId,
+    DecisionOwner, DecisionStatus, DecisionType, MemberType, Message, MessageId, ResultId, Room,
+    RoomId, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use july_workspace::storage::SqliteStore;
 use july_workspace::tui::app::{App, AppCommand, AppEvent, CommandResult, Context};
@@ -123,6 +124,50 @@ impl TestWorkspace {
         agent
     }
 
+    fn seed_failed_dm_delivery(&self, body: &str) -> (MessageId, Agent) {
+        let source = self.seed_acp_agent("delivery-source", &[]);
+        let target = self.seed_acp_agent("delivery-target", &[]);
+        let message_id = MessageId::new();
+        let mut store = SqliteStore::open(&self.database).unwrap();
+        store
+            .persist_agent_direct_message(message_id, source.id, target.id, body, NOW)
+            .unwrap();
+        store
+            .mark_delivery_failed(message_id, target.id, NOW)
+            .unwrap();
+        (message_id, target)
+    }
+
+    fn seed_failed_thread_delivery(
+        &self,
+        thread_id: ConversationId,
+        source: &Agent,
+        target: &Agent,
+        body: &str,
+    ) -> MessageId {
+        let message = Message {
+            id: MessageId::new(),
+            conversation_id: thread_id,
+            sender_type: MemberType::Agent,
+            sender_id: source.id.to_string(),
+            body: body.into(),
+            reply_to: None,
+            metadata: json!({"mention": target.id.to_string()}),
+            created_at: NOW.into(),
+        };
+        let mut store = SqliteStore::open(&self.database).unwrap();
+        store
+            .insert_message_with_pending_delivery(&message, target.id, Some("capsule"))
+            .unwrap();
+        store
+            .mark_delivery_capsule_delivered(message.id, target.id, NOW)
+            .unwrap();
+        store
+            .mark_delivery_failed(message.id, target.id, NOW)
+            .unwrap();
+        message.id
+    }
+
     fn seed_thread(&self, room: &Room, title: &str, agents: &[&Agent]) -> ConversationId {
         let thread = Conversation {
             id: ConversationId::new(),
@@ -146,6 +191,36 @@ impl TestWorkspace {
             )
             .unwrap();
         thread.id
+    }
+
+    fn seed_decision(
+        &self,
+        thread_id: ConversationId,
+        title: &str,
+        owner: DecisionOwner,
+    ) -> Decision {
+        let decision = Decision {
+            id: DecisionId::new(),
+            thread_id,
+            decision_type: DecisionType::Technical,
+            title: title.into(),
+            decision: None,
+            reason: None,
+            selected_proposal_id: None,
+            alternatives: vec!["keep current contract".into(), "replace contract".into()],
+            evidence: vec!["test:payment_contract".into()],
+            participants: Vec::new(),
+            decision_owner: owner,
+            status: DecisionStatus::Pending,
+            supersedes_decision_id: None,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+        };
+        SqliteStore::open(&self.database)
+            .unwrap()
+            .record_decision(&decision)
+            .unwrap();
+        decision
     }
 
     fn seed_message(
@@ -464,6 +539,75 @@ fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn repl_lists_and_retries_failed_deliveries_without_changing_context() {
+    let workspace = TestWorkspace::new();
+    let (message_id, target) = workspace.seed_failed_dm_delivery("repl retry body");
+
+    let output = workspace.repl(&format!(
+        "/status\n/deliveries\n/delivery retry {message_id} --agent {}\n/status\n/deliveries\n/quit\n",
+        target.name
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.contains("MESSAGE ID"));
+    assert!(output.contains(&message_id.to_string()));
+    assert!(output.contains("repl retry body"));
+    assert!(output.contains(&format!("delivered\t{message_id}\t{}", target.id)));
+    assert!(output.contains("No failed deliveries."));
+    assert_eq!(output.matches("root\n").count(), 2);
+}
+
+#[test]
+fn repl_retries_a_delivery_for_the_current_thread_without_opening_a_second_context() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let source = workspace.seed_acp_agent("thread-source", &[]);
+    let target = workspace.seed_acp_agent("thread-target", &[]);
+    workspace.add_member(&room, &source);
+    workspace.add_member(&room, &target);
+    let thread = workspace.seed_thread(&room, "Delivery retry", &[&source, &target]);
+    let message_id =
+        workspace.seed_failed_thread_delivery(thread, &source, &target, "current thread retry");
+
+    let output = workspace.repl(&format!(
+        "/room Operations\n/thread {thread} --agent {}\n/delivery retry {message_id} --agent {}\n1\n/status\n/quit\n",
+        target.name, target.name
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.contains(&format!("delivered\t{message_id}\t{}", target.id)));
+    assert!(output.contains(&format!("work\t{thread}\t{}", target.name)));
+}
+
+#[test]
+fn repl_detaches_a_temporary_retry_context_before_opening_that_thread() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let source = workspace.seed_acp_agent("temp-source", &[]);
+    let target = workspace.seed_acp_agent("temp-target", &[]);
+    workspace.add_member(&room, &source);
+    workspace.add_member(&room, &target);
+    let thread = workspace.seed_thread(&room, "Temporary retry", &[&source, &target]);
+    let message_id =
+        workspace.seed_failed_thread_delivery(thread, &source, &target, "temporary retry");
+
+    let output = workspace.repl(&format!(
+        "/room Operations\n/delivery retry {message_id} --agent {}\n/thread {thread} --agent {}\n/status\n/quit\n",
+        target.name, target.name
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.contains(&format!("delivered\t{message_id}\t{}", target.id)));
+    assert!(output.contains(&format!("work\t{thread}\t{}", target.name)));
 }
 
 #[test]
@@ -940,18 +1084,79 @@ fn repl_thread_switch_failures_leave_the_previous_context_active() {
 #[tokio::test]
 async fn inactive_tui_bridge_projects_visible_commands_for_root_room_dm_and_work() {
     const ROOT: &[&str] = &[
-        "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/help", "/exit",
+        "/dm",
+        "/room",
+        "/back",
+        "/rooms",
+        "/agents",
+        "/deliveries",
+        "/decisions",
+        "/decision accept",
+        "/decision reject",
+        "/decision work",
+        "/status",
+        "/delivery retry",
+        "/help",
+        "/exit",
     ];
     const ROOM: &[&str] = &[
-        "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/status", "/help",
+        "/dm",
+        "/room",
+        "/back",
+        "/rooms",
+        "/agents",
+        "/deliveries",
+        "/decisions",
+        "/decision accept",
+        "/decision reject",
+        "/decision work",
+        "/members",
+        "/work",
+        "/status",
+        "/delivery retry",
+        "/help",
         "/exit",
     ];
     const DM: &[&str] = &[
-        "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/restart", "/help", "/exit",
+        "/dm",
+        "/room",
+        "/back",
+        "/rooms",
+        "/agents",
+        "/deliveries",
+        "/decisions",
+        "/decision accept",
+        "/decision reject",
+        "/decision work",
+        "/status",
+        "/restart",
+        "/delivery retry",
+        "/help",
+        "/exit",
     ];
     const WORK: &[&str] = &[
-        "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/results", "/status",
-        "/publish", "/restart", "/help", "/exit",
+        "/dm",
+        "/room",
+        "/back",
+        "/rooms",
+        "/agents",
+        "/deliveries",
+        "/decisions",
+        "/decision accept",
+        "/decision reject",
+        "/decision work",
+        "/members",
+        "/work assign",
+        "/work status",
+        "/work result",
+        "/work",
+        "/results",
+        "/status",
+        "/publish",
+        "/restart",
+        "/delivery retry",
+        "/help",
+        "/exit",
     ];
 
     let workspace = TestWorkspace::new();
@@ -2062,6 +2267,176 @@ fn repl_plain_prompt_inside_work_stays_in_that_work() {
         &workspace,
         threads[0].parse().unwrap(),
         &["implement refund flow", "support partial refund too"],
+    );
+}
+
+#[test]
+fn repl_work_control_mutates_only_explicit_work_in_the_active_context() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_agent("codex");
+    workspace.add_member(&room, &codex);
+    let active_thread = workspace.seed_thread(&room, "active", &[&codex]);
+    let other_thread = workspace.seed_thread(&room, "other", &[&codex]);
+    let store = SqliteStore::open(&workspace.database).unwrap();
+    let active_work = store.list_work_items(active_thread).unwrap()[0].id;
+    let other_work = store.list_work_items(other_thread).unwrap()[0].id;
+    drop(store);
+
+    let output = workspace.repl(&format!(
+        "/room vna\n/work {active_thread}\n/work assign {active_work} --agent codex\n\
+         /work status {active_work} working\n\
+         /work result {active_work} --status accepted --summary refund contract verified\n\
+         /work assign {other_work} --agent codex\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let output_text = stdout(&output);
+    assert!(output_text.contains(&format!("assigned\t{active_work}\t{}\n", codex.id)));
+    assert!(output_text.contains(&format!("status\t{active_work}\tworking\n")));
+    assert!(output_text.contains(&format!("result\t{active_work}\t")));
+    assert!(stderr(&output).contains(&format!("work {other_work} does not exist\n")));
+
+    let store = SqliteStore::open(&workspace.database).unwrap();
+    let active = store.list_work_items(active_thread).unwrap().remove(0);
+    assert_eq!(active.owner_agent_id, Some(codex.id));
+    assert_eq!(active.status, WorkStatus::Ready);
+    let results = store.list_work_results(active_thread).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].work_id, active_work);
+    assert_eq!(results[0].status, "accepted");
+    assert_eq!(results[0].summary, "refund contract verified");
+    assert_eq!(
+        store.list_work_items(other_thread).unwrap()[0].owner_agent_id,
+        None
+    );
+}
+
+#[test]
+fn repl_work_control_rejects_room_scope_and_invalid_mutations() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_agent("codex");
+    workspace.add_member(&room, &codex);
+    let thread = workspace.seed_thread(&room, "active", &[&codex]);
+    let work = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_work_items(thread)
+        .unwrap()[0]
+        .id;
+
+    let output = workspace.repl(&format!(
+        "/room vna\n/work assign {work} --agent codex\n/work {thread}\n\
+         /work status {work} nonsense\n/work assign {work} codex\n\
+         /work result {work} --status --bad --summary invalid\n/quit\n"
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(errors.contains("/work assign is unavailable in room context"));
+    assert_eq!(errors.matches("invalid command\n").count(), 3);
+    let work = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_work_items(thread)
+        .unwrap()
+        .remove(0);
+    assert_eq!(work.status, WorkStatus::Open);
+    assert_eq!(work.owner_agent_id, None);
+}
+
+#[test]
+fn repl_decision_inbox_accepts_rejects_and_creates_explicit_work() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("payments");
+    let codex = workspace.seed_agent("codex");
+    workspace.add_member(&room, &codex);
+    let thread = workspace.seed_thread(&room, "callback retry", &[&codex]);
+    let accepted = workspace.seed_decision(thread, "Choose retry contract", DecisionOwner::User);
+    let rejected = workspace.seed_decision(thread, "Replace stable API", DecisionOwner::User);
+    let literal = workspace.seed_decision(thread, "Keep flag text", DecisionOwner::User);
+    let work_id = WorkItemId::new();
+    let literal_work_id = WorkItemId::new();
+
+    let output = workspace.repl(&format!(
+        "/decisions\n\
+         /decision accept {} --decision keep current contract --reason integration tests pass\n\
+         /decision reject {} --reason stable API already works\n\
+         /decision work {} --work-id {work_id} --title verify retry contract --agent codex\n\
+         /decision accept {} --decision \"keep --reason semantics\"\n\
+         /decision work {} --work-id {literal_work_id} --title \"verify --agent routing\"\n\
+         /decisions\n/quit\n",
+        accepted.id, rejected.id, accepted.id, literal.id, literal.id
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains(&accepted.id.to_string()));
+    assert!(text.contains("Choose retry contract"));
+    assert!(text.contains("test:payment_contract"));
+    assert!(text.contains(&format!("decided\t{}\n", accepted.id)));
+    assert!(text.contains(&format!("cancelled\t{}\n", rejected.id)));
+    assert!(text.contains(&format!("work\t{}\t{work_id}\n", accepted.id)));
+    assert!(text.contains("No pending decisions."));
+
+    let store = SqliteStore::open(&workspace.database).unwrap();
+    let accepted = store.get_decision(accepted.id).unwrap().unwrap();
+    assert_eq!(accepted.status, DecisionStatus::Decided);
+    assert_eq!(accepted.decision.as_deref(), Some("keep current contract"));
+    assert_eq!(accepted.reason.as_deref(), Some("integration tests pass"));
+    let rejected = store.get_decision(rejected.id).unwrap().unwrap();
+    assert_eq!(rejected.status, DecisionStatus::Cancelled);
+    assert_eq!(rejected.reason.as_deref(), Some("stable API already works"));
+    let work = store.get_work_item(work_id).unwrap().unwrap();
+    assert_eq!(work.title, "verify retry contract");
+    assert_eq!(work.owner_agent_id, Some(codex.id));
+    assert_eq!(
+        store
+            .get_decision(literal.id)
+            .unwrap()
+            .unwrap()
+            .decision
+            .as_deref(),
+        Some("keep --reason semantics")
+    );
+    assert_eq!(
+        store.get_work_item(literal_work_id).unwrap().unwrap().title,
+        "verify --agent routing"
+    );
+}
+
+#[test]
+fn repl_decision_actions_reject_non_user_ownership_and_bad_grammar() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("payments");
+    let architect = workspace.seed_agent("architect");
+    workspace.add_member(&room, &architect);
+    let thread = workspace.seed_thread(&room, "contract", &[&architect]);
+    let decision = workspace.seed_decision(
+        thread,
+        "Architect-owned decision",
+        DecisionOwner::Agent(architect.id),
+    );
+
+    let output = workspace.repl(&format!(
+        "/decision accept {} --decision override\n\
+         /decision reject {} --reason override\n\
+         /decision accept {} --decision\n/quit\n",
+        decision.id, decision.id, decision.id
+    ));
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let errors = stderr(&output);
+    assert_eq!(errors.matches("belongs to owner").count(), 2);
+    assert!(errors.contains("invalid command"));
+    assert_eq!(
+        SqliteStore::open(&workspace.database)
+            .unwrap()
+            .get_decision(decision.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        DecisionStatus::Pending
     );
 }
 

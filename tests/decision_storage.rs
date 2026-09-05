@@ -373,6 +373,38 @@ fn the_user_decides_a_dispute_and_ownership_follows_the_decision() {
 }
 
 #[test]
+fn the_user_can_cancel_a_disputed_decision_without_leaving_the_handoff_open() {
+    let database = TestDatabase::new();
+    let seeded = seed(database.path());
+    let mut store = database.store();
+    let (handoff, decision) = escalate(&mut store, &seeded, DecisionOwner::User);
+
+    let cancelled = store
+        .cancel_decision(
+            decision.id,
+            DecisionOwner::User,
+            "keep current ownership",
+            DECIDED,
+        )
+        .unwrap();
+
+    assert_eq!(cancelled.status, DecisionStatus::Cancelled);
+    assert_eq!(cancelled.reason.as_deref(), Some("keep current ownership"));
+    assert_eq!(
+        store.get_handoff(handoff.id).unwrap().unwrap().status,
+        HandoffStatus::Resolved
+    );
+    assert_eq!(
+        store
+            .get_work_item(seeded.work_id)
+            .unwrap()
+            .unwrap()
+            .owner_agent_id,
+        None
+    );
+}
+
+#[test]
 fn a_named_agent_can_own_the_decision_and_others_cannot_settle_it() {
     let database = TestDatabase::new();
     let seeded = seed(database.path());

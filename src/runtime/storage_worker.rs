@@ -1,13 +1,14 @@
 use super::{RuntimeError, timestamp};
 use crate::application::{
     BuildRecoveryCapsule, CollaborationError, CollaborationRuntime, DeliberationError,
-    DeliberationRuntime, DependencyError, DependencyOutcome, DependencyRuntime, MembershipChange,
-    MembershipState, PublishError, PublishRuntime, PublishedResult, RecoveryCapsule, RecoveryError,
-    RecoveryInput, RecoveryRuntime, WorkError, WorkRuntime, format_recovery_capsule,
+    DeliberationRuntime, DependencyError, DependencyOutcome, DependencyRuntime,
+    FailedMessageDelivery, MembershipChange, MembershipState, PublishError, PublishRuntime,
+    PublishedResult, RecoveryCapsule, RecoveryError, RecoveryInput, RecoveryRuntime, WorkError,
+    WorkRuntime, format_recovery_capsule,
 };
 use crate::domain::{
     Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Decision,
-    DecisionId, DecisionOutcome, DecisionWork, Handoff, HandoffChallenge, HandoffId,
+    DecisionId, DecisionOutcome, DecisionOwner, DecisionWork, Handoff, HandoffChallenge, HandoffId,
     HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery,
     MessageId, PermissionDecision, Proposal, ProposalId, ProposalResponse, Publish, PublishId,
     ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
@@ -79,6 +80,8 @@ enum Command {
     WithdrawProposal(ProposalId, AgentId, String, Reply<Proposal>),
     RecordDecision(Box<Decision>, Reply<Decision>),
     DecideDecision(DecisionId, Box<DecisionOutcome>, String, Reply<Decision>),
+    CancelDecision(DecisionId, DecisionOwner, String, String, Reply<Decision>),
+    ListPendingDecisions(Reply<Vec<Decision>>),
     ConvertDecisionToWork(DecisionId, Vec<DecisionWork>, String, Reply<Vec<WorkItem>>),
     AdmitThreadSession(
         ConversationId,
@@ -112,6 +115,7 @@ enum Command {
     MarkDeliveryCapsuleDelivered(MessageId, AgentId, String, Reply<bool>),
     MarkDeliveryDelivered(MessageId, AgentId, String, Reply<bool>),
     MarkDeliveryFailed(MessageId, AgentId, String, Reply<bool>),
+    ListFailedMessageDeliveries(Reply<Vec<FailedMessageDelivery>>),
     ClaimThreadMentionRetry(
         MessageId,
         AgentId,
@@ -202,13 +206,23 @@ pub struct StorageWorker {
 
 impl StorageWorker {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
+        Self::open_inner(path, true)
+    }
+
+    pub(crate) fn open_for_inspection(path: impl AsRef<Path>) -> Result<Self, RuntimeError> {
+        Self::open_inner(path, false)
+    }
+
+    fn open_inner(path: impl AsRef<Path>, reconcile: bool) -> Result<Self, RuntimeError> {
         let path = PathBuf::from(path.as_ref());
         let (commands, receiver) = mpsc::channel(STORAGE_CAPACITY);
         let (started, ready) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::spawn(move || {
             let store = match SqliteStore::open(path) {
                 Ok(mut store) => {
-                    if let Err(error) = store.reconcile_pending_deliveries(&timestamp()) {
+                    if reconcile
+                        && let Err(error) = store.reconcile_pending_deliveries(&timestamp())
+                    {
                         let _ = started.send(Err(error));
                         return;
                     }
@@ -239,6 +253,12 @@ impl StorageWorker {
 
     pub(crate) fn handle(&self) -> StorageHandle {
         self.handle.clone()
+    }
+
+    pub async fn list_failed_message_deliveries(
+        &self,
+    ) -> Result<Vec<FailedMessageDelivery>, RuntimeError> {
+        self.handle.list_failed_message_deliveries().await
     }
 
     pub async fn shutdown(&mut self) -> Result<(), RuntimeError> {
@@ -379,6 +399,17 @@ impl StorageHandle {
             Command::MarkDeliveryFailed(message_id, target_agent_id, failed_at, reply)
         })
         .await
+    }
+
+    pub async fn list_failed_message_deliveries(
+        &self,
+    ) -> Result<Vec<FailedMessageDelivery>, RuntimeError> {
+        self.request(Command::ListFailedMessageDeliveries).await
+    }
+
+    pub async fn list_pending_decisions(&self) -> Result<Vec<Decision>, DeliberationError> {
+        self.deliberation_request(Command::ListPendingDecisions)
+            .await
     }
 
     pub(crate) async fn claim_thread_mention_retry(
@@ -994,7 +1025,7 @@ impl CollaborationRuntime for StorageWorker {
     }
 }
 
-impl WorkRuntime for StorageWorker {
+impl WorkRuntime for StorageHandle {
     async fn assign_work_owner(
         &mut self,
         work_id: WorkItemId,
@@ -1020,6 +1051,34 @@ impl WorkRuntime for StorageWorker {
     async fn create_work_result(&mut self, result: WorkResult) -> Result<WorkResult, WorkError> {
         self.work_request(|reply| Command::CreateWorkResult(result, reply))
             .await
+    }
+}
+
+impl WorkRuntime for StorageWorker {
+    async fn assign_work_owner(
+        &mut self,
+        work_id: WorkItemId,
+        owner_agent_id: AgentId,
+        assigned_at: String,
+    ) -> Result<WorkItem, WorkError> {
+        self.handle
+            .assign_work_owner(work_id, owner_agent_id, assigned_at)
+            .await
+    }
+
+    async fn transition_work(
+        &mut self,
+        work_id: WorkItemId,
+        target: WorkStatus,
+        transitioned_at: String,
+    ) -> Result<WorkItem, WorkError> {
+        self.handle
+            .transition_work(work_id, target, transitioned_at)
+            .await
+    }
+
+    async fn create_work_result(&mut self, result: WorkResult) -> Result<WorkResult, WorkError> {
+        self.handle.create_work_result(result).await
     }
 }
 
@@ -1289,6 +1348,17 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::DecideDecision(decision_id, outcome, decided_at, reply) => {
                 let _ = reply.send(store.decide(decision_id, &outcome, &decided_at));
             }
+            Command::CancelDecision(decision_id, cancelled_by, reason, cancelled_at, reply) => {
+                let _ = reply.send(store.cancel_decision(
+                    decision_id,
+                    cancelled_by,
+                    &reason,
+                    &cancelled_at,
+                ));
+            }
+            Command::ListPendingDecisions(reply) => {
+                let _ = reply.send(store.list_pending_decisions());
+            }
             Command::ConvertDecisionToWork(decision_id, items, created_at, reply) => {
                 let _ =
                     reply.send(store.convert_decision_to_work(decision_id, &items, &created_at));
@@ -1361,6 +1431,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::MarkDeliveryFailed(message_id, target_agent_id, failed_at, reply) => {
                 let _ =
                     reply.send(store.mark_delivery_failed(message_id, target_agent_id, &failed_at));
+            }
+            Command::ListFailedMessageDeliveries(reply) => {
+                let _ = reply.send(store.list_failed_message_deliveries());
             }
             Command::ClaimThreadMentionRetry(message_id, target_agent_id, claimed_at, reply) => {
                 let _ = reply.send(store.claim_failed_thread_mention_delivery(
@@ -1695,7 +1768,7 @@ fn map_deliberation_error(error: StoreError) -> DeliberationError {
     }
 }
 
-impl DeliberationRuntime for StorageWorker {
+impl DeliberationRuntime for StorageHandle {
     async fn propose_handoff(&mut self, handoff: Handoff) -> Result<Handoff, DeliberationError> {
         self.deliberation_request(|reply| Command::ProposeHandoff(Box::new(handoff), reply))
             .await
@@ -1779,6 +1852,19 @@ impl DeliberationRuntime for StorageWorker {
         .await
     }
 
+    async fn cancel_decision(
+        &mut self,
+        decision_id: DecisionId,
+        cancelled_by: DecisionOwner,
+        reason: String,
+        cancelled_at: String,
+    ) -> Result<Decision, DeliberationError> {
+        self.deliberation_request(|reply| {
+            Command::CancelDecision(decision_id, cancelled_by, reason, cancelled_at, reply)
+        })
+        .await
+    }
+
     async fn convert_decision_to_work(
         &mut self,
         decision_id: DecisionId,
@@ -1789,6 +1875,103 @@ impl DeliberationRuntime for StorageWorker {
             Command::ConvertDecisionToWork(decision_id, items, created_at, reply)
         })
         .await
+    }
+}
+
+impl DeliberationRuntime for StorageWorker {
+    async fn propose_handoff(&mut self, handoff: Handoff) -> Result<Handoff, DeliberationError> {
+        self.handle.propose_handoff(handoff).await
+    }
+
+    async fn respond_to_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        response: HandoffResponse,
+        responded_at: String,
+    ) -> Result<Handoff, DeliberationError> {
+        self.handle
+            .respond_to_handoff(handoff_id, response, responded_at)
+            .await
+    }
+
+    async fn challenge_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        challenge: HandoffChallenge,
+        challenged_at: String,
+    ) -> Result<(Handoff, Option<Decision>), DeliberationError> {
+        self.handle
+            .challenge_handoff(handoff_id, challenge, challenged_at)
+            .await
+    }
+
+    async fn resolve_handoff(
+        &mut self,
+        handoff_id: HandoffId,
+        agent_id: AgentId,
+        resolved_at: String,
+    ) -> Result<Handoff, DeliberationError> {
+        self.handle
+            .resolve_handoff(handoff_id, agent_id, resolved_at)
+            .await
+    }
+
+    async fn create_proposal(&mut self, proposal: Proposal) -> Result<Proposal, DeliberationError> {
+        self.handle.create_proposal(proposal).await
+    }
+
+    async fn respond_to_proposal(
+        &mut self,
+        response: ProposalResponse,
+    ) -> Result<ProposalResponse, DeliberationError> {
+        self.handle.respond_to_proposal(response).await
+    }
+
+    async fn withdraw_proposal(
+        &mut self,
+        proposal_id: ProposalId,
+        agent_id: AgentId,
+        withdrawn_at: String,
+    ) -> Result<Proposal, DeliberationError> {
+        self.handle
+            .withdraw_proposal(proposal_id, agent_id, withdrawn_at)
+            .await
+    }
+
+    async fn record_decision(&mut self, decision: Decision) -> Result<Decision, DeliberationError> {
+        self.handle.record_decision(decision).await
+    }
+
+    async fn decide(
+        &mut self,
+        decision_id: DecisionId,
+        outcome: DecisionOutcome,
+        decided_at: String,
+    ) -> Result<Decision, DeliberationError> {
+        self.handle.decide(decision_id, outcome, decided_at).await
+    }
+
+    async fn cancel_decision(
+        &mut self,
+        decision_id: DecisionId,
+        cancelled_by: DecisionOwner,
+        reason: String,
+        cancelled_at: String,
+    ) -> Result<Decision, DeliberationError> {
+        self.handle
+            .cancel_decision(decision_id, cancelled_by, reason, cancelled_at)
+            .await
+    }
+
+    async fn convert_decision_to_work(
+        &mut self,
+        decision_id: DecisionId,
+        items: Vec<DecisionWork>,
+        created_at: String,
+    ) -> Result<Vec<WorkItem>, DeliberationError> {
+        self.handle
+            .convert_decision_to_work(decision_id, items, created_at)
+            .await
     }
 }
 

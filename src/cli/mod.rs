@@ -1,14 +1,18 @@
 use crate::adapter::{ADAPTERS, AdapterSpec, AdapterStore};
 use crate::application::{
-    AddAgent, AddRoomMember, AddThreadMember, AgentRef, ChatEvent, ChatFailureKind,
-    ChatPermissionRequestId, CollaborationError, CollaborationService, CreateRoom, CreateThread,
-    DirectMessageError, DirectMessageRuntime, DirectMessageService, MembershipChange,
-    MembershipState, OpenThreadForAgent, PublishError, PublishResult, PublishService,
-    RemoveRoomMember, RemoveThreadMember, RoomRef, ThreadChatRuntime, ThreadChatService,
+    AddAgent, AddRoomMember, AddThreadMember, AgentDirectMessageOutcome, AgentRef, AssignWorkOwner,
+    ChatEvent, ChatFailureKind, ChatPermissionRequestId, CollaborationError, CollaborationService,
+    CreateRoom, CreateThread, CreateWorkResult, DeliberationError, DeliberationService,
+    DirectMessageError, DirectMessageRuntime, DirectMessageService, FailedMessageDelivery,
+    MembershipChange, MembershipState, OpenThreadForAgent, PublishError, PublishResult,
+    PublishService, RemoveRoomMember, RemoveThreadMember, RetryAgentDirectMessage,
+    RetryThreadMention, RoomRef, ThreadChatRuntime, ThreadChatService, ThreadMentionOutcome,
+    ThreadRuntime, TransitionWork, WorkError, WorkService,
 };
 use crate::domain::{
-    AgentId, ConversationId, MemberType, PermissionOption, PermissionOutcome, PublishId, ResultId,
-    RoomId, WorkItemId,
+    AgentId, ConversationId, ConversationKind, Decision, DecisionId, DecisionOutcome,
+    DecisionOwner, DecisionWork, MemberType, MessageId, PermissionOption, PermissionOutcome,
+    PublishId, ResultId, RoomId, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::runtime::{
     AgentDirectMessageRuntime, AgentThreadRuntime, DirectMessageBootstrapError, StorageWorker,
@@ -84,6 +88,10 @@ pub enum CliError {
     Collaboration(#[from] CollaborationError),
     #[error(transparent)]
     Publish(#[from] PublishError),
+    #[error(transparent)]
+    Work(#[from] WorkError),
+    #[error(transparent)]
+    Deliberation(#[from] DeliberationError),
     #[error("runtime error: {0}")]
     Runtime(String),
     #[error("agent turn failed: {0}")]
@@ -92,6 +100,11 @@ pub enum CliError {
     Disconnected(String),
     #[error("agent event stream closed")]
     EventStreamClosed,
+    #[error("delivery {message_id} to agent {target_agent_id} is not retryable")]
+    DeliveryNotRetryable {
+        message_id: MessageId,
+        target_agent_id: AgentId,
+    },
     #[error("{operation}; storage shutdown failed: {shutdown}")]
     OperationAndShutdown {
         operation: Box<CliError>,
@@ -136,6 +149,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         Command::Agent { operation, .. } => run_agent(operation, json).await,
         Command::Room { operation, .. } => run_room(operation, json).await,
         Command::Thread { operation, .. } => run_thread(operation, json).await,
+        Command::Delivery { operation, .. } => run_delivery(operation, json).await,
         Command::Publish {
             result_id,
             target_conversation_id,
@@ -202,10 +216,32 @@ impl CliError {
                 PublishError::AmbiguousTarget { .. } => "publish_target_ambiguous",
                 PublishError::Runtime(_) => "runtime_error",
             },
+            Self::Work(error) => match error {
+                WorkError::WorkNotFound(_) => "work_not_found",
+                WorkError::OwnerNotFound(_) => "agent_not_found",
+                WorkError::OwnerInactive(_) => "agent_inactive",
+                WorkError::OwnerOutOfScope { .. } => "work_owner_out_of_scope",
+                WorkError::TerminalOwnershipImmutable(_) => "terminal_work_immutable",
+                WorkError::InvalidTransition { .. } => "invalid_work_transition",
+                WorkError::InvalidTimestamp => "invalid_timestamp",
+                WorkError::ResultConflict(_) => "result_conflict",
+                WorkError::SupersededResultNotFound(_) => "result_not_found",
+                WorkError::CrossWorkSupersede { .. } => "cross_work_supersede",
+                WorkError::Runtime(_) => "runtime_error",
+            },
+            Self::Deliberation(error) => match error {
+                DeliberationError::NotFound(_) => "deliberation_not_found",
+                DeliberationError::Conflict(_) => "deliberation_conflict",
+                DeliberationError::NotPermitted(_) => "deliberation_not_permitted",
+                DeliberationError::InvalidTransition(_) => "invalid_deliberation_transition",
+                DeliberationError::Invalid(_) => "invalid_deliberation",
+                DeliberationError::Runtime(_) => "runtime_error",
+            },
             Self::MissingHome
             | Self::TurnFailed(_)
             | Self::Disconnected(_)
             | Self::EventStreamClosed => "runtime_error",
+            Self::DeliveryNotRetryable { .. } => "delivery_not_retryable",
             Self::OperationAndShutdown { operation, .. }
             | Self::OperationAndContextShutdown { operation, .. }
             | Self::OperationAndRestore { operation, .. } => operation.error_code(),
@@ -238,6 +274,10 @@ enum Command {
     },
     Thread {
         operation: ThreadOperation,
+        json: bool,
+    },
+    Delivery {
+        operation: DeliveryOperation,
         json: bool,
     },
     Publish {
@@ -428,6 +468,7 @@ impl Command {
                 | Self::Agent { json: true, .. }
                 | Self::Room { json: true, .. }
                 | Self::Thread { json: true, .. }
+                | Self::Delivery { json: true, .. }
                 | Self::Publish { json: true, .. }
         )
     }
@@ -497,6 +538,14 @@ enum ThreadOperation {
     },
 }
 
+enum DeliveryOperation {
+    List,
+    Retry {
+        message_id: MessageId,
+        agent: AgentRef,
+    },
+}
+
 fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
     let json = remove_json(&mut args)?;
     match args.first().map(String::as_str) {
@@ -510,6 +559,22 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("agent") => parse_agent(args, json),
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),
+        Some("delivery") => match args.as_slice() {
+            [_, operation] if operation == "list" => Ok(Command::Delivery {
+                operation: DeliveryOperation::List,
+                json,
+            }),
+            [_, operation, message, flag, agent] if operation == "retry" && flag == "--agent" => {
+                Ok(Command::Delivery {
+                    operation: DeliveryOperation::Retry {
+                        message_id: message_id(message)?,
+                        agent: agent_ref(agent)?,
+                    },
+                    json,
+                })
+            }
+            _ => Err(CliError::InvalidCommand),
+        },
         Some("publish") => parse_publish(args, json),
         Some("--version") | Some("-V") if args.len() == 1 => Ok(Command::Version { json }),
         Some(command) if command.starts_with("--") => Err(CliError::Usage),
@@ -886,6 +951,31 @@ fn result_id(value: &str) -> Result<ResultId, CliError> {
         .ok_or(CliError::Usage)
 }
 
+fn work_id(value: &str) -> Result<WorkItemId, CliError> {
+    let id = WorkItemId::from_str(value).map_err(|_| CliError::InvalidCommand)?;
+    (id.to_string() == value)
+        .then_some(id)
+        .ok_or(CliError::InvalidCommand)
+}
+
+fn decision_id(value: &str) -> Result<DecisionId, CliError> {
+    let id = DecisionId::from_str(value).map_err(|_| CliError::InvalidCommand)?;
+    (id.to_string() == value)
+        .then_some(id)
+        .ok_or(CliError::InvalidCommand)
+}
+
+fn work_status(value: &str) -> Result<WorkStatus, CliError> {
+    WorkStatus::from_str(value).map_err(|_| CliError::InvalidCommand)
+}
+
+fn message_id(value: &str) -> Result<MessageId, CliError> {
+    let id = MessageId::from_str(value).map_err(|_| CliError::Usage)?;
+    (id.to_string() == value)
+        .then_some(id)
+        .ok_or(CliError::Usage)
+}
+
 async fn run_repl() -> Result<(), CliError> {
     let database = database_path()?;
     if let Some(parent) = database
@@ -1069,6 +1159,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         live,
     } = state;
     let mut publish = PublishService::new(workspace.storage());
+    let mut deliberation = DeliberationService::new(workspace.storage().clone());
     let mut pending_origin = None;
     let mut context_changed = false;
     loop {
@@ -1300,6 +1391,318 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
             },
+            "/deliveries" if arguments.is_empty() => {
+                match workspace.storage().list_failed_message_deliveries().await {
+                    Ok(deliveries) => repl_write(
+                        stdout,
+                        format_args!("{}\n", render_failed_deliveries(deliveries, false)),
+                    )?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/decisions" if arguments.is_empty() => {
+                match workspace.storage().list_pending_decisions().await {
+                    Ok(decisions) => repl_write(
+                        stdout,
+                        format_args!("{}\n", render_pending_decisions(decisions)),
+                    )?,
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/decision accept" => {
+                let parsed = repl_arguments(arguments).and_then(|fields| {
+                    let id = decision_id(fields.first().ok_or(CliError::InvalidCommand)?)?;
+                    if fields.get(1).map(String::as_str) != Some("--decision") {
+                        return Err(CliError::InvalidCommand);
+                    }
+                    let reason_at = fields.iter().position(|field| *field == "--reason");
+                    let decision_end = reason_at.unwrap_or(fields.len());
+                    if decision_end <= 2 {
+                        return Err(CliError::InvalidCommand);
+                    }
+                    let reason = match reason_at {
+                        Some(index) if index + 1 < fields.len() => {
+                            Some(fields[index + 1..].join(" "))
+                        }
+                        Some(_) => return Err(CliError::InvalidCommand),
+                        None => None,
+                    };
+                    Ok((id, fields[2..decision_end].join(" "), reason))
+                });
+                match parsed {
+                    Ok((id, decision, reason)) => {
+                        let mut outcome = DecisionOutcome::new(DecisionOwner::User, decision);
+                        outcome.reason = reason;
+                        match deliberation.decide(id, outcome, timestamp()).await {
+                            Ok(decision) => {
+                                repl_write(stdout, format_args!("decided\t{}\n", decision.id))?
+                            }
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/decision reject" => {
+                let parsed = repl_arguments(arguments).and_then(|fields| match fields.as_slice() {
+                    [id, flag, reason @ ..] if flag == "--reason" && !reason.is_empty() => {
+                        decision_id(id).map(|id| (id, reason.join(" ")))
+                    }
+                    _ => Err(CliError::InvalidCommand),
+                });
+                match parsed {
+                    Ok((id, reason)) => match deliberation
+                        .cancel_decision(id, DecisionOwner::User, reason, timestamp())
+                        .await
+                    {
+                        Ok(decision) => {
+                            repl_write(stdout, format_args!("cancelled\t{}\n", decision.id))?
+                        }
+                        Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                    },
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/decision work" => {
+                let parsed = repl_arguments(arguments).and_then(|fields| {
+                    let id = decision_id(fields.first().ok_or(CliError::InvalidCommand)?)?;
+                    if fields.get(1).map(String::as_str) != Some("--work-id")
+                        || fields.get(3).map(String::as_str) != Some("--title")
+                    {
+                        return Err(CliError::InvalidCommand);
+                    }
+                    let work_id = work_id(fields.get(2).ok_or(CliError::InvalidCommand)?)?;
+                    let agent_at = fields.iter().position(|field| *field == "--agent");
+                    let title_end = agent_at.unwrap_or(fields.len());
+                    if title_end <= 4 {
+                        return Err(CliError::InvalidCommand);
+                    }
+                    let agent = match agent_at {
+                        Some(index) if index + 2 == fields.len() => {
+                            Some(agent_ref(&fields[index + 1])?)
+                        }
+                        Some(_) => return Err(CliError::InvalidCommand),
+                        None => None,
+                    };
+                    Ok((id, work_id, fields[4..title_end].join(" "), agent))
+                });
+                match parsed {
+                    Ok((id, work_id, title, agent)) => {
+                        let owner_agent_id = match agent {
+                            Some(agent) => match service.resolve_agent(agent).await {
+                                Ok(agent) => Some(agent.id),
+                                Err(error) => {
+                                    repl_write(stderr, format_args!("{error}\n"))?;
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        let item = DecisionWork {
+                            work_id,
+                            title,
+                            goal: None,
+                            owner_agent_id,
+                            depends_on: Vec::new(),
+                        };
+                        match deliberation
+                            .convert_decision_to_work(id, vec![item], timestamp())
+                            .await
+                        {
+                            Ok(_) => repl_write(stdout, format_args!("work\t{id}\t{work_id}\n"))?,
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/delivery retry" if !arguments.is_empty() => {
+                let fields: Vec<_> = arguments.split_whitespace().collect();
+                let (message, agent) = match fields.as_slice() {
+                    [message, flag, agent] if *flag == "--agent" => (*message, *agent),
+                    _ => {
+                        repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
+                        continue;
+                    }
+                };
+                let parsed =
+                    message_id(message).and_then(|message_id| Ok((message_id, agent_ref(agent)?)));
+                match parsed {
+                    Ok((message_id, agent)) => {
+                        match retry_delivery(
+                            service,
+                            workspace,
+                            registered,
+                            Some(contexts.last().expect("REPL always has a root context")),
+                            live.as_mut(),
+                            message_id,
+                            agent,
+                        )
+                        .await
+                        {
+                            Ok((target_agent_id, used_live)) => {
+                                repl_write(
+                                    stdout,
+                                    format_args!("delivered\t{message_id}\t{target_agent_id}\n"),
+                                )?;
+                                if used_live {
+                                    drain_repl_turn(
+                                        live.as_mut().expect("live retry has a live context"),
+                                        input,
+                                        stdout,
+                                        stderr,
+                                        tui_events,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/work assign" => {
+                let fields = arguments.split_whitespace().collect::<Vec<_>>();
+                let parsed = match fields.as_slice() {
+                    [work, flag, agent] if *flag == "--agent" => {
+                        work_id(work).and_then(|work_id| Ok((work_id, agent_ref(agent)?)))
+                    }
+                    _ => Err(CliError::InvalidCommand),
+                };
+                match parsed {
+                    Ok((work_id, agent)) => {
+                        let conversation_id = contexts
+                            .last()
+                            .and_then(ReplContext::conversation_id)
+                            .expect("work control is scoped to work context");
+                        if let Err(error) =
+                            require_context_work(service, conversation_id, work_id).await
+                        {
+                            repl_write(stderr, format_args!("{error}\n"))?;
+                            continue;
+                        }
+                        let agent = match service.resolve_agent(agent).await {
+                            Ok(agent) => agent,
+                            Err(error) => {
+                                repl_write(stderr, format_args!("{error}\n"))?;
+                                continue;
+                            }
+                        };
+                        let mut works = WorkService::new(workspace.storage());
+                        match works
+                            .assign_owner(AssignWorkOwner {
+                                work_id,
+                                owner_agent_id: agent.id,
+                                assigned_at: timestamp(),
+                            })
+                            .await
+                        {
+                            Ok(work) => repl_write(
+                                stdout,
+                                format_args!(
+                                    "assigned\t{}\t{}\n",
+                                    work.id,
+                                    work.owner_agent_id.expect("assigned work has an owner")
+                                ),
+                            )?,
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/work status" => {
+                let fields = arguments.split_whitespace().collect::<Vec<_>>();
+                let parsed = match fields.as_slice() {
+                    [work, status] => {
+                        work_id(work).and_then(|work_id| Ok((work_id, work_status(status)?)))
+                    }
+                    _ => Err(CliError::InvalidCommand),
+                };
+                match parsed {
+                    Ok((work_id, status)) => {
+                        let conversation_id = contexts
+                            .last()
+                            .and_then(ReplContext::conversation_id)
+                            .expect("work control is scoped to work context");
+                        if let Err(error) =
+                            require_context_work(service, conversation_id, work_id).await
+                        {
+                            repl_write(stderr, format_args!("{error}\n"))?;
+                            continue;
+                        }
+                        let mut works = WorkService::new(workspace.storage());
+                        match works
+                            .transition(TransitionWork {
+                                work_id,
+                                target: status,
+                                transitioned_at: timestamp(),
+                            })
+                            .await
+                        {
+                            Ok(work) => repl_write(
+                                stdout,
+                                format_args!("status\t{}\t{}\n", work.id, work.status),
+                            )?,
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
+            "/work result" => {
+                let fields = arguments.split_whitespace().collect::<Vec<_>>();
+                let parsed = match fields.as_slice() {
+                    [work, status_flag, status, summary_flag, summary @ ..]
+                        if *status_flag == "--status"
+                            && *summary_flag == "--summary"
+                            && !status.starts_with("--")
+                            && !summary.is_empty() =>
+                    {
+                        work_id(work)
+                            .map(|work_id| (work_id, (*status).to_owned(), summary.join(" ")))
+                    }
+                    _ => Err(CliError::InvalidCommand),
+                };
+                match parsed {
+                    Ok((work_id, status, summary)) => {
+                        let conversation_id = contexts
+                            .last()
+                            .and_then(ReplContext::conversation_id)
+                            .expect("work control is scoped to work context");
+                        if let Err(error) =
+                            require_context_work(service, conversation_id, work_id).await
+                        {
+                            repl_write(stderr, format_args!("{error}\n"))?;
+                            continue;
+                        }
+                        let mut works = WorkService::new(workspace.storage());
+                        match works
+                            .create_result(CreateWorkResult {
+                                result: WorkResult {
+                                    id: ResultId::new(),
+                                    work_id,
+                                    status,
+                                    summary,
+                                    outputs: Vec::new(),
+                                    evidence: Vec::new(),
+                                    supersedes_result_id: None,
+                                    created_at: timestamp(),
+                                },
+                            })
+                            .await
+                        {
+                            Ok(result) => repl_write(
+                                stdout,
+                                format_args!("result\t{}\t{}\n", result.work_id, result.id),
+                            )?,
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
             // In a Room, `/work` is the list of Works; inside one, its items.
             "/work"
                 if arguments.is_empty() && contexts.last().unwrap().conversation_id().is_none() =>
@@ -1655,6 +2058,23 @@ async fn require_thread_in_room<R: crate::application::CollaborationRuntime>(
             ))
             .into()
         })
+}
+
+async fn require_context_work<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    conversation_id: ConversationId,
+    work_id: WorkItemId,
+) -> Result<(), CliError> {
+    if service
+        .list_work_items(conversation_id)
+        .await?
+        .iter()
+        .any(|work| work.id == work_id)
+    {
+        Ok(())
+    } else {
+        Err(WorkError::WorkNotFound(work_id).into())
+    }
 }
 
 async fn open_repl_dm(
@@ -3229,6 +3649,302 @@ async fn run_room(operation: RoomOperation, json_output: bool) -> Result<(), Cli
         (Err(operation), Ok(())) => Err(operation),
         (Ok(_), Err(shutdown)) => Err(shutdown),
         (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn run_delivery(operation: DeliveryOperation, json_output: bool) -> Result<(), CliError> {
+    match operation {
+        DeliveryOperation::List => run_delivery_list(json_output).await,
+        DeliveryOperation::Retry { message_id, agent } => {
+            run_delivery_retry(message_id, agent, json_output).await
+        }
+    }
+}
+
+async fn run_delivery_list(json_output: bool) -> Result<(), CliError> {
+    let database = database_path()?;
+    let mut worker = StorageWorker::open_for_inspection(&database)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let deliveries = worker
+        .list_failed_message_deliveries()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let output = render_failed_deliveries(deliveries, json_output);
+    worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    println!("{output}");
+    Ok(())
+}
+
+fn render_failed_deliveries(deliveries: Vec<FailedMessageDelivery>, json_output: bool) -> String {
+    if json_output {
+        json!(
+            deliveries
+                .into_iter()
+                .map(|failed| json!({
+                    "message_id": failed.message.id.to_string(),
+                    "conversation_id": failed.message.conversation_id.to_string(),
+                    "conversation_kind": failed.conversation_kind.to_string(),
+                    "sender_id": failed.message.sender_id,
+                    "target_agent_id": failed.delivery.target_agent_id.to_string(),
+                    "status": failed.delivery.status.to_string(),
+                    "capsule_delivered_at": failed.delivery.capsule_delivered_at,
+                    "updated_at": failed.delivery.updated_at,
+                    "body": failed.message.body,
+                }))
+                .collect::<Vec<_>>()
+        )
+        .to_string()
+    } else if deliveries.is_empty() {
+        "No failed deliveries.".into()
+    } else {
+        render_table(
+            [
+                "MESSAGE ID",
+                "CONVERSATION ID",
+                "KIND",
+                "SENDER ID",
+                "TARGET AGENT ID",
+                "STATUS",
+                "CAPSULE DELIVERED AT",
+                "UPDATED AT",
+                "BODY",
+            ],
+            deliveries
+                .into_iter()
+                .map(|failed| {
+                    [
+                        failed.message.id.to_string(),
+                        failed.message.conversation_id.to_string(),
+                        failed.conversation_kind.to_string(),
+                        failed.message.sender_id,
+                        failed.delivery.target_agent_id.to_string(),
+                        failed.delivery.status.to_string(),
+                        failed.delivery.capsule_delivered_at.unwrap_or_default(),
+                        failed.delivery.updated_at,
+                        serde_json::to_string(&failed.message.body)
+                            .expect("serializing a string cannot fail"),
+                    ]
+                })
+                .collect(),
+        )
+    }
+}
+
+fn render_pending_decisions(decisions: Vec<Decision>) -> String {
+    if decisions.is_empty() {
+        return "No pending decisions.".into();
+    }
+    render_table(
+        [
+            "DECISION ID",
+            "THREAD ID",
+            "TYPE",
+            "TITLE",
+            "OWNER",
+            "STATUS",
+            "ALTERNATIVES",
+            "EVIDENCE",
+        ],
+        decisions
+            .into_iter()
+            .map(|decision| {
+                [
+                    decision.id.to_string(),
+                    decision.thread_id.to_string(),
+                    decision.decision_type.to_string(),
+                    decision.title,
+                    decision.decision_owner.to_string(),
+                    decision.status.to_string(),
+                    serde_json::to_string(&decision.alternatives)
+                        .expect("serializing string alternatives cannot fail"),
+                    serde_json::to_string(&decision.evidence)
+                        .expect("serializing string evidence cannot fail"),
+                ]
+            })
+            .collect(),
+    )
+}
+
+async fn run_delivery_retry(
+    message_id: MessageId,
+    agent: AgentRef,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let database = database_path()?;
+    let worker = StorageWorker::open_for_inspection(&database)
+        .map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut workspace =
+        WorkspaceRuntime::new(worker).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let operation = async {
+        let mut service = CollaborationService::new(workspace.storage());
+        let mut registered = HashSet::new();
+        let target_agent_id = retry_delivery(
+            &mut service,
+            &workspace,
+            &mut registered,
+            None,
+            None,
+            message_id,
+            agent,
+        )
+        .await?
+        .0;
+        Ok(if json_output {
+            json!({
+                "message_id": message_id.to_string(),
+                "target_agent_id": target_agent_id.to_string(),
+                "status": "delivered",
+            })
+            .to_string()
+        } else {
+            format!("delivered\t{message_id}\t{target_agent_id}")
+        })
+    }
+    .await;
+    let shutdown = workspace
+        .shutdown(timestamp())
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    match (operation, shutdown) {
+        (Ok(output), Ok(())) => {
+            println!("{output}");
+            Ok(())
+        }
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndShutdown {
+            operation: Box::new(operation),
+            shutdown: shutdown.to_string(),
+        }),
+    }
+}
+
+async fn retry_delivery<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    registered: &mut HashSet<AgentId>,
+    current_context: Option<&ReplContext>,
+    live: Option<&mut ReplChat>,
+    message_id: MessageId,
+    agent: AgentRef,
+) -> Result<(AgentId, bool), CliError> {
+    let agent = service.resolve_agent(agent).await?;
+    let failed = workspace
+        .storage()
+        .list_failed_message_deliveries()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()))?
+        .into_iter()
+        .find(|failed| {
+            failed.message.id == message_id && failed.delivery.target_agent_id == agent.id
+        })
+        .ok_or(CliError::DeliveryNotRetryable {
+            message_id,
+            target_agent_id: agent.id,
+        })?;
+    if let (
+        ConversationKind::Thread,
+        Some(ReplContext::Thread {
+            conversation_id,
+            agent_id,
+            ..
+        }),
+        Some(ReplChat::Thread(thread)),
+    ) = (failed.conversation_kind, current_context, live)
+        && *conversation_id == failed.message.conversation_id
+        && *agent_id == agent.id
+    {
+        return match thread
+            .retry_thread_mention(RetryThreadMention {
+                message_id,
+                target_agent_id: agent.id,
+                retried_at: timestamp(),
+            })
+            .await?
+        {
+            Some(ThreadMentionOutcome::Delivered(_)) => Ok((agent.id, true)),
+            Some(ThreadMentionOutcome::PersistedFailed(error)) => Err(error.into()),
+            None => Err(CliError::DeliveryNotRetryable {
+                message_id,
+                target_agent_id: agent.id,
+            }),
+        };
+    }
+    if registered.insert(agent.id)
+        && let Err(error) = register_acp_agent(workspace, &agent).await
+    {
+        registered.remove(&agent.id);
+        return Err(error.into());
+    }
+    let retried_at = timestamp();
+    let delivered = match failed.conversation_kind {
+        ConversationKind::Dm => {
+            let runtime = workspace
+                .direct_message_for_agent(agent.id)
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let mut service = DirectMessageService::new(runtime);
+            let operation = match service
+                .retry_agent_message(RetryAgentDirectMessage {
+                    message_id,
+                    target_agent_id: agent.id,
+                    retried_at: retried_at.clone(),
+                })
+                .await
+            {
+                Ok(Some(AgentDirectMessageOutcome::Delivered(_))) => Ok(true),
+                Ok(Some(AgentDirectMessageOutcome::PersistedFailed(error))) => Err(error.into()),
+                Ok(None) => Ok(false),
+                Err(error) => Err(error.into()),
+            };
+            let shutdown = service.shutdown(timestamp()).await.map_err(CliError::from);
+            combine_context_shutdown(operation, shutdown)?
+        }
+        ConversationKind::Thread => {
+            let mut runtime = workspace
+                .thread(agent.id)
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            let operation: Result<bool, CliError> = match runtime
+                .retry_thread_mention(RetryThreadMention {
+                    message_id,
+                    target_agent_id: agent.id,
+                    retried_at,
+                })
+                .await
+            {
+                Ok(Some(ThreadMentionOutcome::Delivered(_))) => Ok(true),
+                Ok(Some(ThreadMentionOutcome::PersistedFailed(error))) => Err(error.into()),
+                Ok(None) => Ok(false),
+                Err(error) => Err(error.into()),
+            };
+            let shutdown = ThreadRuntime::shutdown(&mut runtime, timestamp())
+                .await
+                .map_err(CliError::from);
+            combine_context_shutdown(operation, shutdown)?
+        }
+    };
+    delivered
+        .then_some((agent.id, false))
+        .ok_or(CliError::DeliveryNotRetryable {
+            message_id,
+            target_agent_id: agent.id,
+        })
+}
+
+fn combine_context_shutdown<T>(
+    operation: Result<T, CliError>,
+    shutdown: Result<(), CliError>,
+) -> Result<T, CliError> {
+    match (operation, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(operation), Err(shutdown)) => Err(CliError::OperationAndContextShutdown {
             operation: Box::new(operation),
             shutdown: shutdown.to_string(),
         }),

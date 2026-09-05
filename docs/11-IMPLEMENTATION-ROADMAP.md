@@ -505,6 +505,76 @@ Live-provider smoke remains opt-in and is not Phase 10 closure evidence.
 
 ---
 
+## Post-Phase 10 — Delivery operations
+
+Status: implemented and verified under `JULY_WORKSPACE-sca.3`.
+
+`july delivery list [--json]` and `/deliveries` expose deterministic,
+workspace-wide FAILED delivery inspection. `july delivery retry <message-id>
+--agent <agent> [--json]` and `/delivery retry ...` reuse the existing DM and
+Thread failed-only claim engines and preserve the current REPL/TUI context.
+Missing, non-failed and concurrently claimed rows are typed as
+`delivery_not_retryable`.
+
+This surface adds no schema, daemon, automatic retry/backoff, failure-reason
+persistence or exactly-once guarantee. Retry remains explicit and at-least-once:
+a crash after transport acceptance but before the `DELIVERED` write can cause a
+duplicate exact-body delivery.
+
+---
+
+## Post-Phase 10 — Explicit Work control
+
+Status: implemented and verified under `JULY_WORKSPACE-sca.5`.
+
+The active Work context exposes explicit, deterministic mutations through
+`/work assign`, `/work status`, and `/work result`. Each command names a Work
+ID from the current context and reuses the existing Work lifecycle service.
+This slice adds no semantic routing, automatic dependency transition, schema,
+or A2A behavior.
+
+---
+
+## Post-Phase 10 — Human Decision inbox
+
+Status: implemented and verified under `JULY_WORKSPACE-sca.2`.
+
+`/decisions` lists only durable `pending` and `needs_decision` records with
+their owner, alternatives and evidence. `/decision accept` settles a
+user-owned Decision, `/decision reject` cancels it with an explicit reason,
+and `/decision work` converts a decided Decision into one explicitly identified
+Work item. These commands reuse the existing Decision and Work transactions.
+
+This slice adds no voting, scoring, semantic facilitator, automatic debate,
+schema, Room chat or A2A behavior.
+
+## Future phase — Room agent communication via A2A
+
+Status: deferred. It is not part of the current supplemental-feature phase and
+must not resume until explicitly scheduled.
+
+The active design is
+`docs/24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md`:
+
+- Room is the membership and durable shared-chat boundary;
+- `RoomMessage` is canonical shared state;
+- explicit mentions route and activate only Room members;
+- A2A carries interactions between July-managed agents in the same Room;
+- ACP remains the runtime execution layer;
+- private runtime transcripts never enter Room chat;
+- simple chat does not require Thread or Work;
+- external agents, cross-Room messaging and agent-agent DM are deferred.
+
+Future implementation order: audit, durable Room chat, mention routing, incremental
+Room cursors, agent-facing messaging, internal A2A bridge, ACP recipient
+delivery, shared-response normalization, structured Work integration,
+recovery, then cleanup of the obsolete external-first direction.
+
+`JULY_WORKSPACE-sca.5` is required only before structured Work integration;
+the human Decision inbox is not a prerequisite for Room chat.
+
+---
+
 ## Cross-phase metrics
 
 ### DM overhead

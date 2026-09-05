@@ -1,5 +1,8 @@
 # Lessons
 
+- Khi Sếp nói các tính năng đang làm chỉ là feature bổ sung và A2A thuộc phase khác, phải dừng mọi RoomMessage/A2A implementation, rollback đúng các hunk vừa tạo và quay lại Beads non-A2A đang sẵn sàng; không dùng tên roadmap cũ để suy diễn scope hiện tại.
+- Trước khi kết luận một feature chưa được implement hoặc rollback feature đó, phải audit cả `git log --all`, branch/ref liên quan và từng hunk chưa commit; không suy ra từ semantic search hay `git status` tổng quát khi worktree đang chứa nhiều slice trộn lẫn.
+- Khi thiết kế A2A cho July, phải khóa product boundary trước: A2A là kênh agent↔agent giữa các July-managed agents cùng Room; không tự suy diễn thành external-agent interoperability hay runtime adapter thay ACP.
 - Khi thiết kế autocomplete trong editor mà `Enter` hiện đang submit, phải chốt precedence rõ: lần đầu accept suggestion và thêm space, lần sau mới submit; đồng thời quyết định riêng trường hợp nhiều candidate để không nuốt `Enter` vô ích.
 - Khi một thuật ngữ gần giống từ khóa sản phẩm có thể dẫn tới hai luồng UX khác nhau (ví dụ `motion`/`mention`), phải xác nhận nghĩa trước khi chốt plan; sau khi xác nhận thì sửa ngay task scope, không giữ assumption cũ.
 - Khi Sếp nói “làm tiếp” sau khi phase trước đã được báo hoàn tất, phải kiểm tra Git/Beads và thực hiện task kế tiếp theo thứ tự; không tự suy diễn thiết kế ghi “future Phase” thành lý do defer nếu prerequisite đã hoàn tất.
