@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -102,6 +104,12 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/prompt":
         session_id = message["params"]["sessionId"]
+        if prompt_log := os.environ.get("ACP_PROMPT_LOG"):
+            content = message["params"]["prompt"][0]["text"]
+            with Path(prompt_log).open("a") as log:
+                log.write(json.dumps(content) + "\n")
+        if "--slow-prompt" in sys.argv:
+            time.sleep(0.05)
         if "--protocol-error" in sys.argv:
             send({
                 "jsonrpc": "2.0",

@@ -129,6 +129,87 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
             .await
     }
 
+    async fn finish_capsule_turn(&mut self, cancelled_at: &str) -> Result<(), CollaborationError> {
+        let expected = self
+            .session
+            .as_ref()
+            .ok_or(CollaborationError::ChatNotOpen)?
+            .session()
+            .clone();
+        let mut capsule_error = None;
+        loop {
+            let event = self
+                .next_event()
+                .await
+                .map_err(runtime_error)?
+                .ok_or_else(|| {
+                    CollaborationError::Runtime("Thread mention capsule event stream closed".into())
+                })?;
+            match event {
+                TransportEvent::TurnCompleted { session } => {
+                    require_session(&expected, &session)?;
+                    return capsule_error.map_or(Ok(()), Err);
+                }
+                TransportEvent::PermissionRequested(request) => {
+                    require_session(&expected, &request.session)?;
+                    if capsule_error.is_none() {
+                        self.session
+                            .as_ref()
+                            .ok_or(CollaborationError::ChatNotOpen)?
+                            .cancel_turn(cancelled_at.into())
+                            .await
+                            .map_err(runtime_error)?;
+                        capsule_error = Some(CollaborationError::Runtime(
+                            "Thread mention capsule requested permission".into(),
+                        ));
+                    } else {
+                        let response = self
+                            .session
+                            .as_ref()
+                            .ok_or(CollaborationError::ChatNotOpen)?
+                            .respond_permission(
+                                request.request_id,
+                                PermissionOutcome::Cancelled,
+                                cancelled_at.into(),
+                            )
+                            .await
+                            .map_err(runtime_error);
+                        match response {
+                            Ok(()) | Err(CollaborationError::PermissionRequestNotFound(_)) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                TransportEvent::TurnFailed { session, failure } => {
+                    require_session(&expected, &session)?;
+                    return Err(capsule_error.unwrap_or_else(|| {
+                        CollaborationError::Runtime(format!(
+                            "Thread mention capsule turn failed: {failure:?}"
+                        ))
+                    }));
+                }
+                TransportEvent::TransportDisconnected { agent_id, reason } => {
+                    if self.opened.ok_or(CollaborationError::ChatNotOpen)?.agent_id != agent_id {
+                        return Err(CollaborationError::SessionMismatch);
+                    }
+                    return Err(CollaborationError::Runtime(reason));
+                }
+                TransportEvent::SessionLost { session } => {
+                    require_session(&expected, &session)?;
+                    return Err(CollaborationError::SessionLost);
+                }
+                TransportEvent::TurnStarted { session }
+                | TransportEvent::AgentTextDelta { session, .. }
+                | TransportEvent::AgentMessageCompleted { session }
+                | TransportEvent::ToolCallStarted { session, .. }
+                | TransportEvent::ToolCallFinished { session, .. }
+                | TransportEvent::UsageReported { session, .. } => {
+                    require_session(&expected, &session)?;
+                }
+            }
+        }
+    }
+
     async fn persisted_failure(
         &self,
         message_id: MessageId,
@@ -218,6 +299,11 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                 .await
                 .map_err(runtime_error)
             {
+                return self
+                    .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
+                    .await;
+            }
+            if let Err(error) = self.finish_capsule_turn(&attempted_at).await {
                 return self
                     .persisted_failure(message.id, delivery.target_agent_id, attempted_at, error)
                     .await;

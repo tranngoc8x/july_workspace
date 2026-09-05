@@ -1,7 +1,7 @@
 use crate::domain::{
-    Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, MessageId,
-    Room, RoomId, RoomMember, SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId,
-    WorkResult,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, Message,
+    MessageDelivery, MessageId, Room, RoomId, RoomMember, SessionBindingId, SessionBindingStatus,
+    WorkItem, WorkItemId, WorkResult,
 };
 use thiserror::Error;
 
@@ -27,6 +27,13 @@ pub enum MembershipState {
 pub struct MembershipChange {
     pub state: MembershipState,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FailedMessageDelivery {
+    pub message: Message,
+    pub delivery: MessageDelivery,
+    pub conversation_kind: ConversationKind,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

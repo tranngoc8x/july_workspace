@@ -179,6 +179,23 @@ The CLI form always names its target. The REPL form may omit it when exactly
 one downstream conversation is linked by a work dependency; see `/publish`
 below.
 
+### Failed deliveries
+
+```bash
+july delivery list [--json]
+july delivery retry <message-id> --agent <agent> [--json]
+```
+
+`delivery list` is read-only and returns only `FAILED` delivery rows. `delivery
+retry` requires both the canonical message ID and an exact agent name or
+canonical `AgentId`; it atomically claims only the matching `FAILED` row and
+reuses the stored target, conversation kind and exact body. Missing, already
+delivered and concurrently claimed rows return `delivery_not_retryable`.
+
+Retry is explicit and remains at-least-once. A crash after transport acceptance
+but before the `DELIVERED` write can cause the exact body to be delivered again.
+There is no automatic retry/backoff and no exactly-once promise.
+
 ### Session
 
 ```bash
@@ -270,6 +287,7 @@ reports a no-op.
 ```text
 /rooms      Root | Room | Dm | Thread
 /agents     Root | Room | Dm | Thread
+/deliveries Root | Room | Dm | Thread
 /status     Root | Room | Dm | Thread
 /help       Root | Room | Dm | Thread
 /members    Room | Thread
@@ -283,6 +301,9 @@ current Room or Thread. `/work` lists the current Thread's work items and
 `/results` the results its work produced; work state is normally changed by the
 collaboration runtime, not by a REPL command.
 
+`/deliveries` is the interactive form of `july delivery list`; it inspects the
+same workspace-wide FAILED rows without changing the current context.
+
 `/help` renders the commands valid in the current scope, grouped by kind, from
 the registry. `/help <command>` renders that command's name, summary, usage,
 valid contexts, aliases and examples from the same metadata.
@@ -293,6 +314,7 @@ valid contexts, aliases and examples from the same metadata.
 /thread new <title> [--goal <goal>]   Room | Thread
 /publish <result> [--to <target>]     Thread
 /restart                              Dm | Thread
+/delivery retry <message-id> --agent <agent>  Root | Room | Dm | Thread
 /exit  (alias /quit)                  Root | Room | Dm | Thread
 ```
 
@@ -307,6 +329,9 @@ dependency resolves, no link is an error, and several require an explicit
 `/restart` restarts the current conversation's agent session in place. Session
 and binding identifiers stay out of the REPL; low-level session operations
 remain in the administrative CLI.
+
+`/delivery retry` uses the same failed-only retry operation as the finite CLI
+and leaves the REPL navigation stack unchanged.
 
 `/exit` is the canonical REPL exit and `/quit` is an alias. It leaves the REPL
 only: it deletes no workspace state, removes no membership and completes no

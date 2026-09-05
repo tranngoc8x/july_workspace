@@ -157,6 +157,55 @@ pub const COMMANDS: &[CommandSpec] = &[
         examples: &["/agents"],
     },
     CommandSpec {
+        name: "/deliveries",
+        aliases: &[],
+        kind: Inspection,
+        scopes: CommandScope::ALL,
+        summary: "list failed message deliveries",
+        usage: "/deliveries",
+        examples: &["/deliveries"],
+    },
+    CommandSpec {
+        name: "/decisions",
+        aliases: &[],
+        kind: Inspection,
+        scopes: CommandScope::ALL,
+        summary: "list decisions waiting for a human",
+        usage: "/decisions",
+        examples: &["/decisions"],
+    },
+    CommandSpec {
+        name: "/decision accept",
+        aliases: &[],
+        kind: Control,
+        scopes: CommandScope::ALL,
+        summary: "settle a user-owned decision",
+        usage: "/decision accept <decision-id> --decision <text> [--reason <text>]",
+        examples: &[
+            "/decision accept 01ARZ3NDEKTSV4RRFFQ69G5FAV --decision keep current contract --reason tests pass",
+        ],
+    },
+    CommandSpec {
+        name: "/decision reject",
+        aliases: &[],
+        kind: Control,
+        scopes: CommandScope::ALL,
+        summary: "cancel a user-owned decision",
+        usage: "/decision reject <decision-id> --reason <text>",
+        examples: &["/decision reject 01ARZ3NDEKTSV4RRFFQ69G5FAV --reason request is obsolete"],
+    },
+    CommandSpec {
+        name: "/decision work",
+        aliases: &[],
+        kind: Control,
+        scopes: CommandScope::ALL,
+        summary: "create explicit work from a decided decision",
+        usage: "/decision work <decision-id> --work-id <work-id> --title <title> [--agent <agent>]",
+        examples: &[
+            "/decision work 01ARZ3NDEKTSV4RRFFQ69G5FAV --work-id 01ARZ3NDEKTSV4RRFFQ69G5FAA --title verify contract --agent codex",
+        ],
+    },
+    CommandSpec {
         name: "/members",
         aliases: &[],
         kind: Inspection,
@@ -164,6 +213,35 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "list active members of the current room or thread",
         usage: "/members",
         examples: &["/members"],
+    },
+    CommandSpec {
+        name: "/work assign",
+        aliases: &[],
+        kind: Control,
+        scopes: &[Thread],
+        summary: "assign an explicit work item to an agent",
+        usage: "/work assign <work-id> --agent <agent>",
+        examples: &["/work assign 01ARZ3NDEKTSV4RRFFQ69G5FAV --agent cashpoint"],
+    },
+    CommandSpec {
+        name: "/work status",
+        aliases: &[],
+        kind: Control,
+        scopes: &[Thread],
+        summary: "transition an explicit work item",
+        usage: "/work status <work-id> <status>",
+        examples: &["/work status 01ARZ3NDEKTSV4RRFFQ69G5FAV working"],
+    },
+    CommandSpec {
+        name: "/work result",
+        aliases: &[],
+        kind: Control,
+        scopes: &[Thread],
+        summary: "record a result for an explicit work item",
+        usage: "/work result <work-id> --status <status> --summary <summary>",
+        examples: &[
+            "/work result 01ARZ3NDEKTSV4RRFFQ69G5FAV --status accepted --summary refund contract verified",
+        ],
     },
     CommandSpec {
         name: "/work",
@@ -212,6 +290,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "restart the current conversation's agent session",
         usage: "/restart",
         examples: &["/restart"],
+    },
+    CommandSpec {
+        name: "/delivery retry",
+        aliases: &[],
+        kind: Control,
+        scopes: CommandScope::ALL,
+        summary: "retry one failed message delivery",
+        usage: "/delivery retry <message-id> --agent <agent>",
+        examples: &["/delivery retry 01ARZ3NDEKTSV4RRFFQ69G5FAV --agent codex"],
     },
     CommandSpec {
         name: "/help",
@@ -439,28 +526,88 @@ mod tests {
         assert_eq!(
             names(CommandScope::Root),
             [
-                "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/help", "/exit"
+                "/dm",
+                "/room",
+                "/back",
+                "/rooms",
+                "/agents",
+                "/deliveries",
+                "/decisions",
+                "/decision accept",
+                "/decision reject",
+                "/decision work",
+                "/status",
+                "/delivery retry",
+                "/help",
+                "/exit"
             ]
         );
         assert_eq!(
             names(CommandScope::Room),
             [
-                "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/status",
-                "/help", "/exit"
+                "/dm",
+                "/room",
+                "/back",
+                "/rooms",
+                "/agents",
+                "/deliveries",
+                "/decisions",
+                "/decision accept",
+                "/decision reject",
+                "/decision work",
+                "/members",
+                "/work",
+                "/status",
+                "/delivery retry",
+                "/help",
+                "/exit"
             ]
         );
         assert_eq!(
             names(CommandScope::Dm),
             [
-                "/dm", "/room", "/back", "/rooms", "/agents", "/status", "/restart", "/help",
+                "/dm",
+                "/room",
+                "/back",
+                "/rooms",
+                "/agents",
+                "/deliveries",
+                "/decisions",
+                "/decision accept",
+                "/decision reject",
+                "/decision work",
+                "/status",
+                "/restart",
+                "/delivery retry",
+                "/help",
                 "/exit"
             ]
         );
         assert_eq!(
             names(CommandScope::Thread),
             [
-                "/dm", "/room", "/back", "/rooms", "/agents", "/members", "/work", "/results",
-                "/status", "/publish", "/restart", "/help", "/exit"
+                "/dm",
+                "/room",
+                "/back",
+                "/rooms",
+                "/agents",
+                "/deliveries",
+                "/decisions",
+                "/decision accept",
+                "/decision reject",
+                "/decision work",
+                "/members",
+                "/work assign",
+                "/work status",
+                "/work result",
+                "/work",
+                "/results",
+                "/status",
+                "/publish",
+                "/restart",
+                "/delivery retry",
+                "/help",
+                "/exit"
             ]
         );
         for scope in CommandScope::ALL {

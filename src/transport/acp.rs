@@ -749,9 +749,11 @@ fn start_turn(
                             session: session.clone(),
                         })
                         .await;
+                    lock(&active_turns).remove(&remote_id);
                     let _ = events.send(TransportEvent::TurnCompleted { session }).await;
                 }
                 Err(error) => {
+                    lock(&active_turns).remove(&remote_id);
                     let _ = events
                         .send(TransportEvent::TurnFailed {
                             session,
@@ -760,7 +762,6 @@ fn start_turn(
                         .await;
                 }
             }
-            lock(&active_turns).remove(&remote_id);
             Ok(())
         })
         .map_err(map_sdk_error)

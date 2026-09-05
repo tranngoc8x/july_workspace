@@ -9,8 +9,9 @@ use july_workspace::domain::{
 use july_workspace::runtime::{StorageWorker, WorkspaceRuntime};
 use july_workspace::storage::SqliteStore;
 use july_workspace::transport::{
-    AgentConnection, AgentTransport, CreateSession, PermissionResponse, ResumeSession, SendMessage,
-    SessionCreated, SessionRef, SessionResumed, TransportError, TransportEvents,
+    AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionResponse,
+    ResumeSession, SendMessage, SessionCreated, SessionRef, SessionResumed, TransportError,
+    TransportEvent, TransportEvents,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -52,15 +53,19 @@ struct ObservedTransport {
     connections: Vec<AgentConnection>,
     creates: Vec<CreateSession>,
     messages: Vec<SendMessage>,
+    permission_responses: Vec<PermissionResponse>,
 }
 
 struct FakeTransport {
     events: Option<tokio::sync::mpsc::Receiver<july_workspace::transport::TransportEvent>>,
-    _event_source: tokio::sync::mpsc::Sender<july_workspace::transport::TransportEvent>,
+    event_source: tokio::sync::mpsc::Sender<TransportEvent>,
     observed: Arc<Mutex<ObservedTransport>>,
     remote_prefix: String,
     create_fails_at: Option<usize>,
     send_fails_at: Option<usize>,
+    permission_on_send_at: Option<usize>,
+    permission_after_cancel: bool,
+    permission_response_not_found: bool,
     block_send_at: Option<(usize, std::sync::mpsc::SyncSender<()>)>,
 }
 
@@ -71,11 +76,14 @@ impl FakeTransport {
         (
             Self {
                 events: Some(receiver),
-                _event_source: sender,
+                event_source: sender,
                 observed: observed.clone(),
                 remote_prefix: remote_prefix.into(),
                 create_fails_at: None,
                 send_fails_at: None,
+                permission_on_send_at: None,
+                permission_after_cancel: false,
+                permission_response_not_found: false,
                 block_send_at: None,
             },
             observed,
@@ -120,6 +128,8 @@ impl AgentTransport for FakeTransport {
     }
 
     async fn send_message(&mut self, request: SendMessage) -> Result<(), TransportError> {
+        let session = request.session.clone();
+        let completes_capsule = request.content == CAPSULE;
         let sent = {
             let mut observed = self.observed.lock().unwrap();
             observed.messages.push(request);
@@ -134,19 +144,61 @@ impl AgentTransport for FakeTransport {
         if self.send_fails_at == Some(sent) {
             Err(TransportError::Protocol("send failed".into()))
         } else {
+            if self.permission_on_send_at == Some(sent) {
+                self.event_source
+                    .send(TransportEvent::PermissionRequested(PermissionRequest {
+                        session,
+                        request_id: "permission".into(),
+                        prompt: "fixture permission".into(),
+                        options: Vec::new(),
+                    }))
+                    .await
+                    .unwrap();
+            } else if completes_capsule {
+                self.event_source
+                    .send(TransportEvent::TurnCompleted { session })
+                    .await
+                    .unwrap();
+            }
             Ok(())
         }
     }
 
-    async fn cancel_turn(&mut self, _session: SessionRef) -> Result<(), TransportError> {
+    async fn cancel_turn(&mut self, session: SessionRef) -> Result<(), TransportError> {
+        if self.permission_after_cancel {
+            self.event_source
+                .send(TransportEvent::PermissionRequested(PermissionRequest {
+                    session: session.clone(),
+                    request_id: "late-permission".into(),
+                    prompt: "late fixture permission".into(),
+                    options: Vec::new(),
+                }))
+                .await
+                .unwrap();
+        }
+        self.event_source
+            .send(TransportEvent::TurnCompleted { session })
+            .await
+            .unwrap();
         Ok(())
     }
 
     async fn respond_permission(
         &mut self,
-        _response: PermissionResponse,
+        response: PermissionResponse,
     ) -> Result<(), TransportError> {
-        Ok(())
+        self.observed
+            .lock()
+            .unwrap()
+            .permission_responses
+            .push(response);
+        if self.permission_response_not_found {
+            Err(TransportError::PermissionRequestNotFound(
+                "already-cancelled".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     async fn close_session(&mut self, _session: SessionRef) -> Result<(), TransportError> {
@@ -859,6 +911,75 @@ async fn body_failure_retry_delivers_original_body_without_duplicate_capsule() {
     assert_eq!(delivery.status, DeliveryStatus::Delivered);
     assert_eq!(delivery.capsule_delivered_at.as_deref(), Some(MENTIONED));
     assert_eq!(delivery.delivered_at.as_deref(), Some(LATER));
+
+    mentions.shutdown(LATER.into()).await.unwrap();
+    target_owner.shutdown(LATER.into()).await.unwrap();
+    workspace.shutdown(LATER.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn permission_cancel_drains_its_terminal_event_before_same_runtime_retry() {
+    let database = TestDatabase::new();
+    let fixture = seed(&database);
+    let (mut transport, observed) = FakeTransport::new("target");
+    transport.permission_on_send_at = Some(1);
+    transport.permission_after_cancel = true;
+    transport.permission_response_not_found = true;
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    let mut target_owner = workspace.thread_with_transport(transport).unwrap();
+    target_owner
+        .open_thread_for_agent(open_command(
+            fixture.target_owner_thread.id,
+            fixture.target.id,
+        ))
+        .await
+        .unwrap();
+    let mut mentions = workspace.thread(fixture.target.id).unwrap();
+    let message_id = MessageId::new();
+
+    assert!(matches!(
+        mentions
+            .mention_thread_agent(mention_command(
+                &fixture,
+                message_id,
+                fixture.mention_thread.id,
+                fixture.target.id,
+                BODY,
+                CAPSULE,
+                MENTIONED,
+            ))
+            .await
+            .unwrap(),
+        Some(ThreadMentionOutcome::PersistedFailed(_))
+    ));
+    delivered(
+        mentions
+            .retry_thread_mention(retry_command(message_id, fixture.target.id))
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(
+        observed
+            .lock()
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![CAPSULE, CAPSULE, BODY]
+    );
+    assert_eq!(
+        observed.lock().unwrap().permission_responses[0].outcome,
+        july_workspace::domain::PermissionOutcome::Cancelled
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), mentions.next_event())
+            .await
+            .is_err(),
+        "the cancelled capsule left a stale terminal event"
+    );
 
     mentions.shutdown(LATER.into()).await.unwrap();
     target_owner.shutdown(LATER.into()).await.unwrap();

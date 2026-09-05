@@ -71,6 +71,14 @@ pub trait DeliberationRuntime {
         decided_at: String,
     ) -> Result<Decision, DeliberationError>;
 
+    async fn cancel_decision(
+        &mut self,
+        decision_id: DecisionId,
+        cancelled_by: crate::domain::DecisionOwner,
+        reason: String,
+        cancelled_at: String,
+    ) -> Result<Decision, DeliberationError>;
+
     async fn convert_decision_to_work(
         &mut self,
         decision_id: DecisionId,
@@ -173,6 +181,18 @@ impl<R: DeliberationRuntime> DeliberationService<R> {
         decided_at: String,
     ) -> Result<Decision, DeliberationError> {
         self.runtime.decide(decision_id, outcome, decided_at).await
+    }
+
+    pub async fn cancel_decision(
+        &mut self,
+        decision_id: DecisionId,
+        cancelled_by: crate::domain::DecisionOwner,
+        reason: String,
+        cancelled_at: String,
+    ) -> Result<Decision, DeliberationError> {
+        self.runtime
+            .cancel_decision(decision_id, cancelled_by, reason, cancelled_at)
+            .await
     }
 
     pub async fn convert_decision_to_work(

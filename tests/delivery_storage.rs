@@ -1,5 +1,6 @@
 use july_workspace::domain::{
-    Agent, AgentId, DeliveryStatus, DomainError, MemberType, Message, MessageDelivery, MessageId,
+    Agent, AgentId, Conversation, ConversationId, ConversationKind, DeliveryStatus, DomainError,
+    MemberType, Message, MessageDelivery, MessageId, Room, RoomId, WorkItemId,
 };
 use july_workspace::runtime::StorageWorker;
 use july_workspace::storage::{SqliteStore, StoreError};
@@ -9,6 +10,7 @@ use ulid::Ulid;
 
 const NOW: &str = "2026-08-22T10:00:00Z";
 const LATER: &str = "2026-08-22T10:01:00Z";
+const LATEST: &str = "2026-08-22T10:02:00Z";
 
 struct TestDatabase {
     directory: PathBuf,
@@ -63,6 +65,140 @@ fn message(store: &mut SqliteStore, target: &Agent) -> Message {
         metadata: json!({}),
         created_at: NOW.into(),
     }
+}
+
+fn message_with_id(id: u128, conversation_id: ConversationId, body: &str) -> Message {
+    Message {
+        id: Ulid::from(id).into(),
+        conversation_id,
+        sender_type: MemberType::User,
+        sender_id: "tony".into(),
+        body: body.into(),
+        reply_to: None,
+        metadata: json!({}),
+        created_at: NOW.into(),
+    }
+}
+
+#[tokio::test]
+async fn failed_delivery_list_is_read_only_complete_and_deterministic() {
+    let database = TestDatabase::new();
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let mut first_target = agent("codex");
+    first_target.id = Ulid::from(1_u128).into();
+    let mut second_target = agent("claude");
+    second_target.id = Ulid::from(2_u128).into();
+    store.insert_agent(&first_target).unwrap();
+    store.insert_agent(&second_target).unwrap();
+
+    let room = Room {
+        id: RoomId::new(),
+        name: "delivery inspection".into(),
+        description: None,
+        status: "active".into(),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    store.insert_room(&room).unwrap();
+    store
+        .add_room_member(room.id, first_target.id, None, NOW)
+        .unwrap();
+    let thread = Conversation {
+        id: ConversationId::new(),
+        kind: ConversationKind::Thread,
+        room_id: Some(room.id),
+        title: Some("Failed delivery".into()),
+        goal: None,
+        parent_conversation_id: None,
+        origin_conversation_id: None,
+        status: "open".into(),
+        created_at: NOW.into(),
+        updated_at: NOW.into(),
+    };
+    store
+        .create_thread_with_primary_work(&thread, WorkItemId::new(), "tony", &[first_target.id])
+        .unwrap();
+    let thread_message = message_with_id(1, thread.id, "thread failure");
+    store
+        .insert_message_with_pending_delivery(
+            &thread_message,
+            first_target.id,
+            Some("thread capsule"),
+        )
+        .unwrap();
+    store
+        .mark_delivery_capsule_delivered(thread_message.id, first_target.id, LATER)
+        .unwrap();
+    store
+        .mark_delivery_failed(thread_message.id, first_target.id, LATER)
+        .unwrap();
+
+    let dm = store
+        .get_or_create_dm("tony", first_target.id, NOW)
+        .unwrap();
+    let shared_message = message_with_id(2, dm.id, "two failed targets");
+    for target in [&second_target, &first_target] {
+        store
+            .insert_message_with_pending_delivery(&shared_message, target.id, None)
+            .unwrap();
+        store
+            .mark_delivery_failed(shared_message.id, target.id, LATEST)
+            .unwrap();
+    }
+    let pending = message_with_id(3, dm.id, "pending");
+    store
+        .insert_message_with_pending_delivery(&pending, first_target.id, None)
+        .unwrap();
+    let delivered = message_with_id(4, dm.id, "delivered");
+    store
+        .insert_message_with_pending_delivery(&delivered, first_target.id, None)
+        .unwrap();
+    store
+        .mark_delivery_delivered(delivered.id, first_target.id, LATEST)
+        .unwrap();
+
+    let before = [
+        (thread_message.id, first_target.id),
+        (shared_message.id, first_target.id),
+        (shared_message.id, second_target.id),
+    ]
+    .map(|(message_id, target_agent_id)| {
+        store
+            .get_message_delivery(message_id, target_agent_id)
+            .unwrap()
+            .unwrap()
+    });
+    let listed = store.list_failed_message_deliveries().unwrap();
+
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[0].message, thread_message);
+    assert_eq!(listed[0].conversation_kind, ConversationKind::Thread);
+    assert_eq!(listed[0].delivery, before[0]);
+    assert_eq!(listed[1].message, shared_message);
+    assert_eq!(listed[1].conversation_kind, ConversationKind::Dm);
+    assert_eq!(listed[1].delivery, before[1]);
+    assert_eq!(listed[2].message, shared_message);
+    assert_eq!(listed[2].conversation_kind, ConversationKind::Dm);
+    assert_eq!(listed[2].delivery, before[2]);
+    for delivery in &before {
+        assert_eq!(
+            store
+                .get_message_delivery(delivery.message_id, delivery.target_agent_id)
+                .unwrap(),
+            Some(delivery.clone())
+        );
+    }
+
+    store
+        .mark_delivery_delivered(pending.id, first_target.id, LATEST)
+        .unwrap();
+    drop(store);
+    let mut worker = StorageWorker::open(database.path()).unwrap();
+    assert_eq!(
+        worker.list_failed_message_deliveries().await.unwrap(),
+        listed
+    );
+    worker.shutdown().await.unwrap();
 }
 
 #[test]

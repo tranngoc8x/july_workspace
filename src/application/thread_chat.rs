@@ -1,5 +1,8 @@
 use super::chat::{ChatEvent, ChatPermissionRequestId, ChatRuntimeEvent};
-use super::collaboration::{CollaborationError, OpenThreadForAgent, OpenedThread};
+use super::collaboration::{
+    CollaborationError, OpenThreadForAgent, OpenedThread, RetryThreadMention, ThreadMentionOutcome,
+    ThreadRuntime,
+};
 use crate::domain::{AgentId, ConversationId, MemberType, Message, PermissionOutcome};
 
 /// Interactive Thread chat port. `CollaborationService` stays the owner of the
@@ -209,6 +212,15 @@ impl<R: ThreadChatRuntime> ThreadChatService<R> {
             .response
             .clear();
         Ok(())
+    }
+}
+
+impl<R: ThreadChatRuntime + ThreadRuntime> ThreadChatService<R> {
+    pub async fn retry_thread_mention(
+        &mut self,
+        command: RetryThreadMention,
+    ) -> Result<Option<ThreadMentionOutcome>, CollaborationError> {
+        self.runtime.retry_thread_mention(command).await
     }
 }
 

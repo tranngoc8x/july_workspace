@@ -1,4 +1,5 @@
 use super::{StoreError, records};
+use crate::application::FailedMessageDelivery;
 use crate::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
     ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner, DecisionStatus,
@@ -956,6 +957,24 @@ impl SqliteStore {
         target_agent_id: AgentId,
     ) -> Result<Option<MessageDelivery>, StoreError> {
         get_message_delivery(&self.connection, message_id, target_agent_id)
+    }
+
+    pub fn list_failed_message_deliveries(&self) -> Result<Vec<FailedMessageDelivery>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT m.id, m.conversation_id, m.sender_type, m.sender_id, m.body, m.reply_to,
+                    m.metadata_json, m.created_at,
+                    d.message_id, d.target_agent_id, d.status, d.capsule,
+                    d.capsule_delivered_at, d.created_at, d.updated_at, d.delivered_at,
+                    c.type
+             FROM message_deliveries d
+             JOIN messages m ON m.id = d.message_id
+             JOIN conversations c ON c.id = m.conversation_id
+             WHERE d.status = 'failed'
+             ORDER BY d.updated_at, d.message_id, d.target_agent_id",
+            params![],
+            failed_message_delivery,
+        )
     }
 
     pub fn mark_delivery_capsule_delivered(
@@ -2063,6 +2082,54 @@ impl SqliteStore {
         Ok(decision)
     }
 
+    pub fn cancel_decision(
+        &mut self,
+        decision_id: DecisionId,
+        cancelled_by: DecisionOwner,
+        reason: &str,
+        cancelled_at: &str,
+    ) -> Result<Decision, StoreError> {
+        require_decision_timestamp(cancelled_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut decision = require_decision(&transaction, decision_id)?;
+        if !matches!(
+            decision.status,
+            DecisionStatus::Pending | DecisionStatus::NeedsDecision
+        ) {
+            return Err(StoreError::InvalidDecisionTransition {
+                decision_id,
+                from: decision.status,
+                to: DecisionStatus::Cancelled,
+            });
+        }
+        if cancelled_by != decision.decision_owner {
+            return Err(StoreError::DecisionOwnerMismatch {
+                decision_id,
+                expected: decision.decision_owner,
+            });
+        }
+        if reason.trim().is_empty() {
+            return Err(StoreError::Domain(crate::domain::DomainError::EmptyField(
+                "decision.reason",
+            )));
+        }
+        decision.status = DecisionStatus::Cancelled;
+        decision.reason = Some(reason.into());
+        decision.updated_at = cancelled_at.into();
+        decision.validate()?;
+        update_decision(&transaction, &decision)?;
+        if let Some(mut handoff) = get_handoff_for_decision(&transaction, decision_id)? {
+            handoff.status = HandoffStatus::Resolved;
+            handoff.updated_at = cancelled_at.into();
+            handoff.validate()?;
+            update_handoff(&transaction, &handoff)?;
+        }
+        transaction.commit()?;
+        Ok(decision)
+    }
+
     /// Turn a settled decision into executable work. The conversion is
     /// explicit, links every generated work item back to the decision, and a
     /// replay of the same request creates nothing new.
@@ -2176,6 +2243,17 @@ impl SqliteStore {
             &self.connection,
             &format!("{DECISION_COLUMNS} WHERE thread_id = ?1 ORDER BY created_at, id"),
             params![thread_id.to_string()],
+            records::decision,
+        )
+    }
+
+    pub fn list_pending_decisions(&self) -> Result<Vec<Decision>, StoreError> {
+        query_all(
+            &self.connection,
+            &format!(
+                "{DECISION_COLUMNS} WHERE status IN ('pending', 'needs_decision') ORDER BY created_at, id"
+            ),
+            [],
             records::decision,
         )
     }
@@ -3088,6 +3166,23 @@ fn get_message(
         params![message_id.to_string()],
         records::message,
     )
+}
+
+fn failed_message_delivery(row: &Row<'_>) -> Result<FailedMessageDelivery, StoreError> {
+    Ok(FailedMessageDelivery {
+        message: records::message(row)?,
+        delivery: MessageDelivery {
+            message_id: row.get::<_, String>(8)?.parse()?,
+            target_agent_id: row.get::<_, String>(9)?.parse()?,
+            status: row.get::<_, String>(10)?.parse()?,
+            capsule: row.get(11)?,
+            capsule_delivered_at: row.get(12)?,
+            created_at: row.get(13)?,
+            updated_at: row.get(14)?,
+            delivered_at: row.get(15)?,
+        },
+        conversation_kind: row.get::<_, String>(16)?.parse()?,
+    })
 }
 
 fn get_message_delivery(
