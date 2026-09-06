@@ -1,5 +1,6 @@
 # Lessons
 
+- Khi Sếp cho phép tiếp tục các phase trong roadmap A2A với điều kiện không chạm A2A, phải phân loại theo hành vi thực tế thay vì tên epic: chỉ triển khai lần lượt các foundation độc lập như Room persistence/routing/API, và dừng trước phase đầu tiên tạo A2A Message/Task, binding hoặc bridge.
 - Khi Sếp nói các tính năng đang làm chỉ là feature bổ sung và A2A thuộc phase khác, phải dừng mọi RoomMessage/A2A implementation, rollback đúng các hunk vừa tạo và quay lại Beads non-A2A đang sẵn sàng; không dùng tên roadmap cũ để suy diễn scope hiện tại.
 - Trước khi kết luận một feature chưa được implement hoặc rollback feature đó, phải audit cả `git log --all`, branch/ref liên quan và từng hunk chưa commit; không suy ra từ semantic search hay `git status` tổng quát khi worktree đang chứa nhiều slice trộn lẫn.
 - Khi thiết kế A2A cho July, phải khóa product boundary trước: A2A là kênh agent↔agent giữa các July-managed agents cùng Room; không tự suy diễn thành external-agent interoperability hay runtime adapter thay ACP.

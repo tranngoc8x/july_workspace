@@ -8,11 +8,12 @@ use crate::application::{
 };
 use crate::domain::{
     Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Decision,
-    DecisionId, DecisionOutcome, DecisionOwner, DecisionWork, Handoff, HandoffChallenge, HandoffId,
-    HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType, Message, MessageDelivery,
-    MessageId, PermissionDecision, Proposal, ProposalId, ProposalResponse, Publish, PublishId,
-    ResultId, Room, RoomId, RoomMember, SessionBinding, SessionBindingId, SessionBindingStatus,
-    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    DecisionId, DecisionOutcome, DecisionOwner, DecisionWork, DomainError, Handoff,
+    HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
+    Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
+    ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
+    SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency,
+    WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -30,6 +31,8 @@ enum Command {
     GetRoom(RoomId, Reply<Option<Room>>),
     GetRoomByName(String, Reply<Option<Room>>),
     ListRooms(Reply<Vec<Room>>),
+    AppendRoomMessage(RoomMessage, Reply<RoomMessage>),
+    ListRecentRoomMessages(RoomId, usize, Reply<(Vec<RoomMessage>, bool)>),
     ListAgents(Reply<Vec<Agent>>),
     CreateAgent(Box<Agent>, Reply<()>),
     UpdateAgent(Box<Agent>, Reply<bool>),
@@ -736,6 +739,23 @@ impl CollaborationRuntime for StorageHandle {
         self.collaboration_request(Command::ListRooms).await
     }
 
+    async fn append_room_message(
+        &mut self,
+        message: RoomMessage,
+    ) -> Result<RoomMessage, CollaborationError> {
+        self.collaboration_request(|reply| Command::AppendRoomMessage(message, reply))
+            .await
+    }
+
+    async fn list_recent_room_messages(
+        &mut self,
+        room_id: RoomId,
+        limit: usize,
+    ) -> Result<(Vec<RoomMessage>, bool), CollaborationError> {
+        self.collaboration_request(|reply| Command::ListRecentRoomMessages(room_id, limit, reply))
+            .await
+    }
+
     async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
         self.collaboration_request(Command::ListAgents).await
     }
@@ -901,6 +921,21 @@ impl CollaborationRuntime for StorageWorker {
 
     async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
         self.handle.list_rooms().await
+    }
+
+    async fn append_room_message(
+        &mut self,
+        message: RoomMessage,
+    ) -> Result<RoomMessage, CollaborationError> {
+        self.handle.append_room_message(message).await
+    }
+
+    async fn list_recent_room_messages(
+        &mut self,
+        room_id: RoomId,
+        limit: usize,
+    ) -> Result<(Vec<RoomMessage>, bool), CollaborationError> {
+        self.handle.list_recent_room_messages(room_id, limit).await
     }
 
     async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
@@ -1245,6 +1280,12 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::ListRooms(reply) => {
                 let _ = reply.send(store.list_rooms());
+            }
+            Command::AppendRoomMessage(message, reply) => {
+                let _ = reply.send(store.append_room_message(&message));
+            }
+            Command::ListRecentRoomMessages(room_id, limit, reply) => {
+                let _ = reply.send(store.list_recent_room_messages(room_id, limit));
             }
             Command::ListRoomMembers(room_id, reply) => {
                 let _ = reply.send(store.list_room_members(room_id));
@@ -1636,6 +1677,13 @@ fn map_store_error(error: StoreError) -> CollaborationError {
         StoreError::RoomInactive(id) => CollaborationError::RoomInactive(id),
         StoreError::RoomIdConflict(id) => CollaborationError::RoomIdConflict(id),
         StoreError::RoomNameConflict(name) => CollaborationError::RoomNameConflict(name),
+        StoreError::RoomMessageIdConflict(id) => CollaborationError::RoomMessageIdConflict(id),
+        StoreError::RoomMessageReplyNotFound(id) => {
+            CollaborationError::RoomMessageReplyNotFound(id)
+        }
+        StoreError::RoomMessageReplyNotInRoom { room_id, reply_to } => {
+            CollaborationError::RoomMessageReplyNotInRoom { room_id, reply_to }
+        }
         StoreError::AgentNotFound(id) => CollaborationError::AgentNotFound(id.to_string()),
         StoreError::AgentInactive(id) => CollaborationError::AgentInactive(id),
         StoreError::ThreadNotFound(id) | StoreError::NotThread(id) => {
@@ -1659,6 +1707,9 @@ fn map_store_error(error: StoreError) -> CollaborationError {
         StoreError::PrimaryWorkIdConflict(id) => CollaborationError::PrimaryWorkIdConflict(id),
         StoreError::MessageSenderMismatch(id) => {
             CollaborationError::InvalidCommand(format!("message sender must be agent {id}"))
+        }
+        StoreError::Domain(DomainError::UntrustedRoomUserSender(id)) => {
+            CollaborationError::UntrustedRoomUserSender(id)
         }
         StoreError::Domain(error) => CollaborationError::InvalidCommand(error.to_string()),
         error => CollaborationError::Runtime(error.to_string()),

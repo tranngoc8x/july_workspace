@@ -7,9 +7,9 @@ use crate::domain::{
     HandoffId, HandoffResponse, HandoffStatus, MemberType, Memory, MemoryId, MemoryKind,
     MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome,
     Proposal, ProposalId, ProposalResponse, ProposalResponseId, ProposalResponseType,
-    ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, SessionBinding,
-    SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
-    WorkResult, WorkStatus,
+    ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
+    SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency,
+    WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -32,7 +32,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 15] = [
+const MIGRATIONS: [Migration; 16] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -92,6 +92,10 @@ const MIGRATIONS: [Migration; 15] = [
     Migration {
         version: 15,
         sql: include_str!("migrations/0015_decision_work.sql"),
+    },
+    Migration {
+        version: 16,
+        sql: include_str!("migrations/0016_room_messages.sql"),
     },
 ];
 
@@ -895,6 +899,89 @@ impl SqliteStore {
     pub fn insert_message(&self, message: &Message) -> Result<(), StoreError> {
         message.validate()?;
         insert_message(&self.connection, message).map(|_| ())
+    }
+
+    pub fn append_room_message(
+        &mut self,
+        message: &RoomMessage,
+    ) -> Result<RoomMessage, StoreError> {
+        let mut canonical = message.clone();
+        if canonical.sender_type == MemberType::Agent {
+            canonical.sender_id = canonical
+                .sender_id
+                .parse::<AgentId>()
+                .map_err(|_| StoreError::InvalidStoredValue("room message agent sender"))?
+                .to_string();
+        }
+        let message = &canonical;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = query_optional(
+            &transaction,
+            "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at
+             FROM room_messages WHERE id = ?1",
+            params![message.id.to_string()],
+            records::room_message,
+        )? {
+            if existing == *message {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::RoomMessageIdConflict(message.id));
+        }
+        message.validate()?;
+        require_active_room(&transaction, message.room_id)?;
+        if message.sender_type == MemberType::Agent {
+            let agent_id = message
+                .sender_id
+                .parse()
+                .expect("canonical agent sender id parses");
+            require_active_agent(&transaction, agent_id)?;
+            require_active_room_membership(&transaction, message.room_id, agent_id)?;
+        }
+        if let Some(reply_to) = message.reply_to {
+            let reply_room = query_optional(
+                &transaction,
+                "SELECT room_id FROM room_messages WHERE id = ?1",
+                params![reply_to.to_string()],
+                |row| row.get::<_, String>(0).map_err(StoreError::from),
+            )?
+            .ok_or(StoreError::RoomMessageReplyNotFound(reply_to))?;
+            if reply_room != message.room_id.to_string() {
+                return Err(StoreError::RoomMessageReplyNotInRoom {
+                    room_id: message.room_id,
+                    reply_to,
+                });
+            }
+        }
+        insert_room_message(&transaction, message)?;
+        transaction.commit()?;
+        Ok(message.clone())
+    }
+
+    pub fn list_recent_room_messages(
+        &self,
+        room_id: RoomId,
+        limit: usize,
+    ) -> Result<(Vec<RoomMessage>, bool), StoreError> {
+        let query_limit =
+            i64::try_from(limit.saturating_add(1)).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "room message limit",
+                value: limit as i128,
+            })?;
+        let mut messages = query_all(
+            &self.connection,
+            "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at
+             FROM room_messages WHERE room_id = ?1
+             ORDER BY created_at DESC, id DESC LIMIT ?2",
+            params![room_id.to_string(), query_limit],
+            records::room_message,
+        )?;
+        let truncated = messages.len() > limit;
+        messages.truncate(limit);
+        messages.reverse();
+        Ok((messages, truncated))
     }
 
     pub fn get_message(&self, id: MessageId) -> Result<Option<Message>, StoreError> {
@@ -3131,6 +3218,33 @@ fn insert_message(connection: &Connection, message: &Message) -> Result<bool, St
     }
 }
 
+fn insert_room_message(connection: &Connection, message: &RoomMessage) -> Result<(), StoreError> {
+    let mentions = serde_json::to_string(
+        &message
+            .mentions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    )?;
+    let inserted = connection.execute(
+        "INSERT INTO room_messages(
+            id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            message.id.to_string(),
+            message.room_id.to_string(),
+            message.sender_type.to_string(),
+            message.sender_id,
+            message.body,
+            mentions,
+            message.reply_to.map(|id| id.to_string()),
+            message.created_at,
+        ],
+    )?;
+    debug_assert_eq!(inserted, 1);
+    Ok(())
+}
+
 fn insert_message_delivery(
     connection: &Connection,
     delivery: &MessageDelivery,
@@ -4198,11 +4312,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_has_schema_version_fifteen() {
+    fn fresh_database_has_schema_version_sixteen() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 15);
+        assert_eq!(store.schema_version().unwrap(), 16);
     }
 
     #[test]
@@ -4213,6 +4327,7 @@ mod tests {
             "agents",
             "rooms",
             "room_members",
+            "room_messages",
             "conversations",
             "conversation_members",
             "messages",
@@ -4250,6 +4365,7 @@ mod tests {
         let store = SqliteStore::open(database.path()).expect("open fresh database");
         let tables = [
             "room_members",
+            "room_messages",
             "conversations",
             "conversation_members",
             "messages",
@@ -4284,7 +4400,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 30);
+        assert_eq!(foreign_key_count, 32);
     }
 
     #[test]
@@ -4572,14 +4688,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            15
+            16
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            15
+            16
         );
     }
 
@@ -5248,7 +5364,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 15);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 16);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -5736,15 +5852,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (16);",
+                 INSERT INTO schema_migrations(version) VALUES (17);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 16,
-                supported: 15,
+                found: 17,
+                supported: 16,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

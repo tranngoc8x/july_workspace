@@ -1,10 +1,13 @@
 use super::{
     AgentId, CheckpointId, ConversationId, DecisionId, DomainError, HandoffId, MemoryId, MessageId,
-    ProposalId, ProposalResponseId, PublishId, ResultId, RoomId, SessionBindingId, WorkItemId,
+    ProposalId, ProposalResponseId, PublishId, ResultId, RoomId, RoomMessageId, SessionBindingId,
+    WorkItemId,
 };
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
+
+pub const TRUSTED_LOCAL_USER_ID: &str = "local-user";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
@@ -273,6 +276,38 @@ impl RoomMember {
             return Err(DomainError::InvalidMembershipGeneration);
         }
         require_text(&self.joined_at, "room_member.joined_at")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomMessage {
+    pub id: RoomMessageId,
+    pub room_id: RoomId,
+    pub sender_type: MemberType,
+    pub sender_id: String,
+    pub body: String,
+    pub mentions: Vec<AgentId>,
+    pub reply_to: Option<RoomMessageId>,
+    pub created_at: String,
+}
+
+impl RoomMessage {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.sender_id, "room_message.sender_id")?;
+        require_text(&self.body, "room_message.body")?;
+        require_text(&self.created_at, "room_message.created_at")?;
+        if self.sender_type == MemberType::User && self.sender_id != TRUSTED_LOCAL_USER_ID {
+            return Err(DomainError::UntrustedRoomUserSender(self.sender_id.clone()));
+        }
+        if self
+            .mentions
+            .iter()
+            .enumerate()
+            .any(|(index, mention)| self.mentions[..index].contains(mention))
+        {
+            return Err(DomainError::DuplicateRoomMessageMention);
+        }
+        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, ConversationMember, Message,
-    MessageDelivery, MessageId, Room, RoomId, RoomMember, SessionBindingId, SessionBindingStatus,
-    WorkItem, WorkItemId, WorkResult,
+    MessageDelivery, MessageId, Room, RoomId, RoomMember, RoomMessage, RoomMessageId,
+    SessionBindingId, SessionBindingStatus, WorkItem, WorkItemId, WorkResult,
 };
 use thiserror::Error;
 
@@ -42,6 +42,11 @@ pub struct CreateRoom {
     pub name: String,
     pub description: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppendRoomMessage {
+    pub message: RoomMessage,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +178,17 @@ pub enum CollaborationError {
     ThreadIdConflict(ConversationId),
     #[error("primary work id {0} already exists")]
     PrimaryWorkIdConflict(WorkItemId),
+    #[error("room message id {0} already exists with different content")]
+    RoomMessageIdConflict(RoomMessageId),
+    #[error("room message reply {0} does not exist")]
+    RoomMessageReplyNotFound(RoomMessageId),
+    #[error("room message reply {reply_to} does not belong to room {room_id}")]
+    RoomMessageReplyNotInRoom {
+        room_id: RoomId,
+        reply_to: RoomMessageId,
+    },
+    #[error("room user sender must be the trusted local user: {0}")]
+    UntrustedRoomUserSender(String),
     #[error("agent {agent_id} must be an active member of room {room_id}")]
     RoomMembershipRequired { room_id: RoomId, agent_id: AgentId },
     #[error("agent {agent_id} must be an active member of thread {thread_id}")]
@@ -241,6 +257,15 @@ pub trait CollaborationRuntime {
     async fn get_room(&mut self, room_id: RoomId) -> Result<Option<Room>, CollaborationError>;
     async fn get_room_by_name(&mut self, name: String) -> Result<Option<Room>, CollaborationError>;
     async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError>;
+    async fn append_room_message(
+        &mut self,
+        message: RoomMessage,
+    ) -> Result<RoomMessage, CollaborationError>;
+    async fn list_recent_room_messages(
+        &mut self,
+        room_id: RoomId,
+        limit: usize,
+    ) -> Result<(Vec<RoomMessage>, bool), CollaborationError>;
     async fn get_agent(&mut self, agent_id: AgentId) -> Result<Option<Agent>, CollaborationError>;
     async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError>;
     async fn create_agent(&mut self, agent: Agent) -> Result<(), CollaborationError>;
@@ -332,6 +357,21 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
 
     pub async fn list_rooms(&mut self) -> Result<Vec<Room>, CollaborationError> {
         self.runtime.list_rooms().await
+    }
+
+    pub async fn append_room_message(
+        &mut self,
+        command: AppendRoomMessage,
+    ) -> Result<RoomMessage, CollaborationError> {
+        self.runtime.append_room_message(command.message).await
+    }
+
+    pub async fn list_recent_room_messages(
+        &mut self,
+        room_id: RoomId,
+        limit: usize,
+    ) -> Result<(Vec<RoomMessage>, bool), CollaborationError> {
+        self.runtime.list_recent_room_messages(room_id, limit).await
     }
 
     pub async fn list_agents(&mut self) -> Result<Vec<Agent>, CollaborationError> {
