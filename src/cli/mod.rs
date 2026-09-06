@@ -1,18 +1,19 @@
 use crate::adapter::{ADAPTERS, AdapterSpec, AdapterStore};
 use crate::application::{
-    AddAgent, AddRoomMember, AddThreadMember, AgentDirectMessageOutcome, AgentRef, AssignWorkOwner,
-    ChatEvent, ChatFailureKind, ChatPermissionRequestId, CollaborationError, CollaborationService,
-    CreateRoom, CreateThread, CreateWorkResult, DeliberationError, DeliberationService,
-    DirectMessageError, DirectMessageRuntime, DirectMessageService, FailedMessageDelivery,
-    MembershipChange, MembershipState, OpenThreadForAgent, PublishError, PublishResult,
-    PublishService, RemoveRoomMember, RemoveThreadMember, RetryAgentDirectMessage,
-    RetryThreadMention, RoomRef, ThreadChatRuntime, ThreadChatService, ThreadMentionOutcome,
-    ThreadRuntime, TransitionWork, WorkError, WorkService,
+    AddAgent, AddRoomMember, AddThreadMember, AgentDirectMessageOutcome, AgentRef,
+    AppendRoomMessage, AssignWorkOwner, ChatEvent, ChatFailureKind, ChatPermissionRequestId,
+    CollaborationError, CollaborationService, CreateRoom, CreateThread, CreateWorkResult,
+    DeliberationError, DeliberationService, DirectMessageError, DirectMessageRuntime,
+    DirectMessageService, FailedMessageDelivery, MembershipChange, MembershipState,
+    OpenThreadForAgent, PublishError, PublishResult, PublishService, RemoveRoomMember,
+    RemoveThreadMember, RetryAgentDirectMessage, RetryThreadMention, RoomRef, ThreadChatRuntime,
+    ThreadChatService, ThreadMentionOutcome, ThreadRuntime, TransitionWork, WorkError, WorkService,
 };
 use crate::domain::{
     AgentId, ConversationId, ConversationKind, Decision, DecisionId, DecisionOutcome,
     DecisionOwner, DecisionWork, MemberType, MessageId, PermissionOption, PermissionOutcome,
-    PublishId, ResultId, RoomId, WorkItemId, WorkResult, WorkStatus,
+    PublishId, ResultId, RoomId, RoomMessage, RoomMessageId, TRUSTED_LOCAL_USER_ID, WorkItemId,
+    WorkResult, WorkStatus,
 };
 use crate::runtime::{
     AgentDirectMessageRuntime, AgentThreadRuntime, DirectMessageBootstrapError, StorageWorker,
@@ -38,7 +39,6 @@ mod setup;
 
 use registry::CommandScope;
 
-const LOCAL_USER_ID: &str = "local-user";
 const TUI_HISTORY_LIMIT: usize = 50;
 const USAGE: &str = "usage: july dm <agent>";
 const PROJECT_INIT_USAGE: &str = "usage: july init";
@@ -1305,19 +1305,41 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
             } else if let Some(room_id) = contexts.last().unwrap().room_id() {
-                // Rule D: a Room launches work, it is not a conversation. Name
-                // the targets instead of reporting a command error.
-                match room_member_names(service, room_id).await {
-                    Ok(names) if names.is_empty() => repl_write(
-                        stderr,
-                        format_args!(
-                            "no agents in this room yet; add one with: july room member add\n"
-                        ),
-                    )?,
-                    Ok(names) => {
-                        repl_write(stdout, format_args!("who should work on this?\n"))?;
-                        for name in names {
-                            repl_write(stdout, format_args!("  @{name} {line}\n"))?;
+                let message = RoomMessage {
+                    id: RoomMessageId::new(),
+                    room_id,
+                    sender_type: MemberType::User,
+                    sender_id: TRUSTED_LOCAL_USER_ID.into(),
+                    body: line,
+                    mentions: Vec::new(),
+                    reply_to: None,
+                    created_at: timestamp(),
+                };
+                match service
+                    .append_room_message(AppendRoomMessage {
+                        message: message.clone(),
+                    })
+                    .await
+                {
+                    Ok(_) => {
+                        if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
+                            use crate::tui::app::{CommandResult, HistoryAuthor, HistoryEntry};
+
+                            let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
+                                context: origin,
+                                result: CommandResult::ContextWithHistory(
+                                    project_context_snapshot(
+                                        service,
+                                        workspace,
+                                        contexts,
+                                        Some(HistoryEntry {
+                                            author: HistoryAuthor::User,
+                                            body: message.body,
+                                        }),
+                                    )
+                                    .await?,
+                                ),
+                            });
                         }
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
@@ -1821,7 +1843,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                                 room: RoomRef::Id(room_id),
                                 title,
                                 goal,
-                                user_id: LOCAL_USER_ID.into(),
+                                user_id: TRUSTED_LOCAL_USER_ID.into(),
                                 initial_agents: Vec::new(),
                                 created_at: timestamp(),
                             })
@@ -2086,7 +2108,11 @@ async fn open_repl_dm(
         .map_err(|error| CliError::Runtime(error.to_string()))?;
     let mut dm = DirectMessageService::new(runtime);
     let opened = dm
-        .open(LOCAL_USER_ID.into(), agent.name.clone(), timestamp())
+        .open(
+            TRUSTED_LOCAL_USER_ID.into(),
+            agent.name.clone(),
+            timestamp(),
+        )
         .await?;
     Ok((
         ReplContext::Dm {
@@ -2107,7 +2133,7 @@ async fn open_repl_thread(
     let mut chat = ThreadChatService::new(open_thread_runtime(workspace, agent.id)?);
     let opened = chat
         .open(
-            LOCAL_USER_ID.into(),
+            TRUSTED_LOCAL_USER_ID.into(),
             OpenThreadForAgent {
                 thread_id,
                 agent_id: agent.id,
@@ -2296,7 +2322,7 @@ async fn enter_repl_work<R: crate::application::CollaborationRuntime>(
             room: RoomRef::Id(room_id),
             title: title.clone(),
             goal: None,
-            user_id: LOCAL_USER_ID.into(),
+            user_id: TRUSTED_LOCAL_USER_ID.into(),
             initial_agents: agents.iter().map(|agent| AgentRef::Id(agent.id)).collect(),
             created_at: timestamp(),
         })
@@ -2344,25 +2370,6 @@ async fn enter_repl_thread<R: crate::application::CollaborationRuntime>(
             recover_repl_context(service, workspace, contexts, live, error).await?,
         )),
     }
-}
-
-/// Active agent members of a Room, by name, in listing order.
-async fn room_member_names<R: crate::application::CollaborationRuntime>(
-    service: &mut CollaborationService<R>,
-    room_id: RoomId,
-) -> Result<Vec<String>, CliError> {
-    let members = service.list_room_members(RoomRef::Id(room_id)).await?;
-    let agents = service.list_agents().await?;
-    Ok(members
-        .into_iter()
-        .filter(|member| member.left_at.is_none())
-        .filter_map(|member| {
-            agents
-                .iter()
-                .find(|agent| agent.id == member.agent_id)
-                .map(|agent| agent.name.clone())
-        })
-        .collect())
 }
 
 /// `<work> [--agent <agent>]`: enter an existing Work of the current Room.
@@ -2762,10 +2769,33 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
     use crate::tui::app::{ContextSnapshot, History, HistoryAuthor, HistoryEntry};
 
     let context = project_repl_context(service, contexts).await?;
-    let history = match contexts.last().and_then(ReplContext::conversation_id) {
-        Some(conversation_id) => workspace
+    let history = match contexts.last() {
+        Some(ReplContext::Room(room_id)) => service
+            .list_recent_room_messages(*room_id, TUI_HISTORY_LIMIT)
+            .await
+            .map(|(messages, truncated)| History {
+                entries: messages
+                    .into_iter()
+                    .map(|message| HistoryEntry {
+                        author: match message.sender_type {
+                            MemberType::User => HistoryAuthor::User,
+                            MemberType::Agent => HistoryAuthor::Agent,
+                        },
+                        body: format!(
+                            "[{}:{}] {}",
+                            message.sender_type, message.sender_id, message.body
+                        ),
+                    })
+                    .collect(),
+                truncated,
+            })
+            .map_err(|error| error.to_string()),
+        Some(context) if context.conversation_id().is_some() => workspace
             .storage()
-            .list_recent_messages(conversation_id, TUI_HISTORY_LIMIT)
+            .list_recent_messages(
+                context.conversation_id().expect("checked above"),
+                TUI_HISTORY_LIMIT,
+            )
             .await
             .map(|(messages, truncated)| History {
                 entries: messages
@@ -2781,7 +2811,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
                 truncated,
             })
             .map_err(|error| error.to_string()),
-        None => Ok(History {
+        _ => Ok(History {
             entries: Vec::new(),
             truncated: false,
         }),
@@ -3068,11 +3098,11 @@ async fn run_dm(agent_name: String) -> Result<(), CliError> {
     let mut service = DirectMessageService::new(runtime);
     let interaction = async {
         let opened = service
-            .open(LOCAL_USER_ID.into(), agent_name, timestamp())
+            .open(TRUSTED_LOCAL_USER_ID.into(), agent_name, timestamp())
             .await?;
         for message in opened.messages {
             let sender = match message.sender_type {
-                MemberType::User => LOCAL_USER_ID,
+                MemberType::User => TRUSTED_LOCAL_USER_ID,
                 MemberType::Agent => opened.agent_name.as_str(),
             };
             println!("[{sender}] {}", message.body);
@@ -3128,7 +3158,7 @@ async fn run_thread_session<R: crate::application::CollaborationRuntime>(
     register_acp_agent(workspace, &agent).await?;
     let mut chat = ThreadChatService::new(open_thread_runtime(workspace, agent.id)?);
     chat.open(
-        LOCAL_USER_ID.into(),
+        TRUSTED_LOCAL_USER_ID.into(),
         OpenThreadForAgent {
             thread_id,
             agent_id: agent.id,
@@ -3977,7 +4007,7 @@ async fn run_thread(operation: ThreadOperation, json_output: bool) -> Result<(),
                         room,
                         title,
                         goal,
-                        user_id: LOCAL_USER_ID.into(),
+                        user_id: TRUSTED_LOCAL_USER_ID.into(),
                         initial_agents: members,
                         created_at: timestamp(),
                     })

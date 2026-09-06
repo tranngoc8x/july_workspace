@@ -1,7 +1,7 @@
 use crate::domain::{
     AgentId, ConversationId, DecisionId, DecisionOwner, DecisionStatus, DomainError, HandoffId,
     HandoffStatus, MessageId, ProposalId, ProposalResponseId, ProposalStatus, PublishId, ResultId,
-    RoomId, SessionBindingId, SessionBindingStatus, WorkItemId, WorkStatus,
+    RoomId, RoomMessageId, SessionBindingId, SessionBindingStatus, WorkItemId, WorkStatus,
 };
 use thiserror::Error;
 
@@ -34,6 +34,15 @@ pub enum StoreError {
     RoomIdConflict(RoomId),
     #[error("room name {0} already exists")]
     RoomNameConflict(String),
+    #[error("room message id {0} already exists with different content")]
+    RoomMessageIdConflict(RoomMessageId),
+    #[error("room message reply {0} does not exist")]
+    RoomMessageReplyNotFound(RoomMessageId),
+    #[error("room message reply {reply_to} does not belong to room {room_id}")]
+    RoomMessageReplyNotInRoom {
+        room_id: RoomId,
+        reply_to: RoomMessageId,
+    },
     #[error("agent {0} does not exist")]
     AgentNotFound(AgentId),
     #[error("agent {0} is not active")]

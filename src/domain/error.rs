@@ -10,6 +10,10 @@ pub enum DomainError {
     ThreadMissingRoom,
     #[error("thread conversation requires a non-empty title")]
     ThreadMissingTitle,
+    #[error("room message mentions must be unique")]
+    DuplicateRoomMessageMention,
+    #[error("room user sender must be the trusted local user: {0}")]
+    UntrustedRoomUserSender(String),
     #[error("work dependency cannot reference itself")]
     SelfDependency,
     #[error("work dependency result reference does not match its status")]

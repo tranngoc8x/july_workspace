@@ -4,7 +4,7 @@ use july_workspace::cli::InactiveTuiBridge;
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, Decision, DecisionId,
     DecisionOwner, DecisionStatus, DecisionType, MemberType, Message, MessageId, ResultId, Room,
-    RoomId, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomId, RoomMessage, RoomMessageId, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use july_workspace::storage::SqliteStore;
 use july_workspace::tui::app::{App, AppCommand, AppEvent, CommandResult, Context};
@@ -1384,6 +1384,89 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
 }
 
 #[tokio::test]
+async fn inactive_tui_bridge_hydrates_room_history_with_explicit_sender_labels() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_agent("codex");
+    workspace.add_member(&room, &agent);
+    let mut store = SqliteStore::open(&workspace.database).unwrap();
+    for index in 0..=50 {
+        let (sender_type, sender_id) = if index == 50 {
+            (MemberType::Agent, agent.id.to_string())
+        } else {
+            (MemberType::User, "local-user".to_owned())
+        };
+        store
+            .append_room_message(&RoomMessage {
+                id: RoomMessageId::new(),
+                room_id: room.id,
+                sender_type,
+                sender_id,
+                body: format!("room-{index:02}"),
+                mentions: vec![],
+                reply_to: None,
+                created_at: format!("2026-09-01T10:00:{index:02}Z"),
+            })
+            .unwrap();
+    }
+    drop(store);
+
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let event = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        event,
+        AppEvent::CommandFinished {
+            result: CommandResult::ContextWithHistory(_),
+            ..
+        }
+    ));
+    app.reduce(event);
+    let transcript = app.transcript();
+    assert!(transcript.starts_with("… showing 50 most recent messages …"));
+    assert!(!transcript.contains("room-00"));
+    assert!(transcript.contains("[user:local-user] room-01"));
+    assert!(transcript.contains(&format!("[agent:{}] room-50", agent.id)));
+    assert_eq!(transcript.matches("room-").count(), 50);
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_room_plain_submit_replaces_once_becomes_idle_and_accepts_a_second_submit() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &agent);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    for body in ["first room message", "second room message"] {
+        let event = bridge.execute(tui_command(&mut app, body)).await.unwrap();
+        assert!(matches!(
+            event,
+            AppEvent::CommandFinished {
+                result: CommandResult::ContextWithHistory(_),
+                ..
+            }
+        ));
+        app.reduce(event);
+        assert!(!app.turn_active(), "Room persistence has no live turn");
+        assert_eq!(app.transcript().matches(body).count(), 1);
+    }
+    assert_eq!(app.transcript().matches("first room message").count(), 1);
+    assert_eq!(app.transcript().matches("second room message").count(), 1);
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn inactive_tui_bridge_mentions_hydrate_before_live_deltas() {
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &["--no-permission"]);
@@ -2181,22 +2264,55 @@ fn repl_work_lists_room_work_and_opens_one_without_thread() {
 }
 
 #[test]
-fn repl_plain_room_prompt_offers_targets_instead_of_a_command_error() {
+fn repl_plain_room_input_persists_once_without_conversation_side_effects() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("vna");
-    let codex = workspace.seed_acp_agent("codex", &[]);
-    let pay = workspace.seed_acp_agent("pay", &[]);
-    workspace.add_member(&room, &codex);
-    workspace.add_member(&room, &pay);
+    let agent = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &agent);
 
     let output = workspace.repl("/room vna\ninvestigate refund issue\n/quit\n");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let stdout_output = stdout(&output);
-    assert!(stdout_output.contains("who should work on this?\n"));
-    assert!(stdout_output.contains("  @codex investigate refund issue\n"));
-    assert!(stdout_output.contains("  @pay investigate refund issue\n"));
-    assert!(!stderr(&output).contains("invalid command"));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let messages = connection
+        .prepare(
+            "SELECT room_id, sender_type, sender_id, body
+             FROM room_messages ORDER BY created_at, id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        messages,
+        vec![(
+            room.id.to_string(),
+            "user".into(),
+            "local-user".into(),
+            "investigate refund issue".into(),
+        )]
+    );
+    for table in [
+        "conversations",
+        "work_items",
+        "session_bindings",
+        "message_deliveries",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "plain Room input must not create {table}");
+    }
 }
 
 #[test]

@@ -2,8 +2,8 @@ use super::StoreError;
 use crate::domain::{
     Agent, Checkpoint, Conversation, ConversationId, ConversationMember, Decision, DomainError,
     Handoff, Memory, Message, MessageDelivery, PermissionDecision, PermissionOption,
-    PermissionOutcome, Proposal, ProposalResponse, Publish, Room, RoomMember, SessionBinding,
-    SessionRecovery, WorkDependency, WorkItem, WorkResult,
+    PermissionOutcome, Proposal, ProposalResponse, Publish, Room, RoomMember, RoomMessage,
+    SessionBinding, SessionRecovery, WorkDependency, WorkItem, WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -83,6 +83,23 @@ pub(super) fn room_member(row: &Row<'_>) -> Result<RoomMember, StoreError> {
             })?,
         joined_at: row.get(4)?,
         left_at: row.get(5)?,
+    })
+}
+
+pub(super) fn room_message(row: &Row<'_>) -> Result<RoomMessage, StoreError> {
+    let mentions = string_vec(row.get(5)?)?
+        .into_iter()
+        .map(|id| id.parse())
+        .collect::<Result<_, _>>()?;
+    Ok(RoomMessage {
+        id: id(row.get(0)?)?,
+        room_id: id(row.get(1)?)?,
+        sender_type: domain_enum(row.get(2)?)?,
+        sender_id: row.get(3)?,
+        body: row.get(4)?,
+        mentions,
+        reply_to: optional_id(row.get(6)?)?,
+        created_at: row.get(7)?,
     })
 }
 

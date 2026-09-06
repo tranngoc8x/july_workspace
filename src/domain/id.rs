@@ -50,6 +50,7 @@ macro_rules! typed_id {
 typed_id!(
     AgentId,
     RoomId,
+    RoomMessageId,
     ConversationId,
     MessageId,
     WorkItemId,
@@ -84,6 +85,7 @@ mod tests {
         assert_id_roundtrip!(
             AgentId,
             RoomId,
+            RoomMessageId,
             ConversationId,
             MessageId,
             WorkItemId,
