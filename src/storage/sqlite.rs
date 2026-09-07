@@ -940,6 +940,10 @@ impl SqliteStore {
             require_active_agent(&transaction, agent_id)?;
             require_active_room_membership(&transaction, message.room_id, agent_id)?;
         }
+        for target in &message.mentions {
+            require_active_agent(&transaction, *target)?;
+            require_active_room_membership(&transaction, message.room_id, *target)?;
+        }
         if let Some(reply_to) = message.reply_to {
             let reply_room = query_optional(
                 &transaction,
