@@ -53,13 +53,20 @@ impl<T: AgentTransport> SessionManager<T> {
         message_id: RoomMessageId,
         at: String,
     ) -> Result<Option<SessionRef>, RuntimeError> {
-        let Some((agent, message, binding)) = self
+        let Some(claim) = self
             .storage
             .claim_room_activation(message_id, self.agent_id, at.clone())
             .await?
         else {
             return Ok(None);
         };
+        let crate::storage::RoomActivationClaim {
+            agent,
+            message,
+            binding,
+            context,
+            truncated,
+        } = claim;
         if self.owned_bindings.contains_key(&binding.id) {
             self.storage
                 .set_room_activation_status(message_id, self.agent_id, "failed", at)
@@ -80,10 +87,18 @@ impl<T: AgentTransport> SessionManager<T> {
                 return Err(error);
             }
         };
-        let content = format!(
-            "Room: {}\nSender: {}\nMessage: {}\n\n{}",
-            message.room_id, message.sender_id, message.id, message.body
-        );
+        let mut content = format!("Room: {}\n", message.room_id);
+        if truncated {
+            content.push_str(
+                "Older unseen Room messages omitted: context limited to 50 preceding messages.\n",
+            );
+        }
+        content.push_str("Shared Room context:\n");
+        for previous in &context {
+            append_room_context_message(&mut content, previous);
+        }
+        content.push_str("Current message:\n");
+        append_room_context_message(&mut content, &message);
         let sent = async {
             self.storage
                 .validate_room_activation(message_id, self.agent_id)
@@ -731,4 +746,21 @@ async fn disconnect_owned_bindings(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+fn append_room_context_message(content: &mut String, message: &crate::domain::RoomMessage) {
+    use std::fmt::Write;
+    writeln!(
+        content,
+        "Message: {}\nSender: {} ({})\nReply-to: {}\n{}\n",
+        message.id,
+        message.sender_id,
+        message.sender_type,
+        message
+            .reply_to
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into()),
+        message.body
+    )
+    .expect("writing to String cannot fail");
 }

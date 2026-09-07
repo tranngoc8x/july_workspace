@@ -32,7 +32,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 17] = [
+const MIGRATIONS: [Migration; 18] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -101,7 +101,19 @@ const MIGRATIONS: [Migration; 17] = [
         version: 17,
         sql: include_str!("migrations/0017_room_runtime.sql"),
     },
+    Migration {
+        version: 18,
+        sql: include_str!("migrations/0018_agent_room_cursors.sql"),
+    },
 ];
+
+pub(crate) struct RoomActivationClaim {
+    pub agent: Agent,
+    pub message: RoomMessage,
+    pub binding: RoomSessionBinding,
+    pub context: Vec<RoomMessage>,
+    pub truncated: bool,
+}
 
 /// Durable SQLite access which keeps Work Result lifecycle and Publish writes guarded.
 ///
@@ -2372,7 +2384,7 @@ impl SqliteStore {
         message_id: RoomMessageId,
         agent_id: AgentId,
         activated_at: &str,
-    ) -> Result<Option<(Agent, RoomMessage, RoomSessionBinding)>, StoreError> {
+    ) -> Result<Option<RoomActivationClaim>, StoreError> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2424,8 +2436,28 @@ impl SqliteStore {
         transaction.execute("INSERT INTO room_message_activations(message_id, agent_id, session_binding_id, status, updated_at)
             VALUES (?1, ?2, ?3, 'claimed', ?4)",
             params![message_id.to_string(), agent_id.to_string(), binding.id.to_string(), activated_at])?;
+        // Snapshot only preceding unseen shared messages, never messages after the trigger.
+        let mut context = query_all(&transaction,
+            "SELECT m.id, m.room_id, m.sender_type, m.sender_id, m.body, m.mentions_json, m.reply_to, m.created_at
+             FROM room_messages m JOIN room_message_order o ON o.message_id = m.id
+             WHERE m.room_id = ?1
+               AND o.sequence < (SELECT sequence FROM room_message_order WHERE message_id = ?2)
+               AND o.sequence > COALESCE((SELECT seen.sequence FROM agent_room_cursors c
+                   JOIN room_message_order seen ON seen.message_id = c.last_seen_message_id
+                   WHERE c.agent_id = ?3 AND c.room_id = ?1), 0)
+             ORDER BY o.sequence DESC LIMIT 51",
+            params![message.room_id.to_string(), message_id.to_string(), agent_id.to_string()], records::room_message)?;
+        let truncated = context.len() > 50;
+        context.truncate(50);
+        context.reverse();
         transaction.commit()?;
-        Ok(Some((agent, message, binding)))
+        Ok(Some(RoomActivationClaim {
+            agent,
+            message,
+            binding,
+            context,
+            truncated,
+        }))
     }
 
     pub(crate) fn validate_room_activation(
@@ -2468,11 +2500,25 @@ impl SqliteStore {
         status: &str,
         at: &str,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
             "UPDATE room_message_activations SET status = ?1, updated_at = ?2
             WHERE message_id = ?3 AND agent_id = ?4 AND status IN ('claimed', 'sent')",
             params![status, at, message_id.to_string(), agent_id.to_string()],
         )?;
+        // send_message only queues ACP work. Successful completion acknowledges the
+        // shared context; failed/cancelled/uncertain turns cannot advance it.
+        if changed == 1 && status == "completed" {
+            transaction.execute(
+                "INSERT INTO agent_room_cursors(agent_id, room_id, last_seen_message_id)
+                 SELECT ?1, room_id, id FROM room_messages WHERE id = ?2
+                 ON CONFLICT(agent_id, room_id) DO UPDATE SET last_seen_message_id = excluded.last_seen_message_id
+                 WHERE (SELECT sequence FROM room_message_order WHERE message_id = excluded.last_seen_message_id)
+                     > (SELECT sequence FROM room_message_order WHERE message_id = agent_room_cursors.last_seen_message_id)",
+                params![agent_id.to_string(), message_id.to_string()],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -4466,7 +4512,7 @@ mod tests {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 17);
+        assert_eq!(store.schema_version().unwrap(), 18);
     }
 
     #[test]
@@ -4839,14 +4885,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            17
+            18
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            17
+            18
         );
     }
 
@@ -5515,7 +5561,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 17);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 18);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -6003,15 +6049,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (18);",
+                 INSERT INTO schema_migrations(version) VALUES (19);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 18,
-                supported: 17,
+                found: 19,
+                supported: 18,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),
