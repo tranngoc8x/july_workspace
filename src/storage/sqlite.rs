@@ -8,8 +8,8 @@ use crate::domain::{
     MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome,
     Proposal, ProposalId, ProposalResponse, ProposalResponseId, ProposalResponseType,
     ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency,
-    WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomMessageId, RoomSessionBinding, SessionBinding, SessionBindingId, SessionBindingStatus,
+    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -32,7 +32,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 16] = [
+const MIGRATIONS: [Migration; 17] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -96,6 +96,10 @@ const MIGRATIONS: [Migration; 16] = [
     Migration {
         version: 16,
         sql: include_str!("migrations/0016_room_messages.sql"),
+    },
+    Migration {
+        version: 17,
+        sql: include_str!("migrations/0017_room_runtime.sql"),
     },
 ];
 
@@ -2362,6 +2366,116 @@ impl SqliteStore {
         )
     }
 
+    /// Claim once before any runtime side effect. Exact message replay cannot resend.
+    pub(crate) fn claim_room_activation(
+        &mut self,
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+        activated_at: &str,
+    ) -> Result<Option<(Agent, RoomMessage, RoomSessionBinding)>, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (agent, message) = validate_room_activation(&transaction, message_id, agent_id)?;
+        let claimed: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM room_message_activations WHERE message_id = ?1 AND agent_id = ?2)",
+            params![message_id.to_string(), agent_id.to_string()], |row| row.get(0))?;
+        if claimed {
+            return Ok(None);
+        }
+        let binding = query_optional(&transaction,
+            "SELECT id, room_id, agent_id, transport_type, remote_session_id, generation, status, created_at, last_used_at
+             FROM session_bindings WHERE room_id = ?1 AND agent_id = ?2 ORDER BY generation DESC LIMIT 1",
+            params![message.room_id.to_string(), agent_id.to_string()], records::room_session_binding)?;
+        let binding = match binding {
+            Some(binding)
+                if matches!(
+                    binding.status,
+                    SessionBindingStatus::Lost | SessionBindingStatus::Closed
+                ) =>
+            {
+                return Err(StoreError::RoomSessionUnavailable(binding.id));
+            }
+            Some(binding) => binding,
+            None => {
+                let binding = RoomSessionBinding {
+                    id: SessionBindingId::new(),
+                    room_id: message.room_id,
+                    agent_id,
+                    transport_type: agent.transport_type.clone(),
+                    remote_session_id: None,
+                    generation: 1,
+                    status: SessionBindingStatus::Disconnected,
+                    created_at: activated_at.into(),
+                    last_used_at: activated_at.into(),
+                };
+                transaction.execute("INSERT INTO session_bindings(id, room_id, agent_id, transport_type, generation, status, created_at, last_used_at)
+                    VALUES (?1, ?2, ?3, ?4, 1, 'disconnected', ?5, ?5)",
+                    params![binding.id.to_string(), binding.room_id.to_string(), agent_id.to_string(), binding.transport_type, activated_at])?;
+                binding
+            }
+        };
+        let unfinished: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM room_message_activations WHERE session_binding_id = ?1 AND status IN ('claimed', 'sent'))",
+            params![binding.id.to_string()], |row| row.get(0))?;
+        if unfinished {
+            return Err(StoreError::RoomSessionUnavailable(binding.id));
+        }
+        transaction.execute("INSERT INTO room_message_activations(message_id, agent_id, session_binding_id, status, updated_at)
+            VALUES (?1, ?2, ?3, 'claimed', ?4)",
+            params![message_id.to_string(), agent_id.to_string(), binding.id.to_string(), activated_at])?;
+        transaction.commit()?;
+        Ok(Some((agent, message, binding)))
+    }
+
+    pub(crate) fn validate_room_activation(
+        &self,
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+    ) -> Result<(), StoreError> {
+        validate_room_activation(&self.connection, message_id, agent_id).map(|_| ())
+    }
+
+    pub fn get_room_session_binding(
+        &self,
+        room_id: RoomId,
+        agent_id: AgentId,
+    ) -> Result<Option<RoomSessionBinding>, StoreError> {
+        query_optional(&self.connection,
+            "SELECT id, room_id, agent_id, transport_type, remote_session_id, generation, status, created_at, last_used_at
+             FROM session_bindings WHERE room_id = ?1 AND agent_id = ?2 ORDER BY generation DESC LIMIT 1",
+            params![room_id.to_string(), agent_id.to_string()], records::room_session_binding)
+    }
+
+    pub(crate) fn attach_room_remote_session(
+        &self,
+        binding_id: SessionBindingId,
+        remote: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        if self.connection.execute("UPDATE session_bindings SET remote_session_id = ?1, status = 'active', last_used_at = ?2
+            WHERE id = ?3 AND room_id IS NOT NULL AND status IN ('active', 'disconnected')",
+            params![remote, at, binding_id.to_string()])? == 0 {
+            return Err(StoreError::RoomSessionUnavailable(binding_id));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_room_activation_status(
+        &self,
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+        status: &str,
+        at: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE room_message_activations SET status = ?1, updated_at = ?2
+            WHERE message_id = ?3 AND agent_id = ?4 AND status IN ('claimed', 'sent')",
+            params![status, at, message_id.to_string(), agent_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_session_binding(&self, binding: &SessionBinding) -> Result<(), StoreError> {
         binding.validate()?;
         let generation =
@@ -2397,7 +2511,7 @@ impl SqliteStore {
             &self.connection,
             "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
                     generation, status, created_at, last_used_at
-             FROM session_bindings WHERE id = ?1",
+             FROM session_bindings WHERE id = ?1 AND conversation_id IS NOT NULL",
             params![id.to_string()],
             records::session_binding,
         )
@@ -2447,7 +2561,7 @@ impl SqliteStore {
             "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
                     generation, status, created_at, last_used_at
              FROM session_bindings
-             WHERE agent_id = ?1 AND status IN ('active', 'disconnected')
+             WHERE agent_id = ?1 AND conversation_id IS NOT NULL AND status IN ('active', 'disconnected')
              ORDER BY conversation_id",
             params![agent_id.to_string()],
             records::session_binding,
@@ -2480,7 +2594,11 @@ impl SqliteStore {
         {
             return Ok(true);
         }
-        Ok(self.get_session_binding(binding_id)?.is_some())
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_bindings WHERE id = ?1)",
+            params![binding_id.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn begin_session_replacement(
@@ -4127,6 +4245,34 @@ fn require_store_text(value: &str, field: &'static str) -> Result<(), StoreError
     }
 }
 
+fn validate_room_activation(
+    connection: &Connection,
+    message_id: RoomMessageId,
+    agent_id: AgentId,
+) -> Result<(Agent, RoomMessage), StoreError> {
+    let message = query_optional(connection,
+        "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at FROM room_messages WHERE id = ?1",
+        params![message_id.to_string()], records::room_message)?.ok_or(StoreError::RoomMessageNotFound(message_id))?;
+    if !message.mentions.contains(&agent_id) {
+        return Err(StoreError::RoomMessageTargetRequired {
+            message_id,
+            agent_id,
+        });
+    }
+    require_active_room(connection, message.room_id)?;
+    let agent = require_active_agent_record(connection, agent_id)?;
+    require_active_room_membership(connection, message.room_id, agent_id)?;
+    if message.sender_type == MemberType::Agent {
+        let sender = message
+            .sender_id
+            .parse()
+            .map_err(|_| StoreError::InvalidStoredValue("room sender"))?;
+        require_active_agent(connection, sender)?;
+        require_active_room_membership(connection, message.room_id, sender)?;
+    }
+    Ok((agent, message))
+}
+
 fn session_binding_by_id(
     connection: &Connection,
     id: SessionBindingId,
@@ -4135,7 +4281,7 @@ fn session_binding_by_id(
         connection,
         "SELECT id, conversation_id, agent_id, transport_type, remote_session_id,
                 generation, status, created_at, last_used_at
-         FROM session_bindings WHERE id = ?1",
+         FROM session_bindings WHERE id = ?1 AND conversation_id IS NOT NULL",
         params![id.to_string()],
         records::session_binding,
     )
@@ -4320,7 +4466,7 @@ mod tests {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 16);
+        assert_eq!(store.schema_version().unwrap(), 17);
     }
 
     #[test]
@@ -4370,6 +4516,7 @@ mod tests {
         let tables = [
             "room_members",
             "room_messages",
+            "room_message_activations",
             "conversations",
             "conversation_members",
             "messages",
@@ -4404,7 +4551,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 32);
+        assert_eq!(foreign_key_count, 36);
     }
 
     #[test]
@@ -4692,14 +4839,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            16
+            17
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            16
+            17
         );
     }
 
@@ -5368,7 +5515,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 16);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 17);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -5856,15 +6003,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (17);",
+                 INSERT INTO schema_migrations(version) VALUES (18);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 17,
-                supported: 16,
+                found: 18,
+                supported: 17,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),
@@ -5998,6 +6145,103 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn migration_seventeen_preserves_bindings_permissions_and_recoveries() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..16]).unwrap();
+        seed_session_parent_rows(&connection);
+        insert_raw_binding(&connection, "source", 1, "lost");
+        insert_raw_binding(&connection, "replacement", 2, "active");
+        connection.execute_batch("INSERT INTO permission_decisions VALUES ('decision', 'source', 'request', '[]', 'cancelled', NULL, 'now');
+            INSERT INTO session_recoveries VALUES ('replacement', 'source', 'private capsule', 'delivered', 'now');").unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        assert_eq!(connection.query_row("SELECT count(*) FROM session_bindings WHERE conversation_id = 'conversation-1' AND room_id IS NULL", [], |row| row.get::<_,i64>(0)).unwrap(), 2);
+        assert_eq!(
+            connection
+                .query_row("SELECT capsule FROM session_recoveries", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "private capsule"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT outcome FROM permission_decisions", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "cancelled"
+        );
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
+        );
+        for sql in [
+            "UPDATE permission_decisions SET outcome = 'selected'",
+            "DELETE FROM permission_decisions",
+            "UPDATE session_recoveries SET capsule = 'changed'",
+            "UPDATE session_bindings SET conversation_id = NULL WHERE id = 'source'",
+        ] {
+            assert!(connection.execute(sql, []).is_err(), "{sql}");
+        }
+        connection.execute_batch("INSERT INTO rooms VALUES ('room', 'VNA', NULL, 'active', 'now', 'now');
+            INSERT INTO session_bindings(id, room_id, agent_id, transport_type, generation, status, created_at, last_used_at)
+            VALUES ('room-binding', 'room', 'agent-1', 'acp', 1, 'active', 'now', 'now');").unwrap();
+        assert!(connection.execute("UPDATE session_bindings SET conversation_id = 'conversation-1' WHERE id = 'room-binding'", []).is_err());
+        assert!(connection.execute("INSERT INTO session_bindings(id, room_id, agent_id, transport_type, generation, status, created_at, last_used_at) VALUES ('duplicate', 'room', 'agent-1', 'acp', 2, 'disconnected', 'now', 'now')", []).is_err());
+    }
+
+    #[test]
+    fn failed_migration_seventeen_restores_original_tables_and_triggers() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..16]).unwrap();
+        seed_session_parent_rows(&connection);
+        insert_raw_binding(&connection, "source", 1, "active");
+        connection.execute_batch("INSERT INTO permission_decisions VALUES ('decision', 'source', 'request', '[]', 'cancelled', NULL, 'now');
+            CREATE TABLE room_message_activations (existing TEXT);").unwrap();
+        assert!(apply_migrations(&mut connection, &MIGRATIONS).is_err());
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 16);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM session_bindings WHERE id = 'source'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM permission_decisions", [])
+                .is_err()
+        );
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
         );
     }
 

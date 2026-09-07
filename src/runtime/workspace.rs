@@ -2,7 +2,9 @@ use super::{
     AgentDirectMessageRuntime, AgentThreadRuntime, RuntimeError, SessionManager, StorageHandle,
     StorageWorker, timestamp,
 };
-use crate::domain::{Agent, AgentId, PermissionOutcome, SessionBinding, SessionBindingId};
+use crate::domain::{
+    Agent, AgentId, PermissionOutcome, RoomMessageId, SessionBinding, SessionBindingId,
+};
 use crate::transport::{
     AgentConnection, AgentTransport, PermissionRequestId, PermissionResponse, SendMessage,
     SessionRef, TransportEvent,
@@ -23,6 +25,12 @@ type Reply<T> = oneshot::Sender<Result<T, RuntimeError>>;
 
 enum WorkspaceCommand<T> {
     RegisterAgent(AgentConnection, T, Reply<()>),
+    ActivateRoom(
+        RoomMessageId,
+        AgentId,
+        String,
+        Reply<Option<super::RoomActivation>>,
+    ),
     OpenSession {
         agent_id: AgentId,
         binding: SessionBinding,
@@ -105,6 +113,12 @@ impl<T: AgentTransport + Send + 'static> WorkspaceHandle<T> {
 }
 
 enum OwnerCommand {
+    ActivateRoom(
+        RoomMessageId,
+        String,
+        mpsc::Sender<TransportEvent>,
+        Reply<Option<SessionRef>>,
+    ),
     OpenSession {
         binding: SessionBinding,
         project_root: PathBuf,
@@ -253,12 +267,24 @@ impl<T: AgentTransport + Send + 'static> WorkspaceRuntime<T> {
         self.handle.storage.clone()
     }
 
-    pub(crate) async fn register_agent(
+    pub async fn register_agent(
         &self,
         connection: AgentConnection,
         transport: T,
     ) -> Result<(), RuntimeError> {
         self.handle.register_agent(connection, transport).await
+    }
+
+    /// Activate only a persisted, explicitly mentioned Room recipient, at most once.
+    pub async fn activate_room_message(
+        &self,
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+        at: String,
+    ) -> Result<Option<super::RoomActivation>, RuntimeError> {
+        self.handle
+            .request(|reply| WorkspaceCommand::ActivateRoom(message_id, agent_id, at, reply))
+            .await
     }
 
     pub fn thread(&self, agent_id: AgentId) -> Result<AgentThreadRuntime<T>, RuntimeError> {
@@ -355,6 +381,40 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                         let _ = reply.send(Err(error));
                     }
                 }
+            }
+            WorkspaceCommand::ActivateRoom(message, agent, at, reply) => {
+                let result = if let Some(owner) = owners.get(&agent) {
+                    let (events, receiver) = mpsc::channel(SESSION_EVENT_CAPACITY);
+                    let (response, receive) = oneshot::channel();
+                    match owner
+                        .commands
+                        .send(OwnerCommand::ActivateRoom(message, at, events, response))
+                        .await
+                    {
+                        Ok(()) => receive
+                            .await
+                            .map_err(|_| RuntimeError::ChannelClosed)
+                            .and_then(|result| result)
+                            .map(|session| {
+                                session.map(|session| RuntimeSession {
+                                    session,
+                                    commands: owner.commands.clone(),
+                                    events: receiver,
+                                })
+                            }),
+                        Err(_) => Err(RuntimeError::ChannelClosed),
+                    }
+                } else {
+                    Err(RuntimeError::AgentNotRegistered(agent))
+                };
+                // The queued result itself owns cleanup, including cancellation after
+                // send succeeds but before the caller polls its oneshot receiver.
+                let result = result.map(|runtime| {
+                    runtime.map(|runtime| {
+                        super::RoomActivation::new(runtime, storage.clone(), message, agent)
+                    })
+                });
+                let _ = reply.send(result);
             }
             WorkspaceCommand::OpenSession {
                 agent_id,
@@ -457,6 +517,7 @@ enum OwnerInput {
 }
 
 struct BindingRoute {
+    room: bool,
     session: SessionRef,
     events: mpsc::Sender<TransportEvent>,
 }
@@ -544,6 +605,21 @@ async fn run_owner<T: AgentTransport>(
                         if route.session != *session {
                             continue;
                         }
+                        // Private Room output is drained here, before the bounded consumer queue.
+                        // A slow UI cannot expose it or block sibling sessions with text/tool traffic.
+                        if route.room
+                            && matches!(
+                                event,
+                                TransportEvent::AgentTextDelta { .. }
+                                    | TransportEvent::AgentMessageCompleted { .. }
+                                    | TransportEvent::ToolCallStarted { .. }
+                                    | TransportEvent::ToolCallFinished { .. }
+                                    | TransportEvent::UsageReported { .. }
+                                    | TransportEvent::TurnStarted { .. }
+                            )
+                        {
+                            continue;
+                        }
                         pending = Some(PendingDelivery {
                             event,
                             targets: VecDeque::from([target]),
@@ -584,6 +660,25 @@ async fn handle_owner_command<T: AgentTransport>(
     pending: &mut Option<PendingDelivery>,
 ) -> Option<OwnerExit> {
     match command {
+        Some(OwnerCommand::ActivateRoom(message, at, events, reply)) => {
+            let result = manager.activate_room_message(message, at.clone()).await;
+            if let Ok(Some(session)) = &result {
+                bindings.insert(
+                    session.binding_id,
+                    BindingRoute {
+                        room: true,
+                        session: session.clone(),
+                        events,
+                    },
+                );
+            }
+            if let Err(Ok(Some(session))) = reply.send(result) {
+                // Caller cancellation after accepted send must not leave an attached orphan.
+                let _ = manager.cancel_turn(session.clone(), at.clone()).await;
+                let _ = manager.detach_session(&session, at).await;
+                bindings.remove(&session.binding_id);
+            }
+        }
         Some(OwnerCommand::OpenSession {
             binding,
             project_root,
@@ -605,6 +700,7 @@ async fn handle_owner_command<T: AgentTransport>(
                     bindings.insert(
                         session.binding_id,
                         BindingRoute {
+                            room: false,
                             session: session.clone(),
                             events,
                         },
