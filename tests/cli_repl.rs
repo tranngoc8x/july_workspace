@@ -2160,52 +2160,33 @@ fn repl_bare_mention_enters_direct_work_without_sending_anything() {
 }
 
 #[test]
-fn repl_multiple_mentions_create_a_work_in_the_room_and_auto_enter_it() {
+fn repl_room_mentions_reject_nonmembers_without_side_effects() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("vna");
     let codex = workspace.seed_acp_agent("codex", &[]);
-    let pay = workspace.seed_acp_agent("pay", &[]);
+    workspace.seed_acp_agent("pay", &[]);
     workspace.add_member(&room, &codex);
-
-    let output = workspace.repl("/room vna\n@codex @pay implement refund flow\n1\n/quit\n");
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
-    let stdout_output = stdout(&output);
-    // `pay` was not a member yet: the mention adds it and says so.
-    assert!(stdout_output.contains(&format!("member\tpay\t{}\n", room.id)));
-    assert!(stdout_output.contains("\timplement refund flow\n"));
-
+    let output =
+        workspace.repl("/room vna\n@codex @pay implement refund flow\n@missing hello\n/quit\n");
+    assert!(output.status.success());
+    assert!(!stderr(&output).is_empty());
     let connection = Connection::open(&workspace.database).unwrap();
-    let (thread, title): (String, String) = connection
+    for table in ["room_messages", "conversations", "session_bindings"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "unexpected side effect in {table}");
+    }
+    let members: i64 = connection
         .query_row(
-            "SELECT id, title FROM conversations WHERE type = 'thread'",
+            "SELECT COUNT(*) FROM room_members WHERE left_at IS NULL",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(title, "implement refund flow");
-    let thread_id: ConversationId = thread.parse().unwrap();
-    assert_eq!(
-        workspace
-            .messages(thread_id)
-            .iter()
-            .map(|(body, _)| body.as_str())
-            .collect::<Vec<_>>(),
-        ["implement refund flow", "fixture reply"]
-    );
-    let members: Vec<String> = connection
-        .prepare(
-            "SELECT member_id FROM conversation_members \
-             WHERE conversation_id = ? AND member_type = 'agent' AND left_at IS NULL",
-        )
-        .unwrap()
-        .query_map([&thread], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(members.len(), 2);
-    assert!(members.contains(&codex.id.to_string()));
-    assert!(members.contains(&pay.id.to_string()));
+    assert_eq!(members, 1);
 }
 
 #[test]
@@ -2365,8 +2346,9 @@ fn repl_plain_prompt_inside_work_stays_in_that_work() {
     workspace.add_member(&room, &codex);
     workspace.add_member(&room, &pay);
 
+    let thread = workspace.seed_thread(&room, "existing work", &[&codex, &pay]);
     let output = workspace.repl(
-        "/room vna\n@codex @pay implement refund flow\n1\nsupport partial refund too\n1\n/quit\n",
+        &format!("/room vna\n/thread {thread} --agent codex\nimplement refund flow\n1\nsupport partial refund too\n1\n/quit\n"),
     );
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
@@ -2557,40 +2539,41 @@ fn repl_decision_actions_reject_non_user_ownership_and_bad_grammar() {
 }
 
 #[test]
-fn repl_two_mention_created_works_keep_separate_transcripts() {
+fn repl_room_mentions_persist_once_activate_only_targets_and_keep_private_output_hidden() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("vna");
-    let codex = workspace.seed_acp_agent("codex", &[]);
-    let pay = workspace.seed_acp_agent("pay", &[]);
-    workspace.add_member(&room, &codex);
-    workspace.add_member(&room, &pay);
-
-    let output = workspace.repl(
-        "/room vna\n@codex @pay refund flow\n1\n/back\n@codex @pay callback retry\n1\n/quit\n",
-    );
-
-    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
+    for agent in [&codex, &pay, &idle] {
+        workspace.add_member(&room, agent);
+    }
+    let output = workspace.repl("/room vna\n@codex @codex @pay refund flow\n/status\n/quit\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("fixture reply"));
     let connection = Connection::open(&workspace.database).unwrap();
-    let threads: Vec<(String, String)> = connection
-        .prepare("SELECT id, title FROM conversations WHERE type = 'thread' ORDER BY created_at")
+    let bodies: Vec<String> = connection
+        .prepare("SELECT body FROM room_messages")
         .unwrap()
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_map([], |r| r.get(0))
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    // Rule C creates a Work per mention; it does not resume a matching one.
-    assert_eq!(threads.len(), 2);
-    for (thread, title) in threads {
-        assert_eq!(
-            workspace
-                .messages(thread.parse().unwrap())
-                .iter()
-                .map(|(body, _)| body.as_str())
-                .collect::<Vec<_>>(),
-            [title.as_str(), "fixture reply"],
-            "work {title} transcript"
-        );
-    }
+    assert_eq!(bodies, ["@codex @codex @pay refund flow"]);
+    let targets: Vec<String> = connection
+        .prepare("SELECT agent_id FROM room_message_activations ORDER BY agent_id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut expected = vec![codex.id.to_string(), pay.id.to_string()];
+    expected.sort();
+    assert_eq!(targets, expected);
+    let conversations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(conversations, 0);
 }
 
 #[test]
@@ -2603,9 +2586,11 @@ fn repl_mentioning_the_same_agents_inside_a_work_continues_it() {
     workspace.add_member(&room, &pay);
 
     // The second mention names the same pair, in the other order, from inside
-    // the work it created.
-    let output = workspace
-        .repl("/room vna\n@codex @pay refund flow\n1\n@pay @codex also partial refund\n1\n/quit\n");
+    // the explicitly opened work.
+    let thread = workspace.seed_thread(&room, "existing work", &[&codex, &pay]);
+    let output = workspace.repl(&format!(
+        "/room vna\n/thread {thread} --agent codex\nrefund flow\n1\n@pay @codex also partial refund\n1\n/quit\n"
+    ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let connection = Connection::open(&workspace.database).unwrap();
@@ -2635,8 +2620,10 @@ fn repl_mentioning_a_different_set_inside_a_work_still_creates_one() {
     workspace.add_member(&room, &pay);
     workspace.add_member(&room, &ops);
 
-    let output = workspace
-        .repl("/room vna\n@codex @pay refund flow\n1\n@codex @ops callback retry\n1\n/quit\n");
+    let thread = workspace.seed_thread(&room, "existing work", &[&codex, &pay]);
+    let output = workspace.repl(&format!(
+        "/room vna\n/thread {thread} --agent codex\nrefund flow\n1\n@codex @ops callback retry\n1\n/quit\n"
+    ));
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let threads: i64 = Connection::open(&workspace.database)
@@ -2667,4 +2654,193 @@ fn repl_mentioning_the_open_agent_inside_direct_work_continues_it() {
         )
         .unwrap();
     assert_turns(&workspace, conversation.parse().unwrap(), &["one", "two"]);
+}
+
+#[tokio::test]
+async fn inactive_tui_room_mentions_keep_fifo_history_and_drain_all_permissions() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    for name in ["codex", "pay"] {
+        let agent = workspace.seed_acp_agent(name, &[]);
+        workspace.add_member(&room, &agent);
+    }
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    let context = app.context().id().to_owned();
+    for body in ["@codex @codex @pay refund flow", "@codex follow up"] {
+        bridge.dispatch(tui_command(&mut app, body)).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&first, AppEvent::CommandFinished { context: origin, result: CommandResult::SubmittedWithContext(_) } if origin == &context)
+        );
+        app.reduce(first);
+        assert_eq!(app.context().id(), &context);
+        assert!(app.turn_active());
+        assert_eq!(app.transcript().matches(body).count(), 1);
+        let mut permissions = 0;
+        while app.turn_active() {
+            let event = tokio::time::timeout(Duration::from_secs(5), bridge.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!matches!(&event, AppEvent::Chat(ChatEvent::TextDelta(_))));
+            app.reduce(event);
+            if app.permission().is_some() {
+                permissions += 1;
+                let commands = app.reduce(AppEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                )));
+                for command in commands {
+                    bridge.dispatch(command).unwrap();
+                }
+            }
+        }
+        assert_eq!(permissions, if body.contains("@pay") { 2 } else { 1 });
+        assert_eq!(app.context().id(), &context);
+        assert!(!app.transcript().contains("fixture reply"));
+    }
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_room_cancel_and_failure_restore_input_without_private_output() {
+    for (arguments, cancel) in [
+        (&["--permission-after-cancel"][..], true),
+        (&["--protocol-error"][..], false),
+    ] {
+        let workspace = TestWorkspace::new();
+        let room = workspace.seed_room("vna");
+        let agent = workspace.seed_acp_agent("codex", arguments);
+        workspace.add_member(&room, &agent);
+        let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+        let mut app = App::new(bridge.initial_context());
+        let opened = bridge
+            .execute(tui_command(&mut app, "/room vna"))
+            .await
+            .unwrap();
+        app.reduce(opened);
+        bridge
+            .dispatch(tui_command(&mut app, "@codex investigate"))
+            .unwrap();
+        let submitted = bridge.next_event().await.unwrap().unwrap();
+        app.reduce(submitted);
+        if cancel {
+            bridge.dispatch(AppCommand::CancelTurn).unwrap();
+        }
+        while app.turn_active() {
+            let event = tokio::time::timeout(Duration::from_secs(5), bridge.next_event())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(!matches!(&event, AppEvent::Chat(ChatEvent::TextDelta(_))));
+            for command in app.reduce(event) {
+                bridge.dispatch(command).unwrap();
+            }
+        }
+        assert!(app.permission().is_none());
+        assert!(app.context().label().contains("room::vna"));
+        assert!(
+            app.transcript()
+                .contains(if cancel { "cancelled" } else { "failed" })
+        );
+        bridge.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn inactive_tui_room_cancel_with_visible_permission_keeps_bridge_alive() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &agent);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    bridge
+        .dispatch(tui_command(&mut app, "@codex investigate"))
+        .unwrap();
+    while app.permission().is_none() {
+        let event = tokio::time::timeout(Duration::from_secs(5), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        app.reduce(event);
+    }
+    bridge.dispatch(AppCommand::CancelTurn).unwrap();
+    while app.turn_active() {
+        let event = tokio::time::timeout(Duration::from_secs(5), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for command in app.reduce(event) {
+            bridge.dispatch(command).unwrap();
+        }
+    }
+    let event = bridge
+        .execute(tui_command(&mut app, "still here"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert!(app.transcript().contains("still here"));
+    assert!(app.permission().is_none());
+    bridge.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn inactive_tui_room_cancel_during_stalled_startup_restores_input() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let agent = workspace.seed_acp_agent("slow", &["--hang-new"]);
+    workspace.add_member(&room, &agent);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    bridge
+        .dispatch(tui_command(&mut app, "@slow investigate"))
+        .unwrap();
+    app.reduce(bridge.next_event().await.unwrap().unwrap());
+    bridge.dispatch(AppCommand::CancelTurn).unwrap();
+    while app.turn_active() {
+        let event = tokio::time::timeout(Duration::from_secs(3), bridge.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        app.reduce(event);
+    }
+    let event = tokio::time::timeout(
+        Duration::from_secs(3),
+        bridge.execute(tui_command(&mut app, "still here")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    app.reduce(event);
+    assert!(app.transcript().contains("still here"));
+    tokio::time::timeout(Duration::from_secs(3), bridge.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
 }
