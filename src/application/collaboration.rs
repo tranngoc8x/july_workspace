@@ -366,6 +366,25 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
         self.runtime.append_room_message(command.message).await
     }
 
+    /// Resolve parsed mention names without changing the shared message body.
+    /// Storage validates all targets and the sender in the append transaction.
+    /// This only persists intent; replaying it does not authorize runtime delivery.
+    pub async fn append_room_message_with_mentions(
+        &mut self,
+        mut command: AppendRoomMessage,
+        names: &[String],
+    ) -> Result<RoomMessage, CollaborationError> {
+        let mut targets = Vec::with_capacity(names.len());
+        for name in names {
+            let agent = self.resolve_agent(AgentRef::Name(name.clone())).await?;
+            if !targets.contains(&agent.id) {
+                targets.push(agent.id);
+            }
+        }
+        command.message.mentions = targets;
+        self.append_room_message(command).await
+    }
+
     pub async fn list_recent_room_messages(
         &mut self,
         room_id: RoomId,

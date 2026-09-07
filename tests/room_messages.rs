@@ -4,7 +4,7 @@ use july_workspace::application::{
 };
 use july_workspace::domain::{Agent, AgentId, MemberType, RoomId, RoomMessage, RoomMessageId};
 use july_workspace::runtime::StorageWorker;
-use july_workspace::storage::SqliteStore;
+use july_workspace::storage::{SqliteStore, StoreError};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -479,5 +479,225 @@ async fn agent_room_senders_must_exist_be_active_and_be_active_room_members() {
             room_id: other_room_id,
             agent_id: active.id,
         })
+    );
+}
+
+#[tokio::test]
+async fn room_mention_targets_are_validated_atomically_at_the_storage_boundary() {
+    let database = TestDatabase::new();
+    let pay = agent("pay", "active");
+    let infra = agent("infra", "active");
+    let inactive = agent("inactive", "inactive");
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    for target in [&pay, &infra, &inactive] {
+        store.insert_agent(target).unwrap();
+    }
+    let mut service = new_service(database.path());
+    let room_id = room(&mut service, "VNA").await;
+    add_member(&mut service, room_id, pay.id).await;
+    let unknown = AgentId::new();
+    for target in [infra.id, inactive.id, unknown] {
+        let message = message(
+            RoomMessageId::new(),
+            room_id,
+            MemberType::User,
+            "local-user",
+            "@pay @other check refund",
+            vec![pay.id, target],
+            None,
+            CREATED,
+        );
+        match store.append_room_message(&message).unwrap_err() {
+            StoreError::RoomMembershipRequired {
+                room_id: rejected_room,
+                agent_id,
+            } => {
+                assert_eq!(
+                    (rejected_room, agent_id, target),
+                    (room_id, infra.id, infra.id)
+                );
+            }
+            StoreError::AgentInactive(agent_id) => {
+                assert_eq!((agent_id, target), (inactive.id, inactive.id));
+            }
+            StoreError::AgentNotFound(agent_id) => {
+                assert_eq!((agent_id, target), (unknown, unknown));
+            }
+            error => panic!("unexpected target validation error: {error}"),
+        }
+        assert!(
+            store
+                .list_recent_room_messages(room_id, 50)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        service
+            .list_room_members(RoomRef::Id(room_id))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn room_mention_resolution_preserves_body_and_deduplicates_targets_in_order() {
+    let database = TestDatabase::new();
+    let cashpoint = agent("cashpoint", "active");
+    let pay = agent("pay", "active");
+    let store = SqliteStore::open(database.path()).unwrap();
+    for target in [&cashpoint, &pay] {
+        store.insert_agent(target).unwrap();
+    }
+    let mut service = new_service(database.path());
+    let room_id = room(&mut service, "VNA").await;
+    for target in [&cashpoint, &pay] {
+        add_member(&mut service, room_id, target.id).await;
+    }
+    let original = message(
+        RoomMessageId::new(),
+        room_id,
+        MemberType::User,
+        "local-user",
+        "  @pay @cashpoint @pay check refund\nkeep this body",
+        vec![],
+        None,
+        CREATED,
+    );
+    let names = vec!["pay".into(), "cashpoint".into(), "pay".into()];
+    let saved = service
+        .append_room_message_with_mentions(
+            AppendRoomMessage {
+                message: original.clone(),
+            },
+            &names,
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.body, original.body);
+    assert_eq!(saved.id, original.id);
+    assert_eq!(saved.mentions, vec![pay.id, cashpoint.id]);
+    assert_eq!(
+        service
+            .append_room_message_with_mentions(AppendRoomMessage { message: original }, &names,)
+            .await
+            .unwrap(),
+        saved
+    );
+    assert_eq!(
+        service
+            .list_recent_room_messages(room_id, 50)
+            .await
+            .unwrap()
+            .0,
+        vec![saved]
+    );
+}
+
+#[tokio::test]
+async fn room_mention_resolution_rejects_unknown_names_before_persistence() {
+    let database = TestDatabase::new();
+    let pay = agent("pay", "active");
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&pay)
+        .unwrap();
+    let mut service = new_service(database.path());
+    let room_id = room(&mut service, "VNA").await;
+    add_member(&mut service, room_id, pay.id).await;
+    let original = message(
+        RoomMessageId::new(),
+        room_id,
+        MemberType::User,
+        "local-user",
+        "@pay @unknown check refund",
+        vec![],
+        None,
+        CREATED,
+    );
+    assert_eq!(
+        service
+            .append_room_message_with_mentions(
+                AppendRoomMessage { message: original },
+                &["pay".into(), "unknown".into()],
+            )
+            .await,
+        Err(CollaborationError::AgentNotFound("unknown".into()))
+    );
+    assert!(
+        service
+            .list_recent_room_messages(room_id, 50)
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn departed_room_target_rejects_new_messages_but_not_exact_history_replay() {
+    let database = TestDatabase::new();
+    let pay = agent("pay", "active");
+    SqliteStore::open(database.path())
+        .unwrap()
+        .insert_agent(&pay)
+        .unwrap();
+    let mut service = new_service(database.path());
+    let room_id = room(&mut service, "VNA").await;
+    add_member(&mut service, room_id, pay.id).await;
+    let original = message(
+        RoomMessageId::new(),
+        room_id,
+        MemberType::User,
+        "local-user",
+        "@pay check refund",
+        vec![pay.id],
+        None,
+        CREATED,
+    );
+    service
+        .append_room_message(AppendRoomMessage {
+            message: original.clone(),
+        })
+        .await
+        .unwrap();
+    service
+        .remove_room_member(RemoveRoomMember {
+            room: RoomRef::Id(room_id),
+            agent: AgentRef::Id(pay.id),
+            changed_at: CREATED.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .append_room_message(AppendRoomMessage {
+                message: original.clone()
+            })
+            .await
+            .unwrap(),
+        original
+    );
+    let mut fresh = original.clone();
+    fresh.id = RoomMessageId::new();
+    assert_eq!(
+        service
+            .append_room_message(AppendRoomMessage { message: fresh })
+            .await,
+        Err(CollaborationError::RoomMembershipRequired {
+            room_id,
+            agent_id: pay.id
+        })
+    );
+    assert_eq!(
+        service
+            .list_recent_room_messages(room_id, 50)
+            .await
+            .unwrap()
+            .0,
+        vec![original]
     );
 }
