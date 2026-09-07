@@ -528,6 +528,13 @@ async fn ambiguous_send_is_recorded_and_never_automatically_retried() {
     let connection = rusqlite::Connection::open(database.path()).unwrap();
     assert_eq!(
         connection
+            .query_row("SELECT count(*) FROM agent_room_cursors", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        connection
             .query_row("SELECT status FROM room_message_activations", [], |row| row
                 .get::<_, String>(0))
             .unwrap(),
@@ -852,6 +859,13 @@ async fn room_terminal_failures_and_disconnects_close_activation_without_shared_
         let connection = rusqlite::Connection::open(database.path()).unwrap();
         assert_eq!(
             connection
+                .query_row("SELECT count(*) FROM agent_room_cursors", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
                 .query_row("SELECT status FROM room_message_activations", [], |row| row
                     .get::<_, String>(0))
                 .unwrap(),
@@ -989,4 +1003,298 @@ async fn terminal_poll_cancellation_preserves_completion_and_finishes_detach() {
         SessionBindingStatus::Disconnected
     );
     workspace.shutdown(NOW.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn room_cursor_delivers_bounded_context_and_advances_only_after_completion() {
+    let database = TestDatabase::new();
+    let (pay, _, room, mut message) = seed(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    for index in 0..55 {
+        message.id = RoomMessageId::new();
+        message.body = format!("shared-context-{index:02}");
+        message.created_at = format!("2000-{index:02}"); // Deliberately unrelated to insertion order.
+        store.append_room_message(&message).unwrap();
+    }
+    message.id = RoomMessageId::new();
+    message.body = "current-trigger".into();
+    store.append_room_message(&message).unwrap();
+    let (transport, events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: pay.id,
+                project_root: pay.project_root.clone().into(),
+            },
+            transport,
+        )
+        .await
+        .unwrap();
+    let mut active = workspace
+        .activate_room_message(message.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let content = observed.lock().unwrap().messages[0].content.clone();
+    assert!(content.contains("shared-context-05"), "{content}");
+    assert!(!content.contains("shared-context-04"));
+    assert!(content.contains("omitted"));
+    assert_eq!(content.matches("current-trigger").count(), 1);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let cursor_count = || {
+        connection
+            .query_row("SELECT count(*) FROM agent_room_cursors", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(cursor_count(), 0);
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        active.next_event(NOW.into()).await.unwrap(),
+        Some(RoomRuntimeEvent::Completed)
+    );
+    assert_eq!(cursor_count(), 1);
+    workspace.shutdown(NOW.into()).await.unwrap();
+    let (transport, events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: pay.id,
+                project_root: pay.project_root.clone().into(),
+            },
+            transport,
+        )
+        .await
+        .unwrap();
+    message.id = RoomMessageId::new();
+    message.body = "incremental-only".into();
+    store.append_room_message(&message).unwrap();
+    let mut active = workspace
+        .activate_room_message(message.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let content = observed.lock().unwrap().messages[0].content.clone();
+    assert!(content.contains("incremental-only"));
+    assert!(!content.contains("shared-context"));
+    assert!(!content.contains("current-trigger"));
+    active.cancel(NOW.into()).await.unwrap();
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        active.next_event(NOW.into()).await.unwrap(),
+        Some(RoomRuntimeEvent::Cancelled)
+    );
+    let seen: String = connection
+        .query_row(
+            "SELECT last_seen_message_id FROM agent_room_cursors WHERE room_id = ?1",
+            [room.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_ne!(seen, message.id.to_string());
+    workspace.shutdown(NOW.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn room_cursor_is_scoped_and_cannot_regress_or_include_future_messages() {
+    let database = TestDatabase::new();
+    let (pay, infra, room, first) = seed(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let mut newer = first.clone();
+    newer.id = RoomMessageId::new();
+    newer.body = "newer-trigger".into();
+    newer.mentions = vec![pay.id, infra.id];
+    store.append_room_message(&newer).unwrap();
+    let mut future = newer.clone();
+    future.id = RoomMessageId::new();
+    future.body = "future-must-not-leak".into();
+    store.append_room_message(&future).unwrap();
+    let (transport, events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: pay.id,
+                project_root: pay.project_root.clone().into(),
+            },
+            transport,
+        )
+        .await
+        .unwrap();
+    let mut active = workspace
+        .activate_room_message(newer.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let content = observed.lock().unwrap().messages[0].content.clone();
+    assert!(content.contains(&first.body));
+    assert!(!content.contains(&future.body));
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    active.next_event(NOW.into()).await.unwrap();
+    // A legitimate older activation still carries its current message, but cannot rewind.
+    let mut active = workspace
+        .activate_room_message(first.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    active.next_event(NOW.into()).await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection.execute_batch("VACUUM").unwrap();
+    let seen: String = connection.query_row("SELECT last_seen_message_id FROM agent_room_cursors WHERE agent_id = ?1 AND room_id = ?2", [pay.id.to_string(), room.id.to_string()], |row| row.get(0)).unwrap();
+    assert_eq!(seen, newer.id.to_string());
+    let (transport, infra_events, infra_observed) = FakeTransport::new();
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: infra.id,
+                project_root: infra.project_root.clone().into(),
+            },
+            transport,
+        )
+        .await
+        .unwrap();
+    let mut active = workspace
+        .activate_room_message(newer.id, infra.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        infra_observed.lock().unwrap().messages[0]
+            .content
+            .contains(&first.body)
+    );
+    infra_events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    active.next_event(NOW.into()).await.unwrap();
+    // The same agent in another Room starts independently.
+    let mut other = room.clone();
+    other.id = RoomId::new();
+    other.name = "Other".into();
+    store.create_room(&other).unwrap();
+    store.add_room_member(other.id, pay.id, None, NOW).unwrap();
+    let mut other_message = first.clone();
+    other_message.room_id = other.id;
+    other_message.id = RoomMessageId::new();
+    other_message.body = "other-room-history".into();
+    store.append_room_message(&other_message).unwrap();
+    other_message.id = RoomMessageId::new();
+    other_message.body = "other-room-current".into();
+    store.append_room_message(&other_message).unwrap();
+    let mut active = workspace
+        .activate_room_message(other_message.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let content = observed
+        .lock()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .clone();
+    assert!(content.contains("other-room-history"));
+    assert!(!content.contains(&newer.body));
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    active.next_event(NOW.into()).await.unwrap();
+    workspace.shutdown(NOW.into()).await.unwrap();
+}
+
+#[test]
+fn room_cursor_migration_preserves_existing_messages_and_stable_append_order() {
+    let database = TestDatabase::new();
+    let (pay, _, room, first) = seed(&database);
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let binding = july_workspace::domain::SessionBindingId::new().to_string();
+    connection.execute("INSERT INTO session_bindings(id, room_id, agent_id, transport_type, status, created_at, last_used_at) VALUES (?1, ?2, ?3, 'acp', 'disconnected', ?4, ?4)", rusqlite::params![binding, room.id.to_string(), pay.id.to_string(), NOW]).unwrap();
+    connection.execute("INSERT INTO room_message_activations(message_id, agent_id, session_binding_id, status, updated_at) VALUES (?1, ?2, ?3, 'failed', ?4)", rusqlite::params![first.id.to_string(), pay.id.to_string(), binding, NOW]).unwrap();
+    // Reconstruct the previous schema with its existing canonical message intact.
+    connection.execute_batch("DROP TRIGGER room_message_append_order; DROP TABLE agent_room_cursors; DROP TABLE room_message_order; DELETE FROM schema_migrations WHERE version = 18;").unwrap();
+    drop(connection);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 18);
+    assert_eq!(
+        store.list_recent_room_messages(room.id, 10).unwrap().0,
+        vec![first.clone()]
+    );
+    let mut second = first.clone();
+    second.id = RoomMessageId::new();
+    second.created_at = "1900-01-01".into();
+    second.body = "new but backdated".into();
+    store.append_room_message(&second).unwrap();
+    store.append_room_message(&second).unwrap(); // Replay must not allocate another ordinal.
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    connection.execute_batch("VACUUM").unwrap();
+    let ordered = connection
+        .prepare("SELECT message_id FROM room_message_order ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(ordered, vec![first.id.to_string(), second.id.to_string()]);
+    assert!(store.get_agent(pay.id).unwrap().is_some());
+    assert_eq!(
+        store
+            .get_room_session_binding(room.id, pay.id)
+            .unwrap()
+            .unwrap()
+            .id
+            .to_string(),
+        binding
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM room_message_activations WHERE message_id = ?1",
+                [first.id.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "failed"
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
 }

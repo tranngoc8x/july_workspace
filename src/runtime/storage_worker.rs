@@ -12,10 +12,10 @@ use crate::domain::{
     HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
     Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
     ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, RoomSessionBinding, SessionBinding, SessionBindingId, SessionBindingStatus,
-    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomMessageId, SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery,
+    WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
-use crate::storage::{SqliteStore, StoreError};
+use crate::storage::{RoomActivationClaim, SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
@@ -29,7 +29,7 @@ enum Command {
         RoomMessageId,
         AgentId,
         String,
-        Reply<Option<(Agent, RoomMessage, RoomSessionBinding)>>,
+        Reply<Option<RoomActivationClaim>>,
     ),
     ValidateRoomActivation(RoomMessageId, AgentId, Reply<()>),
     AttachRoomRemote(SessionBindingId, String, String, Reply<()>),
@@ -499,7 +499,7 @@ impl StorageHandle {
         message: RoomMessageId,
         agent: AgentId,
         at: String,
-    ) -> Result<Option<(Agent, RoomMessage, RoomSessionBinding)>, RuntimeError> {
+    ) -> Result<Option<RoomActivationClaim>, RuntimeError> {
         self.request(|reply| Command::ClaimRoomActivation(message, agent, at, reply))
             .await
     }
