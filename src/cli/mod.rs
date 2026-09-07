@@ -1238,6 +1238,124 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             if line.trim().is_empty() {
                 continue;
             }
+            if let Some(ReplContext::Room(room_id)) = contexts.last() {
+                let names: Vec<String> = mention::parse(&line)
+                    .map(|parsed| {
+                        parsed
+                            .agents
+                            .iter()
+                            .map(|name| (*name).to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let message = match service
+                    .append_room_message_with_mentions(
+                        AppendRoomMessage {
+                            message: RoomMessage {
+                                id: RoomMessageId::new(),
+                                room_id: *room_id,
+                                sender_type: MemberType::User,
+                                sender_id: TRUSTED_LOCAL_USER_ID.into(),
+                                body: line,
+                                mentions: Vec::new(),
+                                reply_to: None,
+                                created_at: timestamp(),
+                            },
+                        },
+                        &names,
+                    )
+                    .await
+                {
+                    Ok(message) => message,
+                    Err(error) => {
+                        repl_write(stderr, format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
+                    use crate::tui::app::{AppEvent, CommandResult, HistoryAuthor, HistoryEntry};
+                    let snapshot = project_context_snapshot(
+                        service,
+                        workspace,
+                        contexts,
+                        Some(HistoryEntry {
+                            author: HistoryAuthor::User,
+                            body: message.body.clone(),
+                        }),
+                    )
+                    .await?;
+                    let result = if message.mentions.is_empty() {
+                        CommandResult::ContextWithHistory(snapshot)
+                    } else {
+                        CommandResult::SubmittedWithContext(snapshot)
+                    };
+                    let _ = events.send(AppEvent::CommandFinished {
+                        context: origin,
+                        result,
+                    });
+                }
+                let mut activations = Vec::new();
+                let mut startup_cancelled = false;
+                for agent_id in &message.mentions {
+                    let startup = async {
+                        let agent = service.resolve_agent(AgentRef::Id(*agent_id)).await?;
+                        if !registered.contains(agent_id) {
+                            register_acp_agent(workspace, &agent).await?;
+                            registered.insert(*agent_id);
+                        }
+                        Ok::<_, CliError>((
+                            agent.name,
+                            workspace
+                                .activate_room_message(message.id, *agent_id, timestamp())
+                                .await?,
+                        ))
+                    };
+                    tokio::pin!(startup);
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut startup => break Some(result),
+                            control = input.recv(), if tui_events.is_some() => {
+                                match control {
+                                    Some(ReplInput::Cancel) => break None,
+                                    None => return Err(CliError::EventStreamClosed),
+                                    _ => {},
+                                }
+                            }
+                            signal = tokio::signal::ctrl_c() => {
+                                signal?;
+                                break None;
+                            }
+                        }
+                    };
+                    let Some(result) = result else {
+                        startup_cancelled = true;
+                        room_status("Room activation cancelled".into(), stdout, tui_events)?;
+                        break;
+                    };
+                    match result {
+                        Ok((name, Some(activation))) => {
+                            room_status(format!("{name}: working"), stdout, tui_events)?;
+                            activations.push((name, activation));
+                        }
+                        Ok((_, None)) => {}
+                        Err(error) => {
+                            room_status(format!("{agent_id}: failed: {error}"), stderr, tui_events)?
+                        }
+                    }
+                }
+                if !message.mentions.is_empty() {
+                    drain_room_turn(
+                        activations,
+                        startup_cancelled,
+                        input,
+                        stdout,
+                        stderr,
+                        tui_events,
+                    )
+                    .await?;
+                }
+                continue;
+            }
             // Rules B and C: `@agent ...` targets work regardless of context.
             if let Some(parsed) = mention::parse(&line) {
                 let names: Vec<String> = parsed.agents.iter().map(|&n| n.to_owned()).collect();
@@ -1304,46 +1422,6 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     });
                 }
                 drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
-            } else if let Some(room_id) = contexts.last().unwrap().room_id() {
-                let message = RoomMessage {
-                    id: RoomMessageId::new(),
-                    room_id,
-                    sender_type: MemberType::User,
-                    sender_id: TRUSTED_LOCAL_USER_ID.into(),
-                    body: line,
-                    mentions: Vec::new(),
-                    reply_to: None,
-                    created_at: timestamp(),
-                };
-                match service
-                    .append_room_message(AppendRoomMessage {
-                        message: message.clone(),
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
-                            use crate::tui::app::{CommandResult, HistoryAuthor, HistoryEntry};
-
-                            let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
-                                context: origin,
-                                result: CommandResult::ContextWithHistory(
-                                    project_context_snapshot(
-                                        service,
-                                        workspace,
-                                        contexts,
-                                        Some(HistoryEntry {
-                                            author: HistoryAuthor::User,
-                                            body: message.body,
-                                        }),
-                                    )
-                                    .await?,
-                                ),
-                            });
-                        }
-                    }
-                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
-                }
             } else {
                 repl_write(stderr, format_args!("{}\n", CliError::InvalidCommand))?;
             }
@@ -2557,6 +2635,201 @@ async fn restore_repl_context<R: crate::application::CollaborationRuntime>(
         _ => return Ok(()),
     };
     *live = Some(restored.1);
+    Ok(())
+}
+
+impl From<crate::runtime::RuntimeError> for CliError {
+    fn from(error: crate::runtime::RuntimeError) -> Self {
+        Self::Runtime(error.to_string())
+    }
+}
+
+fn room_status(
+    status: String,
+    output: &mut impl Write,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+) -> Result<(), CliError> {
+    if let Some(events) = tui_events {
+        let _ = events.send(crate::tui::app::AppEvent::RoomStatus(status));
+        Ok(())
+    } else {
+        repl_write(output, format_args!("{status}\n"))
+    }
+}
+
+// Room activations share one UI turn, but retain independent session and permission identity.
+async fn drain_room_turn(
+    activations: Vec<(String, crate::runtime::RoomActivation)>,
+    initial_cancel: bool,
+    input: &mut mpsc::UnboundedReceiver<ReplInput>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+) -> Result<(), CliError> {
+    use crate::runtime::RoomRuntimeEvent;
+    use crate::tui::app::AppEvent;
+    let mut activations: Vec<_> = activations.into_iter().map(Some).collect();
+    let mut permissions: VecDeque<(usize, crate::transport::PermissionRequest)> = VecDeque::new();
+    let mut shown = false;
+    let mut cancelled = false;
+    let mut cancelled_agents = HashSet::new();
+    if initial_cancel {
+        for (index, entry) in activations.iter_mut().enumerate() {
+            if let Some((_, activation)) = entry {
+                activation.cancel(timestamp()).await?;
+                cancelled_agents.insert(index);
+            }
+        }
+        cancelled = true;
+    }
+    while activations.iter().any(Option::is_some) {
+        if !shown && let Some((index, request)) = permissions.front() {
+            let name = &activations[*index].as_ref().unwrap().0;
+            if let Some(events) = tui_events {
+                let _ = events.send(AppEvent::Chat(ChatEvent::PermissionRequested {
+                    request_id: format!("{}:{}", request.session.binding_id, request.request_id)
+                        .into(),
+                    prompt: format!("{name}: {}", request.prompt),
+                    options: request.options.clone(),
+                }));
+            } else {
+                repl_write(stdout, format_args!("{name}: {}\n", request.prompt))?;
+                for (index, option) in request.options.iter().enumerate() {
+                    repl_write(stdout, format_args!("{}. {}\n", index + 1, option.label))?;
+                }
+                repl_write(stdout, format_args!("permission> "))?;
+            }
+            shown = true;
+        }
+        let next = async {
+            let pending: Vec<_> = activations
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(index, activation)| {
+                    activation.as_mut().map(|(_, activation)| {
+                        Box::pin(async move { (index, activation.next_event(timestamp()).await) })
+                    })
+                })
+                .collect();
+            futures_util::future::select_all(pending).await.0
+        };
+        tokio::select! {
+            (index, event) = next => {
+                match event {
+                    Ok(Some(RoomRuntimeEvent::PermissionRequested(request))) => {
+                        if cancelled_agents.contains(&index) {
+                            // Events may already be audited by cancel_turn, or arrive after it.
+                            match activations[index].as_ref().unwrap().1.respond_permission(
+                                request.request_id, PermissionOutcome::Cancelled, timestamp()).await {
+                                Ok(()) | Err(crate::runtime::RuntimeError::PermissionRequestNotFound(_)) => {},
+                                Err(error) => return Err(error.into()),
+                            }
+                        } else { permissions.push_back((index, request)); }
+                    }
+                    terminal => {
+                        let (name, _) = activations[index].take().unwrap();
+                        match terminal {
+                            Err(error) => room_status(format!("{name}: failed: {error}"), stderr, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Failed(failure))) => room_status(format!("{name}: failed: {failure:?}"), stderr, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Cancelled)) => room_status(format!("{name}: cancelled"), stdout, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Completed)) => room_status(format!("{name}: completed"), stdout, tui_events)?,
+                            _ => {},
+                        }
+                        if permissions.front().is_some_and(|(owner, _)| *owner == index) {
+                            shown = false;
+                            if let Some(events) = tui_events {
+                                let request = &permissions.front().unwrap().1;
+                                let _ = events.send(AppEvent::RoomPermissionDismissed(format!("{}:{}", request.session.binding_id, request.request_id).into()));
+                            }
+                        }
+                        permissions.retain(|(owner, _)| *owner != index);
+                    }
+                }
+            }
+            control = input.recv(), if tui_events.is_some() || !permissions.is_empty() => {
+                let Some(control) = control else { return Err(CliError::EventStreamClosed); };
+                let response = match control {
+                    ReplInput::Line(line) => {
+                        let line = line?;
+                        permissions.front().map(|(_, request)| {
+                            let outcome = line.line.and_then(|line| line.parse::<usize>().ok())
+                                .and_then(|index| index.checked_sub(1))
+                                .and_then(|index| request.options.get(index))
+                                .map(|option| PermissionOutcome::Selected(option.id.clone()))
+                                .unwrap_or(PermissionOutcome::Cancelled);
+                            (format!("{}:{}", request.session.binding_id, request.request_id).into(), outcome)
+                        })
+                    }
+                    ReplInput::Permission { request_id, outcome } => Some((request_id, outcome)),
+                    ReplInput::Cancel => {
+                        let mut result = Ok(());
+                        for (index, entry) in activations.iter_mut().enumerate() {
+                            if let Some((_, activation)) = entry {
+                                match activation.cancel(timestamp()).await {
+                                    Ok(()) => { cancelled_agents.insert(index); },
+                                    Err(error) => result = Err(error),
+                                }
+                            }
+                        }
+                        cancelled = result.is_ok();
+                        if let Some(events) = tui_events {
+                            let _ = events.send(AppEvent::CancelFinished(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
+                        }
+                        permissions.retain(|(index, request)| {
+                            if !cancelled_agents.contains(index) { return true; }
+                            if let Some(events) = tui_events {
+                                let _ = events.send(AppEvent::RoomPermissionDismissed(format!("{}:{}", request.session.binding_id, request.request_id).into()));
+                            }
+                            false
+                        });
+                        shown = false;
+                        None
+                    }
+                };
+                if let Some((id, outcome)) = response {
+                    if permissions.front().is_some_and(|(_, request)| id == ChatPermissionRequestId::from(format!("{}:{}", request.session.binding_id, request.request_id))) {
+                        let (index, request) = permissions.pop_front().unwrap();
+                        let result = activations[index].as_ref().unwrap().1.respond_permission(request.request_id, outcome, timestamp()).await;
+                        // A terminal event can retire this request while another agent is still running.
+                        let result = match result {
+                            Err(crate::runtime::RuntimeError::PermissionRequestNotFound(_)
+                                | crate::runtime::RuntimeError::SessionBindingNotFound(_)) => Ok(()),
+                            result => result,
+                        };
+                        if let Some(events) = tui_events {
+                            let _ = events.send(AppEvent::PermissionFinished(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
+                            if result.is_ok() {
+                                let _ = events.send(AppEvent::RoomPermissionDismissed(id));
+                            }
+                        }
+                        result?;
+                        shown = false;
+                    } else if let Some(events) = tui_events {
+                        let _ = events.send(AppEvent::PermissionFinished(Err("stale permission response".into())));
+                    }
+                }
+            }
+            signal = tokio::signal::ctrl_c(), if !cancelled => {
+                signal?;
+                for (index, entry) in activations.iter_mut().enumerate() {
+                    if let Some((_, activation)) = entry {
+                        activation.cancel(timestamp()).await?;
+                        cancelled_agents.insert(index);
+                    }
+                }
+                for (_, request) in permissions.drain(..) {
+                    if let Some(events) = tui_events {
+                        let _ = events.send(AppEvent::RoomPermissionDismissed(format!("{}:{}", request.session.binding_id, request.request_id).into()));
+                    }
+                }
+                shown = false;
+                cancelled = true;
+            }
+        }
+    }
+    if let Some(events) = tui_events {
+        let _ = events.send(AppEvent::Chat(ChatEvent::TurnCompleted));
+    }
     Ok(())
 }
 

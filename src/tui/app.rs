@@ -165,6 +165,8 @@ pub enum AppEvent {
     Tick,
     /// Agent names for `@` completion, sent once when the session opens.
     Agents(Vec<String>),
+    /// July Room activation status, never a private runtime transcript.
+    RoomStatus(String),
     Chat(ChatEvent),
     ChatBatch(Vec<ChatEvent>),
     CommandFinished {
@@ -172,6 +174,7 @@ pub enum AppEvent {
         result: CommandResult,
     },
     PermissionFinished(Result<(), String>),
+    RoomPermissionDismissed(ChatPermissionRequestId),
     CancelFinished(Result<(), String>),
     Exit,
 }
@@ -481,6 +484,11 @@ impl App {
                 self.completion_selected = 0;
                 Vec::new()
             }
+            AppEvent::RoomStatus(status) => {
+                self.freeze_stream();
+                self.markdown.push_plain(status, COMMAND_OUTPUT_COLOR);
+                Vec::new()
+            }
             AppEvent::Chat(event) => self.reduce_chat_content(std::iter::once(event)),
             AppEvent::ChatBatch(events) => self.reduce_chat_content(events),
             AppEvent::CommandFinished { context, result } => {
@@ -501,6 +509,16 @@ impl App {
                         self.turn = TurnState::Active;
                         self.error = Some(error);
                     }
+                }
+                Vec::new()
+            }
+            AppEvent::RoomPermissionDismissed(request_id) => {
+                if self
+                    .permission
+                    .as_ref()
+                    .is_some_and(|modal| modal.request_id == request_id)
+                {
+                    self.permission = None;
                 }
                 Vec::new()
             }
@@ -1150,6 +1168,28 @@ mod tests {
         }
         app.reduce(AppEvent::Key(key(KeyCode::Enter)));
         app
+    }
+
+    #[test]
+    fn room_permission_dismissal_only_clears_the_matching_modal() {
+        let mut app = App::new(Context::root());
+        app.turn = TurnState::Active;
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "binding:new".to_owned().into(),
+            prompt: "permission".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+        app.reduce(AppEvent::RoomPermissionDismissed(
+            "binding:old".to_owned().into(),
+        ));
+        assert!(app.permission.is_some());
+        app.reduce(AppEvent::RoomPermissionDismissed(
+            "binding:new".to_owned().into(),
+        ));
+        assert!(app.permission.is_none());
     }
 
     #[test]
