@@ -419,3 +419,19 @@ pub(super) fn memory(row: &Row<'_>) -> Result<Memory, StoreError> {
         created_at: row.get(8)?,
     })
 }
+
+pub(super) fn room_session_binding(
+    row: &Row<'_>,
+) -> Result<crate::domain::RoomSessionBinding, StoreError> {
+    Ok(crate::domain::RoomSessionBinding {
+        id: id(row.get(0)?)?,
+        room_id: id(row.get(1)?)?,
+        agent_id: id(row.get(2)?)?,
+        transport_type: row.get(3)?,
+        remote_session_id: row.get(4)?,
+        generation: row.get::<_, i64>(5)? as u64,
+        status: row.get::<_, String>(6)?.parse()?,
+        created_at: row.get(7)?,
+        last_used_at: row.get(8)?,
+    })
+}

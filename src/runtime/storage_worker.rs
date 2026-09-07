@@ -12,8 +12,8 @@ use crate::domain::{
     HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
     Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
     ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency,
-    WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomMessageId, RoomSessionBinding, SessionBinding, SessionBindingId, SessionBindingStatus,
+    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,15 @@ const STORAGE_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
+    ClaimRoomActivation(
+        RoomMessageId,
+        AgentId,
+        String,
+        Reply<Option<(Agent, RoomMessage, RoomSessionBinding)>>,
+    ),
+    ValidateRoomActivation(RoomMessageId, AgentId, Reply<()>),
+    AttachRoomRemote(SessionBindingId, String, String, Reply<()>),
+    SetRoomActivationStatus(RoomMessageId, AgentId, String, String, Reply<()>),
     GetAgent(AgentId, Reply<Option<Agent>>),
     GetAgentByName(String, Reply<Option<Agent>>),
     CreateRoom(Room, Reply<()>),
@@ -483,6 +492,45 @@ impl StorageHandle {
     ) -> Result<Vec<Memory>, RuntimeError> {
         self.request(|reply| Command::ListMemories(scope_type, scope_id, kind, reply))
             .await
+    }
+
+    pub(crate) async fn claim_room_activation(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+        at: String,
+    ) -> Result<Option<(Agent, RoomMessage, RoomSessionBinding)>, RuntimeError> {
+        self.request(|reply| Command::ClaimRoomActivation(message, agent, at, reply))
+            .await
+    }
+    pub(crate) async fn validate_room_activation(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::ValidateRoomActivation(message, agent, reply))
+            .await
+    }
+    pub(crate) async fn attach_room_remote_session(
+        &self,
+        binding: SessionBindingId,
+        remote: String,
+        at: String,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::AttachRoomRemote(binding, remote, at, reply))
+            .await
+    }
+    pub(crate) async fn set_room_activation_status(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+        status: &str,
+        at: String,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| {
+            Command::SetRoomActivationStatus(message, agent, status.into(), at, reply)
+        })
+        .await
     }
 
     pub async fn insert_session_binding(
@@ -1515,6 +1563,18 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::BuildRecoveryCapsule(command, reply) => {
                 let _ = reply.send(build_recovery_capsule(&store, command));
+            }
+            Command::ClaimRoomActivation(message, agent, at, reply) => {
+                let _ = reply.send(store.claim_room_activation(message, agent, &at));
+            }
+            Command::ValidateRoomActivation(message, agent, reply) => {
+                let _ = reply.send(store.validate_room_activation(message, agent));
+            }
+            Command::AttachRoomRemote(binding, remote, at, reply) => {
+                let _ = reply.send(store.attach_room_remote_session(binding, &remote, &at));
+            }
+            Command::SetRoomActivationStatus(message, agent, status, at, reply) => {
+                let _ = reply.send(store.set_room_activation_status(message, agent, &status, &at));
             }
             Command::InsertBinding(binding, reply) => {
                 let _ = reply.send(store.insert_session_binding(&binding));

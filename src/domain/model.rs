@@ -543,6 +543,21 @@ impl SessionBinding {
     }
 }
 
+/// A private runtime session scoped to one Room and one logical Agent.
+/// Conversation-bound sessions retain their existing SessionBinding contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoomSessionBinding {
+    pub id: SessionBindingId,
+    pub room_id: RoomId,
+    pub agent_id: AgentId,
+    pub transport_type: String,
+    pub remote_session_id: Option<String>,
+    pub generation: u64,
+    pub status: SessionBindingStatus,
+    pub created_at: String,
+    pub last_used_at: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionRecovery {
     pub session_binding_id: SessionBindingId,

@@ -4,6 +4,7 @@ use chrono::{SecondsFormat, Utc};
 
 mod direct_message;
 mod error;
+mod room;
 mod session_manager;
 mod storage_worker;
 mod thread;
@@ -15,6 +16,7 @@ pub use direct_message::{
     AgentDirectMessageRuntime, DirectMessageBootstrapError, open_acp_direct_message,
 };
 pub use error::RuntimeError;
+pub use room::{RoomActivation, RoomRuntimeEvent};
 pub(crate) use session_manager::SessionManager;
 pub(crate) use storage_worker::StorageHandle;
 pub use storage_worker::StorageWorker;

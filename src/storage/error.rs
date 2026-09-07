@@ -43,6 +43,15 @@ pub enum StoreError {
         room_id: RoomId,
         reply_to: RoomMessageId,
     },
+    #[error("room message {0} does not exist")]
+    RoomMessageNotFound(RoomMessageId),
+    #[error("agent {agent_id} is not a target of room message {message_id}")]
+    RoomMessageTargetRequired {
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+    },
+    #[error("room session {0} requires explicit recovery")]
+    RoomSessionUnavailable(SessionBindingId),
     #[error("agent {0} does not exist")]
     AgentNotFound(AgentId),
     #[error("agent {0} is not active")]

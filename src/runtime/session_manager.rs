@@ -1,7 +1,8 @@
 use super::{RuntimeError, StorageHandle};
 use crate::application::BuildRecoveryCapsule;
 use crate::domain::{
-    AgentId, PermissionDecision, SessionBinding, SessionBindingId, SessionBindingStatus,
+    AgentId, PermissionDecision, RoomMessageId, RoomSessionBinding, SessionBinding,
+    SessionBindingId, SessionBindingStatus,
 };
 use crate::transport::{
     AgentConnection, AgentTransport, CreateSession, PermissionRequest, PermissionRequestId,
@@ -44,6 +45,112 @@ impl<T: AgentTransport> SessionManager<T> {
             pending_permissions: HashMap::new(),
             owned_bindings: HashMap::new(),
         })
+    }
+
+    /// Room activation never enters conversation recovery or imports private history.
+    pub(crate) async fn activate_room_message(
+        &mut self,
+        message_id: RoomMessageId,
+        at: String,
+    ) -> Result<Option<SessionRef>, RuntimeError> {
+        let Some((agent, message, binding)) = self
+            .storage
+            .claim_room_activation(message_id, self.agent_id, at.clone())
+            .await?
+        else {
+            return Ok(None);
+        };
+        if self.owned_bindings.contains_key(&binding.id) {
+            self.storage
+                .set_room_activation_status(message_id, self.agent_id, "failed", at)
+                .await?;
+            return Err(RuntimeError::SessionBindingAlreadyAttached(binding.id));
+        }
+        let opened = self
+            .open_room_session(&binding, agent.project_root.into(), at.clone())
+            .await;
+        let session = match opened {
+            Ok(session) => session,
+            Err(error) => {
+                self.update_binding_status(binding.id, SessionBindingStatus::Lost, at.clone())
+                    .await?;
+                self.storage
+                    .set_room_activation_status(message_id, self.agent_id, "failed", at)
+                    .await?;
+                return Err(error);
+            }
+        };
+        let content = format!(
+            "Room: {}\nSender: {}\nMessage: {}\n\n{}",
+            message.room_id, message.sender_id, message.id, message.body
+        );
+        let sent = async {
+            self.storage
+                .validate_room_activation(message_id, self.agent_id)
+                .await?;
+            self.send_message(session.clone(), content).await?;
+            self.storage
+                .set_room_activation_status(message_id, self.agent_id, "sent", at.clone())
+                .await
+        }
+        .await;
+        if let Err(error) = sent {
+            // A failed send may already have been accepted. Never retry it automatically.
+            let _ = self.cancel_turn(session.clone(), at.clone()).await;
+            self.update_binding_status(binding.id, SessionBindingStatus::Lost, at.clone())
+                .await?;
+            self.storage
+                .set_room_activation_status(message_id, self.agent_id, "failed", at.clone())
+                .await?;
+            self.detach_session(&session, at).await?;
+            return Err(error);
+        }
+        Ok(Some(session))
+    }
+
+    async fn open_room_session(
+        &mut self,
+        binding: &RoomSessionBinding,
+        project_root: PathBuf,
+        at: String,
+    ) -> Result<SessionRef, RuntimeError> {
+        if binding.agent_id != self.agent_id {
+            return Err(RuntimeError::BindingAgentMismatch);
+        }
+        let session = match &binding.remote_session_id {
+            Some(remote) => {
+                self.transport
+                    .resume_session(ResumeSession {
+                        session: SessionRef {
+                            binding_id: binding.id,
+                            remote_session_id: remote.clone(),
+                        },
+                        project_root,
+                    })
+                    .await?
+                    .session
+            }
+            None => {
+                self.transport
+                    .create_session(CreateSession {
+                        binding_id: binding.id,
+                        project_root,
+                    })
+                    .await?
+                    .session
+            }
+        };
+        if let Err(error) = self
+            .storage
+            .attach_room_remote_session(binding.id, session.remote_session_id.clone(), at)
+            .await
+        {
+            let _ = self.transport.close_session(session).await;
+            return Err(error);
+        }
+        self.owned_bindings
+            .insert(session.binding_id, session.clone());
+        Ok(session)
     }
 
     pub(crate) async fn create_session(
