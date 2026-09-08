@@ -51,10 +51,24 @@ pub struct SessionRef {
     pub remote_session_id: String,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct RoomMessagingConfig {
+    pub socket: PathBuf,
+    pub token: String,
+}
+
+impl std::fmt::Debug for RoomMessagingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoomMessagingConfig")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreateSession {
     pub binding_id: SessionBindingId,
     pub project_root: PathBuf,
+    pub room_messaging: Option<RoomMessagingConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +80,7 @@ pub struct SessionCreated {
 pub struct ResumeSession {
     pub session: SessionRef,
     pub project_root: PathBuf,
+    pub room_messaging: Option<RoomMessagingConfig>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

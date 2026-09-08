@@ -29,6 +29,7 @@ enum WorkspaceCommand<T> {
         RoomMessageId,
         AgentId,
         String,
+        Arc<AtomicBool>,
         Reply<Option<super::RoomActivation>>,
     ),
     OpenSession {
@@ -116,6 +117,7 @@ enum OwnerCommand {
     ActivateRoom(
         RoomMessageId,
         String,
+        Arc<AtomicBool>,
         mpsc::Sender<TransportEvent>,
         Reply<Option<SessionRef>>,
     ),
@@ -282,9 +284,16 @@ impl<T: AgentTransport + Send + 'static> WorkspaceRuntime<T> {
         agent_id: AgentId,
         at: String,
     ) -> Result<Option<super::RoomActivation>, RuntimeError> {
-        self.handle
-            .request(|reply| WorkspaceCommand::ActivateRoom(message_id, agent_id, at, reply))
-            .await
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut guard = super::room_messaging::PublicationGuard(Some(alive.clone()));
+        let result = self
+            .handle
+            .request(|reply| WorkspaceCommand::ActivateRoom(message_id, agent_id, at, alive, reply))
+            .await;
+        if matches!(result, Ok(Some(_))) {
+            guard.0.take();
+        }
+        result
     }
 
     pub fn thread(&self, agent_id: AgentId) -> Result<AgentThreadRuntime<T>, RuntimeError> {
@@ -382,13 +391,19 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                     }
                 }
             }
-            WorkspaceCommand::ActivateRoom(message, agent, at, reply) => {
+            WorkspaceCommand::ActivateRoom(message, agent, at, alive, reply) => {
                 let result = if let Some(owner) = owners.get(&agent) {
                     let (events, receiver) = mpsc::channel(SESSION_EVENT_CAPACITY);
                     let (response, receive) = oneshot::channel();
                     match owner
                         .commands
-                        .send(OwnerCommand::ActivateRoom(message, at, events, response))
+                        .send(OwnerCommand::ActivateRoom(
+                            message,
+                            at,
+                            alive.clone(),
+                            events,
+                            response,
+                        ))
                         .await
                     {
                         Ok(()) => receive
@@ -411,7 +426,13 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                 // send succeeds but before the caller polls its oneshot receiver.
                 let result = result.map(|runtime| {
                     runtime.map(|runtime| {
-                        super::RoomActivation::new(runtime, storage.clone(), message, agent)
+                        super::RoomActivation::new(
+                            runtime,
+                            storage.clone(),
+                            message,
+                            agent,
+                            alive.clone(),
+                        )
                     })
                 });
                 let _ = reply.send(result);
@@ -660,8 +681,10 @@ async fn handle_owner_command<T: AgentTransport>(
     pending: &mut Option<PendingDelivery>,
 ) -> Option<OwnerExit> {
     match command {
-        Some(OwnerCommand::ActivateRoom(message, at, events, reply)) => {
-            let result = manager.activate_room_message(message, at.clone()).await;
+        Some(OwnerCommand::ActivateRoom(message, at, alive, events, reply)) => {
+            let result = manager
+                .activate_room_message(message, at.clone(), alive)
+                .await;
             if let Ok(Some(session)) = &result {
                 bindings.insert(
                     session.binding_id,

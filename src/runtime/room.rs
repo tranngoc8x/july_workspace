@@ -16,6 +16,7 @@ pub enum RoomRuntimeEvent {
 /// A single claimed Room activation. Drop cancels and quarantines an unfinished
 /// session; explicit terminal consumption detaches it for a later fresh message.
 pub struct RoomActivation {
+    publication_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     runtime: Option<RuntimeSession>,
     session: SessionRef,
     storage: StorageHandle,
@@ -36,8 +37,10 @@ impl RoomActivation {
         storage: StorageHandle,
         message_id: RoomMessageId,
         agent_id: AgentId,
+        publication_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
+            publication_alive,
             session: runtime.session().clone(),
             runtime: Some(runtime),
             storage,
@@ -53,6 +56,8 @@ impl RoomActivation {
     }
 
     pub async fn cancel(&mut self, at: String) -> Result<(), RuntimeError> {
+        self.publication_alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(runtime) = &self.runtime
             && !self.cancelled
         {
@@ -157,6 +162,8 @@ impl RoomActivation {
 
 impl Drop for RoomActivation {
     fn drop(&mut self) {
+        self.publication_alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let Some(mut runtime) = self.runtime.take() else {
             return;
         };

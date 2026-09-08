@@ -330,6 +330,101 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
 }
 
 #[tokio::test]
+async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_completion() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    async fn publish(config: &july_workspace::transport::RoomMessagingConfig) -> bool {
+        let Ok(mut stream) = tokio::net::UnixStream::connect(&config.socket).await else {
+            return false;
+        };
+        let request = json!({"token":config.token,"arguments":{"targets":["infra"],"body":"shared","request_id":"once"}});
+        if stream
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let mut response = String::new();
+        if BufReader::new(stream)
+            .read_line(&mut response)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .is_some_and(|v| v.get("result").is_some())
+    }
+    for ending in ["cancel", "drop", "complete"] {
+        let database = TestDatabase::new();
+        let (pay, _, room, message) = seed(&database);
+        let (transport, events, observed) = FakeTransport::new();
+        let mut workspace =
+            WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+        workspace
+            .register_agent(
+                AgentConnection {
+                    agent_id: pay.id,
+                    project_root: pay.project_root.into(),
+                },
+                transport,
+            )
+            .await
+            .unwrap();
+        let mut active = workspace
+            .activate_room_message(message.id, pay.id, NOW.into())
+            .await
+            .unwrap()
+            .unwrap();
+        let config = observed.lock().unwrap().creates[0]
+            .room_messaging
+            .clone()
+            .unwrap();
+        assert!(publish(&config).await);
+        match ending {
+            "cancel" => {
+                active.cancel(NOW.into()).await.unwrap();
+                drop(active);
+            }
+            "drop" => drop(active),
+            _ => {
+                events
+                    .send(TransportEvent::TurnCompleted {
+                        session: active.session().clone(),
+                    })
+                    .await
+                    .unwrap();
+                // The owner must revoke before the UI consumes completion.
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while config.socket.exists() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!publish(&config).await);
+                assert_eq!(
+                    active.next_event(NOW.into()).await.unwrap(),
+                    Some(RoomRuntimeEvent::Completed)
+                );
+            }
+        }
+        assert!(!publish(&config).await, "{ending}");
+        workspace.shutdown(NOW.into()).await.unwrap();
+        let store = SqliteStore::open(database.path()).unwrap();
+        assert_eq!(
+            store
+                .list_recent_room_messages(room.id, 10)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
 async fn room_sessions_resume_without_history_replay_and_keep_permissions_private() {
     let database = TestDatabase::new();
     let (pay, _, room, message) = seed(&database);
@@ -1245,10 +1340,10 @@ fn room_cursor_migration_preserves_existing_messages_and_stable_append_order() {
     connection.execute("INSERT INTO session_bindings(id, room_id, agent_id, transport_type, status, created_at, last_used_at) VALUES (?1, ?2, ?3, 'acp', 'disconnected', ?4, ?4)", rusqlite::params![binding, room.id.to_string(), pay.id.to_string(), NOW]).unwrap();
     connection.execute("INSERT INTO room_message_activations(message_id, agent_id, session_binding_id, status, updated_at) VALUES (?1, ?2, ?3, 'failed', ?4)", rusqlite::params![first.id.to_string(), pay.id.to_string(), binding, NOW]).unwrap();
     // Reconstruct the previous schema with its existing canonical message intact.
-    connection.execute_batch("DROP TRIGGER room_message_append_order; DROP TABLE agent_room_cursors; DROP TABLE room_message_order; DELETE FROM schema_migrations WHERE version = 18;").unwrap();
+    connection.execute_batch("DROP TABLE room_message_publications; DROP TRIGGER room_message_append_order; DROP TABLE agent_room_cursors; DROP TABLE room_message_order; DELETE FROM schema_migrations WHERE version >= 18;").unwrap();
     drop(connection);
     let mut store = SqliteStore::open(database.path()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 18);
+    assert_eq!(store.schema_version().unwrap(), 19);
     assert_eq!(
         store.list_recent_room_messages(room.id, 10).unwrap().0,
         vec![first.clone()]

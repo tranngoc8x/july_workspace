@@ -7,6 +7,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("room messaging activation is no longer available")]
+    RoomPublicationUnavailable,
+    #[error("invalid room message request: {0}")]
+    InvalidRoomMessageRequest(&'static str),
+    #[error("room target {0} does not exist")]
+    RoomTargetNotFound(String),
+    #[error("room message request id already exists with different content")]
+    RoomPublicationConflict,
+
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]

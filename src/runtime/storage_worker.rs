@@ -12,11 +12,12 @@ use crate::domain::{
     HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
     Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
     ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, SessionBinding, SessionBindingId, SessionBindingStatus, SessionRecovery,
-    WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomMessageId, SendRoomMessage, SessionBinding, SessionBindingId, SessionBindingStatus,
+    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::storage::{RoomActivationClaim, SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
@@ -25,6 +26,14 @@ const STORAGE_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
+    SendAgentRoomMessage(
+        RoomMessageId,
+        AgentId,
+        SendRoomMessage,
+        String,
+        Arc<AtomicBool>,
+        Reply<RoomMessage>,
+    ),
     ClaimRoomActivation(
         RoomMessageId,
         AgentId,
@@ -492,6 +501,20 @@ impl StorageHandle {
     ) -> Result<Vec<Memory>, RuntimeError> {
         self.request(|reply| Command::ListMemories(scope_type, scope_id, kind, reply))
             .await
+    }
+
+    pub(crate) async fn send_agent_room_message(
+        &self,
+        trigger: RoomMessageId,
+        agent: AgentId,
+        request: SendRoomMessage,
+        at: String,
+        publication_alive: Arc<AtomicBool>,
+    ) -> Result<RoomMessage, RuntimeError> {
+        self.request(|reply| {
+            Command::SendAgentRoomMessage(trigger, agent, request, at, publication_alive, reply)
+        })
+        .await
     }
 
     pub(crate) async fn claim_room_activation(
@@ -1563,6 +1586,22 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::BuildRecoveryCapsule(command, reply) => {
                 let _ = reply.send(build_recovery_capsule(&store, command));
+            }
+            Command::SendAgentRoomMessage(
+                trigger,
+                agent,
+                request,
+                at,
+                publication_alive,
+                reply,
+            ) => {
+                let _ = reply.send(store.send_agent_room_message(
+                    trigger,
+                    agent,
+                    &request,
+                    &at,
+                    &publication_alive,
+                ));
             }
             Command::ClaimRoomActivation(message, agent, at, reply) => {
                 let _ = reply.send(store.claim_room_activation(message, agent, &at));

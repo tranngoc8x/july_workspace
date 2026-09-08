@@ -2844,3 +2844,105 @@ async fn inactive_tui_room_cancel_during_stalled_startup_restores_input() {
         .unwrap()
         .unwrap();
 }
+
+#[test]
+fn room_agent_mcp_publishes_authenticated_messages_and_rotates_scope_on_resume() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let log = workspace.root.join("mcp.jsonl");
+    let log_arg = format!("--room-mcp-log={}", log.display());
+    let codex = workspace.seed_acp_agent("codex", &["--room-mcp", "--no-permission", &log_arg]);
+    let pay = workspace.seed_agent("pay");
+    let ops = workspace.seed_agent("ops");
+    workspace.seed_agent("outside");
+    for agent in [&codex, &pay, &ops] {
+        workspace.add_member(&room, agent);
+    }
+    let output = workspace.repl("/room vna\n@codex first\n@codex second\n/quit\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stdout(&output).contains("fixture reply"));
+    let logs = std::fs::read_to_string(log).unwrap_or_else(|error| {
+        panic!(
+            "agent must launch the injected MCP tool: {error}; stdout: {}; stderr: {}",
+            stdout(&output),
+            stderr(&output)
+        )
+    });
+    let logs: Vec<serde_json::Value> = logs
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(logs.len(), 2);
+    for (turn, log) in logs.iter().enumerate() {
+        let results = log["results"].as_array().unwrap();
+        assert_eq!(results[0]["result"]["protocolVersion"], "2025-03-26");
+        let tool = &results[1]["result"]["tools"][0];
+        assert_eq!(tool["name"], "send_room_message");
+        assert!(tool["inputSchema"]["properties"].get("sender_id").is_none());
+        assert!(tool["inputSchema"]["properties"].get("room_id").is_none());
+        assert_eq!(results[2]["result"]["isError"], false);
+        assert_eq!(results[2]["result"], results[3]["result"]);
+        for error in &results[4..] {
+            assert_eq!(error["result"]["isError"], true, "{error}");
+        }
+        assert_eq!(results.len(), 10 + turn);
+    }
+    let store = SqliteStore::open(&workspace.database).unwrap();
+    let (messages, _) = store.list_recent_room_messages(room.id, 20).unwrap();
+    assert_eq!(messages.len(), 4);
+    let published: Vec<_> = messages
+        .iter()
+        .filter(|message| message.sender_type == MemberType::Agent)
+        .collect();
+    assert_eq!(published.len(), 2);
+    for message in published {
+        assert_eq!(message.sender_id, codex.id.to_string());
+        assert_eq!(message.room_id, room.id);
+        assert_eq!(message.body, "shared agent message");
+        assert_eq!(message.mentions, vec![pay.id, ops.id]);
+    }
+    let connection = Connection::open(&workspace.database).unwrap();
+    let counts: (i64,i64,i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM room_message_activations), (SELECT COUNT(*) FROM session_bindings)", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+    assert_eq!(counts, (0, 2, 1));
+}
+
+#[test]
+fn room_mcp_stdio_rejects_malformed_requests_and_requires_initialization() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_july"))
+        .arg("__room-mcp")
+        .env_remove("JULY_ROOM_SOCKET")
+        .env_remove("JULY_ROOM_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = concat!(
+        "not-json\n",
+        "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"send_room_message\",\"arguments\":{\"targets\":[\"pay\"],\"body\":\"hello\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}\n",
+    );
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let replies: Vec<serde_json::Value> = stdout(&output)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 6);
+    assert_eq!(replies[0]["error"]["code"], -32700);
+    assert_eq!(replies[1]["error"]["code"], -32600);
+    assert_eq!(replies[2]["error"]["code"], -32601);
+    assert_eq!(replies[3]["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(replies[4]["result"]["isError"], true);
+    assert_eq!(replies[5]["result"], json!({}));
+}
