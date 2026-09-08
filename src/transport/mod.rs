@@ -1,5 +1,6 @@
 //! Transport boundary for external agent protocol implementations.
 
+pub mod a2a;
 mod acp;
 mod error;
 
