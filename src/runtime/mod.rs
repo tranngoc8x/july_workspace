@@ -5,6 +5,7 @@ use chrono::{SecondsFormat, Utc};
 mod direct_message;
 mod error;
 mod room;
+mod room_a2a;
 mod room_messaging;
 #[doc(hidden)]
 pub use room_messaging::run_room_mcp_stdio;
@@ -20,6 +21,7 @@ pub use direct_message::{
 };
 pub use error::RuntimeError;
 pub use room::{RoomActivation, RoomRuntimeEvent};
+pub use room_a2a::{RoomA2aError, RoomA2aRecipient};
 pub(crate) use session_manager::SessionManager;
 pub(crate) use storage_worker::StorageHandle;
 pub use storage_worker::StorageWorker;
