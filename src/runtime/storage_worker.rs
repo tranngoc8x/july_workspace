@@ -33,6 +33,7 @@ enum Command {
         SendRoomMessage,
         String,
         Arc<AtomicBool>,
+        Option<mpsc::OwnedPermit<RoomMessage>>,
         Reply<RoomMessage>,
     ),
     ClaimRoomActivation(
@@ -511,9 +512,18 @@ impl StorageHandle {
         request: SendRoomMessage,
         at: String,
         publication_alive: Arc<AtomicBool>,
+        publication: Option<mpsc::OwnedPermit<RoomMessage>>,
     ) -> Result<RoomMessage, RuntimeError> {
         self.request(|reply| {
-            Command::SendAgentRoomMessage(trigger, agent, request, at, publication_alive, reply)
+            Command::SendAgentRoomMessage(
+                trigger,
+                agent,
+                request,
+                at,
+                publication_alive,
+                publication,
+                reply,
+            )
         })
         .await
     }
@@ -1602,15 +1612,21 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
                 request,
                 at,
                 publication_alive,
+                publication,
                 reply,
             ) => {
-                let _ = reply.send(store.send_agent_room_message(
+                let result = store.send_agent_room_message(
                     trigger,
                     agent,
                     &request,
                     &at,
                     &publication_alive,
-                ));
+                );
+                // The worker owns the permit across commit, even if the MCP caller is aborted.
+                if let (Ok(saved), Some(publication)) = (&result, publication) {
+                    publication.send(saved.clone());
+                }
+                let _ = reply.send(result);
             }
             Command::ClaimRoomActivation(message, agent, at, reply) => {
                 let _ = reply.send(store.claim_room_activation(message, agent, &at));

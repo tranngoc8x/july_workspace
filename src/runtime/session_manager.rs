@@ -57,6 +57,7 @@ impl<T: AgentTransport> SessionManager<T> {
         message_id: RoomMessageId,
         at: String,
         publication_alive: Arc<AtomicBool>,
+        publications: tokio::sync::mpsc::Sender<crate::domain::RoomMessage>,
     ) -> Result<Option<SessionRef>, RuntimeError> {
         let Some(claim) = self
             .storage
@@ -82,7 +83,8 @@ impl<T: AgentTransport> SessionManager<T> {
             self.storage.clone(),
             message_id,
             self.agent_id,
-            publication_alive,
+            publication_alive.clone(),
+            publications,
         ) {
             Ok(scope) => scope,
             Err(error) => {
@@ -124,6 +126,9 @@ impl<T: AgentTransport> SessionManager<T> {
             self.storage
                 .validate_room_activation(message_id, self.agent_id)
                 .await?;
+            if !publication_alive.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(RuntimeError::RoomActivationCancelled);
+            }
             if let Some(scope) = self.room_messaging.get(&binding.id) {
                 scope.enable();
             }

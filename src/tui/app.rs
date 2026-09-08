@@ -167,6 +167,8 @@ pub enum AppEvent {
     Agents(Vec<String>),
     /// July Room activation status, never a private runtime transcript.
     RoomStatus(String),
+    /// An explicitly published canonical shared Room message.
+    RoomMessage(String),
     Chat(ChatEvent),
     ChatBatch(Vec<ChatEvent>),
     CommandFinished {
@@ -482,6 +484,14 @@ impl App {
             AppEvent::Agents(agents) => {
                 self.agents = agents;
                 self.completion_selected = 0;
+                Vec::new()
+            }
+            AppEvent::RoomMessage(body) => {
+                self.freeze_stream();
+                self.push_history_entry(&HistoryEntry {
+                    author: HistoryAuthor::Agent,
+                    body,
+                });
                 Vec::new()
             }
             AppEvent::RoomStatus(status) => {

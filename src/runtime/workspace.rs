@@ -3,7 +3,7 @@ use super::{
     StorageWorker, timestamp,
 };
 use crate::domain::{
-    Agent, AgentId, PermissionOutcome, RoomMessageId, SessionBinding, SessionBindingId,
+    Agent, AgentId, PermissionOutcome, RoomMessage, RoomMessageId, SessionBinding, SessionBindingId,
 };
 use crate::transport::{
     AgentConnection, AgentTransport, PermissionRequestId, PermissionResponse, SendMessage,
@@ -119,6 +119,7 @@ enum OwnerCommand {
         String,
         Arc<AtomicBool>,
         mpsc::Sender<TransportEvent>,
+        mpsc::Sender<RoomMessage>,
         Reply<Option<SessionRef>>,
     ),
     OpenSession {
@@ -392,6 +393,7 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                 }
             }
             WorkspaceCommand::ActivateRoom(message, agent, at, alive, reply) => {
+                let (publications, published) = mpsc::channel(SESSION_EVENT_CAPACITY);
                 let result = if let Some(owner) = owners.get(&agent) {
                     let (events, receiver) = mpsc::channel(SESSION_EVENT_CAPACITY);
                     let (response, receive) = oneshot::channel();
@@ -402,6 +404,7 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                             at,
                             alive.clone(),
                             events,
+                            publications,
                             response,
                         ))
                         .await
@@ -432,6 +435,7 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                             message,
                             agent,
                             alive.clone(),
+                            published,
                         )
                     })
                 });
@@ -681,9 +685,9 @@ async fn handle_owner_command<T: AgentTransport>(
     pending: &mut Option<PendingDelivery>,
 ) -> Option<OwnerExit> {
     match command {
-        Some(OwnerCommand::ActivateRoom(message, at, alive, events, reply)) => {
+        Some(OwnerCommand::ActivateRoom(message, at, alive, events, publications, reply)) => {
             let result = manager
-                .activate_room_message(message, at.clone(), alive)
+                .activate_room_message(message, at.clone(), alive, publications)
                 .await;
             if let Ok(Some(session)) = &result {
                 bindings.insert(

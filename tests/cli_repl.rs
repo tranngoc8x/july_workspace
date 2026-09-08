@@ -2852,8 +2852,8 @@ fn room_agent_mcp_publishes_authenticated_messages_and_rotates_scope_on_resume()
     let log = workspace.root.join("mcp.jsonl");
     let log_arg = format!("--room-mcp-log={}", log.display());
     let codex = workspace.seed_acp_agent("codex", &["--room-mcp", "--no-permission", &log_arg]);
-    let pay = workspace.seed_agent("pay");
-    let ops = workspace.seed_agent("ops");
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let ops = workspace.seed_acp_agent("ops", &["--no-permission"]);
     workspace.seed_agent("outside");
     for agent in [&codex, &pay, &ops] {
         workspace.add_member(&room, agent);
@@ -2903,7 +2903,7 @@ fn room_agent_mcp_publishes_authenticated_messages_and_rotates_scope_on_resume()
     }
     let connection = Connection::open(&workspace.database).unwrap();
     let counts: (i64,i64,i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM conversations), (SELECT COUNT(*) FROM room_message_activations), (SELECT COUNT(*) FROM session_bindings)", [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-    assert_eq!(counts, (0, 2, 1));
+    assert_eq!(counts, (0, 6, 3));
 }
 
 #[test]
@@ -2945,4 +2945,265 @@ fn room_mcp_stdio_rejects_malformed_requests_and_requires_initialization() {
     assert_eq!(replies[3]["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(replies[4]["result"]["isError"], true);
     assert_eq!(replies[5]["result"], json!({}));
+}
+
+#[tokio::test]
+async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_completion() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let fixture = workspace.root.join("room_a2a_agent.py");
+    // Reuse the real ACP/MCP fixture; gate only this scenario's prompt ordering.
+    let source = include_str!("fixtures/acp_agent.py");
+    let marker = "        if \"--room-mcp\" in sys.argv:";
+    assert!(source.contains(marker));
+    let hook = r#"        role = os.environ["ROOM_TEST_ROLE"]
+        gate = Path(os.environ["ROOM_TEST_GATE"])
+        def wait_for(name):
+            deadline = time.monotonic() + 10
+            while not (gate / name).exists():
+                assert time.monotonic() < deadline, name
+                time.sleep(0.005)
+        if role == "cashpoint":
+            wait_for("pay-started")
+            args = {"targets": ["pay"], "body": "explicit shared refund answer", "request_id": "same-publication"}
+            config = dict(room_configs[session_id][0])
+            # InactiveTuiBridge runs inside this test binary; use the actual CLI MCP entrypoint.
+            config["command"] = os.environ["ROOM_TEST_JULY"]
+            results = call_room_mcp(config, [args, args])
+            assert results[2]["result"]["isError"] is False, results
+            assert results[2]["result"] == results[3]["result"], results
+            (gate / "published").write_text("yes")
+        elif role == "pay" and not (gate / "pay-started").exists():
+            (gate / "pay-started").write_text("yes")
+            wait_for("release-pay")
+"#;
+    std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
+    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
+    let connection = Connection::open(&workspace.database).unwrap();
+    for agent in [&cashpoint, &pay, &idle] {
+        workspace.add_member(&room, agent);
+        let mut config = agent.transport_config.clone();
+        config["arguments"][0] = json!(fixture);
+        config["environment"] = json!({
+            "ROOM_TEST_ROLE": agent.name,
+            "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
+            "ROOM_TEST_GATE": workspace.root,
+            "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
+        });
+        connection
+            .execute(
+                "UPDATE agents SET transport_config_json = ?1 WHERE id = ?2",
+                [config.to_string(), agent.id.to_string()],
+            )
+            .unwrap();
+    }
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    bridge
+        .dispatch(tui_command(&mut app, "@cashpoint @pay investigate refund"))
+        .unwrap();
+    let mut publications = 0;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = bridge.next_event().await.unwrap().unwrap();
+            assert!(!matches!(&event, AppEvent::Chat(ChatEvent::TextDelta(_))));
+            if matches!(&event, AppEvent::RoomMessage(_)) {
+                publications += 1;
+                // A shared publication is displayed while pay still owns its first turn.
+                assert!(!workspace.root.join("release-pay").exists());
+                std::fs::write(workspace.root.join("release-pay"), "go").unwrap();
+            }
+            app.reduce(event);
+            if !app.turn_active() {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Room publication and queued recipient must finish");
+    assert_eq!(publications, 1, "{}", app.transcript());
+    assert_eq!(
+        app.transcript()
+            .matches("explicit shared refund answer")
+            .count(),
+        1
+    );
+    assert!(!app.transcript().contains("fixture reply"));
+    bridge.shutdown().await.unwrap();
+    let prompts = |name: &str| -> Vec<String> {
+        std::fs::read_to_string(workspace.root.join(format!("{name}.prompts")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    assert_eq!(prompts("cashpoint").len(), 1);
+    let received = prompts("pay");
+    assert_eq!(received.len(), 2);
+    assert!(!received[0].contains("explicit shared refund answer"));
+    assert!(received[1].contains("explicit shared refund answer"));
+    assert!(!workspace.root.join("idle.prompts").exists());
+    let messages = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 20)
+        .unwrap()
+        .0;
+    assert_eq!(messages.len(), 2);
+    let published = messages
+        .iter()
+        .find(|message| message.sender_type == MemberType::Agent)
+        .unwrap();
+    assert_eq!(published.sender_id, cashpoint.id.to_string());
+    assert_eq!(published.mentions, vec![pay.id]);
+    for table in ["conversations", "messages", "work_items"] {
+        assert_eq!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+    let activations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM room_message_activations WHERE status = 'completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(activations, 3);
+}
+
+#[tokio::test]
+async fn room_a2a_stalled_recipient_does_not_hide_sender_permission_and_can_be_cancelled() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let fixture = workspace.root.join("room_slow_recipient.py");
+    let source = include_str!("fixtures/acp_agent.py");
+    let hook = r#"        config = dict(room_configs[session_id][0])
+        config["command"] = os.environ["ROOM_TEST_JULY"]
+        results = call_room_mcp(config, [{"targets": ["slow", "idle"], "body": "shared startup request", "request_id": "startup"}])
+        assert results[2]["result"]["isError"] is False, results
+        deadline = time.monotonic() + 10
+        while not Path(os.environ["ROOM_TEST_STARTED"]).exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+"#;
+    let source = source.replace(
+        "        if \"--room-mcp\" in sys.argv:",
+        &format!("{hook}        if \"--room-mcp\" in sys.argv:"),
+    );
+    let source = source.replace(
+        "    elif method == \"session/new\":",
+        r#"    elif method == "session/new":
+        if "--hang-new" in sys.argv:
+            gate = Path(os.environ["ROOM_TEST_STARTED"])
+            gate.write_text("started")
+            deadline = time.monotonic() + 10
+            while not gate.with_suffix(".release").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.005)
+            sys.argv.remove("--hang-new")
+"#,
+    );
+    std::fs::write(&fixture, source).unwrap();
+    let sender = workspace.seed_agent("cashpoint");
+    let slow = workspace.seed_acp_agent("slow", &["--hang-new"]);
+    let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
+    let connection = Connection::open(&workspace.database).unwrap();
+    for agent in [&sender, &slow, &idle] {
+        workspace.add_member(&room, agent);
+        let mut config = agent.transport_config.clone();
+        config["arguments"][0] = json!(fixture);
+        config["environment"] = json!({
+            "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
+            "ROOM_TEST_STARTED": workspace.root.join("slow-started"),
+            "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
+        });
+        connection
+            .execute(
+                "UPDATE agents SET transport_config_json = ?1 WHERE id = ?2",
+                [config.to_string(), agent.id.to_string()],
+            )
+            .unwrap();
+    }
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let event = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    bridge
+        .dispatch(tui_command(&mut app, "@cashpoint investigate"))
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.permission().is_none() {
+            let event = bridge.next_event().await.unwrap().unwrap();
+            app.reduce(event);
+            assert!(app.turn_active(), "{}", app.transcript());
+        }
+    })
+    .await
+    .expect("sender permission must arrive during stalled recipient startup");
+    assert!(workspace.root.join("slow-started").exists());
+    bridge.dispatch(AppCommand::CancelTurn).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.turn_active() {
+            app.reduce(bridge.next_event().await.unwrap().unwrap());
+        }
+    })
+    .await
+    .expect("cancel must discard recipient startup and pending recipients");
+    assert!(app.permission().is_none());
+    assert!(app.transcript().contains("shared startup request"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM room_message_activations WHERE agent_id = ?1",
+                [idle.id.to_string()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    // The remote session/new may finish after cancellation; it must never receive a prompt.
+    std::fs::write(workspace.root.join("slow-started.release"), "release").unwrap();
+    let event = tokio::time::timeout(
+        Duration::from_secs(5),
+        bridge.execute(tui_command(&mut app, "/dm slow")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    app.reduce(event);
+    assert!(
+        app.context().label().contains("dm::slow"),
+        "{}",
+        app.transcript()
+    );
+    tokio::time::timeout(Duration::from_secs(5), bridge.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status FROM room_message_activations WHERE agent_id = ?1",
+                [slow.id.to_string()],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        "failed"
+    );
+    assert!(!workspace.root.join("slow.prompts").exists());
+    assert!(!workspace.root.join("idle.prompts").exists());
 }

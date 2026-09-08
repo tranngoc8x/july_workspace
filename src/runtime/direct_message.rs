@@ -366,7 +366,7 @@ pub(crate) async fn register_acp_agent(
         });
     }
     let config = parse_acp_config(&agent.transport_config)?;
-    workspace
+    let registered = workspace
         .register_agent(
             AgentConnection {
                 agent_id: agent.id,
@@ -374,8 +374,13 @@ pub(crate) async fn register_acp_agent(
             },
             AcpTransport::new(config),
         )
-        .await?;
-    Ok(())
+        .await;
+    // Cancellation can discard the caller's registration acknowledgement.
+    // Reuse that same logical agent's owner on the next request.
+    match registered {
+        Ok(()) | Err(RuntimeError::AgentAlreadyRegistered(_)) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn parse_acp_config(

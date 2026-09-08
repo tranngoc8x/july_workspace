@@ -1345,6 +1345,9 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 if !message.mentions.is_empty() {
                     drain_room_turn(
+                        service,
+                        workspace,
+                        registered,
                         activations,
                         startup_cancelled,
                         input,
@@ -2658,7 +2661,11 @@ fn room_status(
 }
 
 // Room activations share one UI turn, but retain independent session and permission identity.
-async fn drain_room_turn(
+#[allow(clippy::too_many_arguments)]
+async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    registered: &mut HashSet<AgentId>,
     activations: Vec<(String, crate::runtime::RoomActivation)>,
     initial_cancel: bool,
     input: &mut mpsc::UnboundedReceiver<ReplInput>,
@@ -2673,6 +2680,17 @@ async fn drain_room_turn(
     let mut shown = false;
     let mut cancelled = false;
     let mut cancelled_agents = HashSet::new();
+    let mut publications = HashSet::new();
+    let mut pending = VecDeque::new();
+    type RecipientStartup<'a> = futures_util::future::BoxFuture<
+        'a,
+        (
+            AgentId,
+            bool,
+            Result<(String, Option<crate::runtime::RoomActivation>), CliError>,
+        ),
+    >;
+    let mut starting: Option<RecipientStartup<'_>> = None;
     if initial_cancel {
         for (index, entry) in activations.iter_mut().enumerate() {
             if let Some((_, activation)) = entry {
@@ -2682,7 +2700,50 @@ async fn drain_room_turn(
         }
         cancelled = true;
     }
-    while activations.iter().any(Option::is_some) {
+    while activations.iter().any(Option::is_some) || !pending.is_empty() || starting.is_some() {
+        if cancelled {
+            pending.clear();
+            starting = None;
+        }
+        // Busy recipients wait for terminal cleanup. Startup remains polled beside
+        // existing turns so a slow ACP session cannot hide another agent's permission.
+        if starting.is_none()
+            && let Some(position) = pending.iter().position(|(_, target)| {
+                !activations
+                    .iter()
+                    .flatten()
+                    .any(|(_, active)| active.agent_id() == *target)
+            })
+        {
+            let (message, target) = pending.remove(position).expect("pending recipient");
+            let agent = service.resolve_agent(AgentRef::Id(target)).await;
+            let needs_registration = !registered.contains(&target);
+            starting = Some(Box::pin(async move {
+                let mut is_registered = !needs_registration;
+                let result = async {
+                    let wire = workspace
+                        .storage()
+                        .prepare_room_a2a_message(message, target)
+                        .await
+                        .map_err(|error| CliError::Runtime(error.to_string()))?;
+                    let agent = agent?;
+                    if needs_registration {
+                        register_acp_agent(workspace, &agent).await?;
+                        is_registered = true;
+                    }
+                    let activation = workspace
+                        .receive_room_a2a_message(target, &wire, timestamp())
+                        .await
+                        .map_err(|error| CliError::Runtime(error.to_string()))?;
+                    Ok((agent.name, activation))
+                }
+                .await;
+                (target, is_registered, result)
+            }));
+        }
+        if !activations.iter().any(Option::is_some) && starting.is_none() {
+            continue;
+        }
         if !shown && let Some((index, request)) = permissions.front() {
             let name = &activations[*index].as_ref().unwrap().0;
             if let Some(events) = tui_events {
@@ -2711,11 +2772,42 @@ async fn drain_room_turn(
                     })
                 })
                 .collect();
+            if pending.is_empty() {
+                return std::future::pending().await;
+            }
             futures_util::future::select_all(pending).await.0
         };
         tokio::select! {
+            (target, is_registered, result) = async { starting.as_mut().expect("guarded startup").await }, if starting.is_some() => {
+                starting = None;
+                if is_registered {
+                    registered.insert(target);
+                }
+                match result {
+                    Ok((name, active)) => {
+                        if let Some(active) = active {
+                            room_status(format!("{name}: working"), stdout, tui_events)?;
+                            activations.push(Some((name, active)));
+                        }
+                    }
+                    Err(error) => room_status(format!("{target}: failed: {error}"), stderr, tui_events)?,
+                }
+            }
             (index, event) = next => {
                 match event {
+                    Ok(Some(RoomRuntimeEvent::SharedMessage(message))) => {
+                        if publications.insert(message.id) {
+                            let body = format!("[{}:{}] {}", message.sender_type, message.sender_id, message.body);
+                            if let Some(events) = tui_events {
+                                let _ = events.send(AppEvent::RoomMessage(body));
+                            } else {
+                                repl_write(stdout, format_args!("{body}\n"))?;
+                            }
+                            if !cancelled {
+                                pending.extend(message.mentions.iter().map(|target| (message.id, *target)));
+                            }
+                        }
+                    }
                     Ok(Some(RoomRuntimeEvent::PermissionRequested(request))) => {
                         if cancelled_agents.contains(&index) {
                             // Events may already be audited by cancel_turn, or arrive after it.
@@ -2762,6 +2854,9 @@ async fn drain_room_turn(
                     }
                     ReplInput::Permission { request_id, outcome } => Some((request_id, outcome)),
                     ReplInput::Cancel => {
+                        cancelled = true;
+                        pending.clear();
+                        starting = None;
                         let mut result = Ok(());
                         for (index, entry) in activations.iter_mut().enumerate() {
                             if let Some((_, activation)) = entry {
@@ -2771,7 +2866,6 @@ async fn drain_room_turn(
                                 }
                             }
                         }
-                        cancelled = result.is_ok();
                         if let Some(events) = tui_events {
                             let _ = events.send(AppEvent::CancelFinished(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
                         }
@@ -2811,6 +2905,9 @@ async fn drain_room_turn(
             }
             signal = tokio::signal::ctrl_c(), if !cancelled => {
                 signal?;
+                cancelled = true;
+                pending.clear();
+                starting = None;
                 for (index, entry) in activations.iter_mut().enumerate() {
                     if let Some((_, activation)) = entry {
                         activation.cancel(timestamp()).await?;
@@ -2823,7 +2920,6 @@ async fn drain_room_turn(
                     }
                 }
                 shown = false;
-                cancelled = true;
             }
         }
     }
