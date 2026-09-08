@@ -5,6 +5,9 @@ use chrono::{SecondsFormat, Utc};
 mod direct_message;
 mod error;
 mod room;
+mod room_messaging;
+#[doc(hidden)]
+pub use room_messaging::run_room_mcp_stdio;
 mod session_manager;
 mod storage_worker;
 mod thread;

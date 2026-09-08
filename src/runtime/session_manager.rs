@@ -1,3 +1,4 @@
+use super::room_messaging::RoomMessagingScope;
 use super::{RuntimeError, StorageHandle};
 use crate::application::BuildRecoveryCapsule;
 use crate::domain::{
@@ -10,6 +11,7 @@ use crate::transport::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, atomic::AtomicBool};
 
 pub(crate) struct SessionManager<T: AgentTransport> {
     transport: T,
@@ -18,6 +20,7 @@ pub(crate) struct SessionManager<T: AgentTransport> {
     events: TransportEvents,
     pending_permissions: HashMap<(SessionBindingId, PermissionRequestId), PermissionRequest>,
     owned_bindings: HashMap<SessionBindingId, SessionRef>,
+    room_messaging: HashMap<SessionBindingId, RoomMessagingScope>,
 }
 
 impl<T: AgentTransport> SessionManager<T> {
@@ -44,6 +47,7 @@ impl<T: AgentTransport> SessionManager<T> {
             events,
             pending_permissions: HashMap::new(),
             owned_bindings: HashMap::new(),
+            room_messaging: HashMap::new(),
         })
     }
 
@@ -52,6 +56,7 @@ impl<T: AgentTransport> SessionManager<T> {
         &mut self,
         message_id: RoomMessageId,
         at: String,
+        publication_alive: Arc<AtomicBool>,
     ) -> Result<Option<SessionRef>, RuntimeError> {
         let Some(claim) = self
             .storage
@@ -73,8 +78,23 @@ impl<T: AgentTransport> SessionManager<T> {
                 .await?;
             return Err(RuntimeError::SessionBindingAlreadyAttached(binding.id));
         }
+        let scope = match RoomMessagingScope::new(
+            self.storage.clone(),
+            message_id,
+            self.agent_id,
+            publication_alive,
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                self.storage
+                    .set_room_activation_status(message_id, self.agent_id, "failed", at)
+                    .await?;
+                return Err(error.into());
+            }
+        };
+        let config = scope.config.clone();
         let opened = self
-            .open_room_session(&binding, agent.project_root.into(), at.clone())
+            .open_room_session(&binding, agent.project_root.into(), at.clone(), config)
             .await;
         let session = match opened {
             Ok(session) => session,
@@ -87,6 +107,7 @@ impl<T: AgentTransport> SessionManager<T> {
                 return Err(error);
             }
         };
+        self.room_messaging.insert(binding.id, scope);
         let mut content = format!("Room: {}\n", message.room_id);
         if truncated {
             content.push_str(
@@ -103,6 +124,9 @@ impl<T: AgentTransport> SessionManager<T> {
             self.storage
                 .validate_room_activation(message_id, self.agent_id)
                 .await?;
+            if let Some(scope) = self.room_messaging.get(&binding.id) {
+                scope.enable();
+            }
             self.send_message(session.clone(), content).await?;
             self.storage
                 .set_room_activation_status(message_id, self.agent_id, "sent", at.clone())
@@ -128,6 +152,7 @@ impl<T: AgentTransport> SessionManager<T> {
         binding: &RoomSessionBinding,
         project_root: PathBuf,
         at: String,
+        room_messaging: crate::transport::RoomMessagingConfig,
     ) -> Result<SessionRef, RuntimeError> {
         if binding.agent_id != self.agent_id {
             return Err(RuntimeError::BindingAgentMismatch);
@@ -141,6 +166,7 @@ impl<T: AgentTransport> SessionManager<T> {
                             remote_session_id: remote.clone(),
                         },
                         project_root,
+                        room_messaging: Some(room_messaging),
                     })
                     .await?
                     .session
@@ -150,6 +176,7 @@ impl<T: AgentTransport> SessionManager<T> {
                     .create_session(CreateSession {
                         binding_id: binding.id,
                         project_root,
+                        room_messaging: Some(room_messaging),
                     })
                     .await?
                     .session
@@ -179,6 +206,7 @@ impl<T: AgentTransport> SessionManager<T> {
             .create_session(CreateSession {
                 binding_id: binding.id,
                 project_root,
+                room_messaging: None,
             })
             .await?;
         binding.remote_session_id = Some(created.session.remote_session_id.clone());
@@ -290,6 +318,7 @@ impl<T: AgentTransport> SessionManager<T> {
             .resume_session(ResumeSession {
                 session: session.clone(),
                 project_root,
+                room_messaging: None,
             })
             .await
         {
@@ -345,6 +374,7 @@ impl<T: AgentTransport> SessionManager<T> {
             .create_session(CreateSession {
                 binding_id: binding.id,
                 project_root,
+                room_messaging: None,
             })
             .await?;
         if let Err(error) = self
@@ -402,6 +432,7 @@ impl<T: AgentTransport> SessionManager<T> {
         session: SessionRef,
         cancelled_at: String,
     ) -> Result<(), RuntimeError> {
+        self.room_messaging.remove(&session.binding_id);
         let audit = self
             .audit_cancelled_permissions(Some(&session), &cancelled_at)
             .await;
@@ -416,6 +447,7 @@ impl<T: AgentTransport> SessionManager<T> {
         session: &SessionRef,
         detached_at: String,
     ) -> Result<(), RuntimeError> {
+        self.room_messaging.remove(&session.binding_id);
         if self.owned_bindings.get(&session.binding_id) != Some(session) {
             return Err(RuntimeError::SessionBindingNotFound(session.binding_id));
         }
@@ -438,6 +470,7 @@ impl<T: AgentTransport> SessionManager<T> {
         session: &SessionRef,
         detached_at: String,
     ) -> Result<(), RuntimeError> {
+        self.room_messaging.remove(&session.binding_id);
         if self.owned_bindings.get(&session.binding_id) != Some(session) {
             return Err(RuntimeError::SessionBindingNotFound(session.binding_id));
         }
@@ -462,8 +495,18 @@ impl<T: AgentTransport> SessionManager<T> {
         observed_at: &str,
     ) -> Result<Option<TransportEvent>, RuntimeError> {
         let Some(event) = self.events.recv().await else {
+            self.room_messaging.clear();
             return Ok(None);
         };
+        match &event {
+            TransportEvent::TurnCompleted { session }
+            | TransportEvent::TurnFailed { session, .. }
+            | TransportEvent::SessionLost { session } => {
+                self.room_messaging.remove(&session.binding_id);
+            }
+            TransportEvent::TransportDisconnected { .. } => self.room_messaging.clear(),
+            _ => {}
+        }
         match &event {
             TransportEvent::TransportDisconnected { agent_id, .. }
                 if *agent_id == self.agent_id =>
@@ -563,6 +606,7 @@ impl<T: AgentTransport> SessionManager<T> {
     }
 
     pub(crate) async fn shutdown(&mut self, stopped_at: String) -> Result<(), RuntimeError> {
+        self.room_messaging.clear();
         let mut first_error = self
             .audit_cancelled_permissions(None, &stopped_at)
             .await

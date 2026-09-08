@@ -8,12 +8,14 @@ use crate::domain::{
     MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome,
     Proposal, ProposalId, ProposalResponse, ProposalResponseId, ProposalResponseType,
     ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, RoomSessionBinding, SessionBinding, SessionBindingId, SessionBindingStatus,
-    SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
+    RoomMessageId, RoomSessionBinding, SendRoomMessage, SessionBinding, SessionBindingId,
+    SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
+    WorkStatus,
 };
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -32,7 +34,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 18] = [
+const MIGRATIONS: [Migration; 19] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -104,6 +106,10 @@ const MIGRATIONS: [Migration; 18] = [
     Migration {
         version: 18,
         sql: include_str!("migrations/0018_agent_room_cursors.sql"),
+    },
+    Migration {
+        version: 19,
+        sql: include_str!("migrations/0019_room_publications.sql"),
     },
 ];
 
@@ -921,63 +927,115 @@ impl SqliteStore {
         &mut self,
         message: &RoomMessage,
     ) -> Result<RoomMessage, StoreError> {
-        let mut canonical = message.clone();
-        if canonical.sender_type == MemberType::Agent {
-            canonical.sender_id = canonical
-                .sender_id
-                .parse::<AgentId>()
-                .map_err(|_| StoreError::InvalidStoredValue("room message agent sender"))?
-                .to_string();
-        }
-        let message = &canonical;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) = query_optional(
-            &transaction,
-            "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at
-             FROM room_messages WHERE id = ?1",
-            params![message.id.to_string()],
-            records::room_message,
-        )? {
-            if existing == *message {
-                transaction.commit()?;
-                return Ok(existing);
-            }
-            return Err(StoreError::RoomMessageIdConflict(message.id));
+        let message = append_room_message(&transaction, message)?;
+        transaction.commit()?;
+        Ok(message)
+    }
+
+    pub(crate) fn send_agent_room_message(
+        &mut self,
+        trigger: RoomMessageId,
+        agent: AgentId,
+        request: &SendRoomMessage,
+        at: &str,
+        publication_alive: &AtomicBool,
+    ) -> Result<RoomMessage, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !publication_alive.load(Ordering::Acquire) {
+            return Err(StoreError::RoomPublicationUnavailable);
         }
-        message.validate()?;
-        require_active_room(&transaction, message.room_id)?;
-        if message.sender_type == MemberType::Agent {
-            let agent_id = message
-                .sender_id
-                .parse()
-                .expect("canonical agent sender id parses");
-            require_active_agent(&transaction, agent_id)?;
-            require_active_room_membership(&transaction, message.room_id, agent_id)?;
+        let (_, incoming) = validate_room_activation(&transaction, trigger, agent)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM room_message_activations a
+             JOIN session_bindings b ON b.id = a.session_binding_id
+             WHERE a.message_id = ?1 AND a.agent_id = ?2 AND a.status IN ('claimed', 'sent')
+               AND b.agent_id = ?2 AND b.room_id = ?3 AND b.status = 'active'
+               AND b.remote_session_id IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM session_bindings newer
+                 WHERE newer.room_id = b.room_id AND newer.agent_id = b.agent_id AND newer.generation > b.generation))",
+            params![trigger.to_string(), agent.to_string(), incoming.room_id.to_string()], |row| row.get(0))?;
+        if !active {
+            return Err(StoreError::RoomPublicationUnavailable);
         }
-        for target in &message.mentions {
-            require_active_agent(&transaction, *target)?;
-            require_active_room_membership(&transaction, message.room_id, *target)?;
+        if request.targets.is_empty() {
+            return Err(StoreError::InvalidRoomMessageRequest(
+                "targets must not be empty",
+            ));
         }
-        if let Some(reply_to) = message.reply_to {
-            let reply_room = query_optional(
+        if request
+            .request_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(StoreError::InvalidRoomMessageRequest(
+                "request id must not be blank",
+            ));
+        }
+        let mut mentions = Vec::new();
+        for name in &request.targets {
+            let id = query_optional(
                 &transaction,
-                "SELECT room_id FROM room_messages WHERE id = ?1",
-                params![reply_to.to_string()],
+                "SELECT id FROM agents WHERE name = ?1",
+                params![name],
+                |row| {
+                    row.get::<_, String>(0)?
+                        .parse::<AgentId>()
+                        .map_err(StoreError::from)
+                },
+            )?
+            .ok_or_else(|| StoreError::RoomTargetNotFound(name.clone()))?;
+            require_active_agent(&transaction, id)?;
+            require_active_room_membership(&transaction, incoming.room_id, id)?;
+            if !mentions.contains(&id) {
+                mentions.push(id);
+            }
+        }
+        let existing_id = if let Some(key) = &request.request_id {
+            query_optional(
+                &transaction,
+                "SELECT published_message_id FROM room_message_publications WHERE trigger_message_id = ?1 AND agent_id = ?2 AND request_id = ?3",
+                params![trigger.to_string(), agent.to_string(), key],
                 |row| row.get::<_, String>(0).map_err(StoreError::from),
             )?
-            .ok_or(StoreError::RoomMessageReplyNotFound(reply_to))?;
-            if reply_room != message.room_id.to_string() {
-                return Err(StoreError::RoomMessageReplyNotInRoom {
-                    room_id: message.room_id,
-                    reply_to,
-                });
+        } else {
+            None
+        };
+        let mut message = RoomMessage {
+            id: RoomMessageId::new(),
+            room_id: incoming.room_id,
+            sender_type: MemberType::Agent,
+            sender_id: agent.to_string(),
+            body: request.body.clone(),
+            mentions,
+            reply_to: request.reply_to,
+            created_at: at.into(),
+        };
+        if let Some(id) = existing_id {
+            let previous = query_optional(&transaction,
+                "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at FROM room_messages WHERE id = ?1",
+                params![id], records::room_message)?.ok_or(StoreError::InvalidStoredValue("room publication message"))?;
+            message.id = previous.id;
+            message.created_at = previous.created_at.clone();
+            if message != previous {
+                return Err(StoreError::RoomPublicationConflict);
             }
         }
-        insert_room_message(&transaction, message)?;
+        let message = append_room_message(&transaction, &message)?;
+        if let Some(key) = &request.request_id {
+            transaction.execute("INSERT OR IGNORE INTO room_message_publications(trigger_message_id, agent_id, request_id, published_message_id) VALUES (?1, ?2, ?3, ?4)",
+                params![trigger.to_string(), agent.to_string(), key, message.id.to_string()])?;
+        }
+        // Recheck after validation so requests queued before revocation cannot publish afterward.
+        if !publication_alive.load(Ordering::Acquire) {
+            return Err(StoreError::RoomPublicationUnavailable);
+        }
         transaction.commit()?;
-        Ok(message.clone())
+        Ok(message)
     }
 
     pub fn list_recent_room_messages(
@@ -4291,6 +4349,64 @@ fn require_store_text(value: &str, field: &'static str) -> Result<(), StoreError
     }
 }
 
+fn append_room_message(
+    connection: &Connection,
+    message: &RoomMessage,
+) -> Result<RoomMessage, StoreError> {
+    let mut canonical = message.clone();
+    if canonical.sender_type == MemberType::Agent {
+        canonical.sender_id = canonical
+            .sender_id
+            .parse::<AgentId>()
+            .map_err(|_| StoreError::InvalidStoredValue("room message agent sender"))?
+            .to_string();
+    }
+    let message = &canonical;
+    if let Some(existing) = query_optional(
+        connection,
+        "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at
+             FROM room_messages WHERE id = ?1",
+        params![message.id.to_string()],
+        records::room_message,
+    )? {
+        if existing == *message {
+            return Ok(existing);
+        }
+        return Err(StoreError::RoomMessageIdConflict(message.id));
+    }
+    message.validate()?;
+    require_active_room(connection, message.room_id)?;
+    if message.sender_type == MemberType::Agent {
+        let agent_id = message
+            .sender_id
+            .parse()
+            .expect("canonical agent sender id parses");
+        require_active_agent(connection, agent_id)?;
+        require_active_room_membership(connection, message.room_id, agent_id)?;
+    }
+    for target in &message.mentions {
+        require_active_agent(connection, *target)?;
+        require_active_room_membership(connection, message.room_id, *target)?;
+    }
+    if let Some(reply_to) = message.reply_to {
+        let reply_room = query_optional(
+            connection,
+            "SELECT room_id FROM room_messages WHERE id = ?1",
+            params![reply_to.to_string()],
+            |row| row.get::<_, String>(0).map_err(StoreError::from),
+        )?
+        .ok_or(StoreError::RoomMessageReplyNotFound(reply_to))?;
+        if reply_room != message.room_id.to_string() {
+            return Err(StoreError::RoomMessageReplyNotInRoom {
+                room_id: message.room_id,
+                reply_to,
+            });
+        }
+    }
+    insert_room_message(connection, message)?;
+    Ok(message.clone())
+}
+
 fn validate_room_activation(
     connection: &Connection,
     message_id: RoomMessageId,
@@ -4508,11 +4624,222 @@ mod tests {
     }
 
     #[test]
+    fn migration_nineteen_preserves_room_history_bindings_and_cursor() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..18]).unwrap();
+        seed_session_parent_rows(&connection);
+        connection.execute_batch("INSERT INTO rooms VALUES ('room', 'room', NULL, 'active', 'now', 'now');
+            INSERT INTO room_messages(id, room_id, sender_type, sender_id, body, mentions_json, created_at) VALUES ('trigger', 'room', 'user', 'local-user', 'body', '[]', 'now');
+            INSERT INTO session_bindings(id, room_id, agent_id, transport_type, remote_session_id, generation, status, created_at, last_used_at) VALUES ('room-binding', 'room', 'agent-1', 'acp', 'remote', 1, 'active', 'now', 'now');
+            INSERT INTO room_message_activations VALUES ('trigger', 'agent-1', 'room-binding', 'completed', 'now');
+            INSERT INTO agent_room_cursors VALUES ('agent-1', 'room', 'trigger');").unwrap();
+        let tables = [
+            "agents",
+            "conversations",
+            "rooms",
+            "room_messages",
+            "room_message_order",
+            "session_bindings",
+            "room_message_activations",
+            "agent_room_cursors",
+        ];
+        let snapshot = |connection: &Connection| {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut statement = connection
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let count = statement.column_count();
+                    statement
+                        .query_map([], |row| {
+                            (0..count)
+                                .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot(&connection);
+        apply_migrations(&mut connection, &MIGRATIONS).unwrap();
+        assert_eq!(snapshot(&connection), before);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 19);
+        assert!(
+            !connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
+        );
+        connection.execute("INSERT INTO room_message_publications VALUES ('trigger', 'agent-1', 'key', 'trigger')", []).unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE room_message_publications SET request_id = 'different'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM room_message_publications", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_room_publication_is_scoped_idempotent_and_revocable() {
+        use crate::domain::{
+            Agent, AgentId, MemberType, Room, RoomId, RoomMessage, RoomMessageId, SendRoomMessage,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let database = TestDatabase::new();
+        let mut store = SqliteStore::open(database.path()).unwrap();
+        let room = Room {
+            id: RoomId::new(),
+            name: "room".into(),
+            description: None,
+            status: "active".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        store.create_room(&room).unwrap();
+        let mut agents = Vec::new();
+        for name in ["sender", "target", "outsider"] {
+            let agent = Agent {
+                id: AgentId::new(),
+                name: name.into(),
+                project_root: "/tmp".into(),
+                transport_type: "acp".into(),
+                transport_config: serde_json::json!({}),
+                status: "active".into(),
+                metadata: serde_json::json!({}),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            };
+            store.insert_agent(&agent).unwrap();
+            if name != "outsider" {
+                store
+                    .add_room_member(room.id, agent.id, None, "now")
+                    .unwrap();
+            }
+            agents.push(agent);
+        }
+        let trigger = RoomMessage {
+            id: RoomMessageId::new(),
+            room_id: room.id,
+            sender_type: MemberType::User,
+            sender_id: "local-user".into(),
+            body: "question".into(),
+            mentions: vec![agents[0].id],
+            reply_to: None,
+            created_at: "now".into(),
+        };
+        store.append_room_message(&trigger).unwrap();
+        let claim = store
+            .claim_room_activation(trigger.id, agents[0].id, "now")
+            .unwrap()
+            .unwrap();
+        store
+            .attach_room_remote_session(claim.binding.id, "remote", "now")
+            .unwrap();
+        let alive = AtomicBool::new(true);
+        let mut request = SendRoomMessage {
+            targets: vec!["target".into(), "target".into()],
+            body: "hello".into(),
+            reply_to: Some(trigger.id),
+            request_id: Some("one".into()),
+        };
+        let sent = store
+            .send_agent_room_message(trigger.id, agents[0].id, &request, "now", &alive)
+            .unwrap();
+        assert_eq!(sent.sender_id, agents[0].id.to_string());
+        assert_eq!(sent.room_id, room.id);
+        assert_eq!(sent.mentions, vec![agents[1].id]);
+        assert_eq!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .unwrap(),
+            sent
+        );
+        request.body = "changed".into();
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        request.request_id = None;
+        request.targets = vec!["outsider".into()];
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        request.targets = vec!["target".into()];
+        request.body = sent.body.clone();
+        request.request_id = Some("one".into());
+        store
+            .remove_room_member(room.id, agents[1].id, "later")
+            .unwrap();
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        store
+            .add_room_member(room.id, agents[1].id, None, "later")
+            .unwrap();
+        store
+            .remove_room_member(room.id, agents[0].id, "later")
+            .unwrap();
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        store
+            .add_room_member(room.id, agents[0].id, None, "later")
+            .unwrap();
+        alive.store(false, Ordering::Release);
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        alive.store(true, Ordering::Release);
+        store
+            .set_room_activation_status(trigger.id, agents[0].id, "completed", "later")
+            .unwrap();
+        assert!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_recent_room_messages(room.id, 50)
+                .unwrap()
+                .0
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn fresh_database_has_schema_version_sixteen() {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 18);
+        assert_eq!(store.schema_version().unwrap(), 19);
     }
 
     #[test]
@@ -4885,14 +5212,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            18
+            19
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            18
+            19
         );
     }
 
@@ -5561,7 +5888,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 18);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 19);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -6049,15 +6376,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (19);",
+                 INSERT INTO schema_migrations(version) VALUES (20);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 19,
-                supported: 18,
+                found: 20,
+                supported: 19,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

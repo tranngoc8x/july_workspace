@@ -106,6 +106,7 @@ async fn subprocess_maps_sessions_permissions_stream_and_missing_resume() {
             .create_session(CreateSession {
                 binding_id: SessionBindingId::new(),
                 project_root: PathBuf::from("/"),
+                room_messaging: None,
             })
             .await,
         Err(TransportError::InvalidConfiguration(
@@ -117,6 +118,7 @@ async fn subprocess_maps_sessions_permissions_stream_and_missing_resume() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -125,6 +127,7 @@ async fn subprocess_maps_sessions_permissions_stream_and_missing_resume() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -192,6 +195,7 @@ async fn subprocess_maps_sessions_permissions_stream_and_missing_resume() {
             .resume_session(ResumeSession {
                 session: missing.clone(),
                 project_root: std::env::temp_dir(),
+                room_messaging: None,
             })
             .await,
         Err(TransportError::SessionLost(id)) if id == "missing"
@@ -214,6 +218,7 @@ async fn two_sessions_interleave_without_losing_per_session_order() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -222,6 +227,7 @@ async fn two_sessions_interleave_without_losing_per_session_order() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -315,6 +321,7 @@ async fn subprocess_rejects_identity_concurrent_turn_and_unknown_permission() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -376,6 +383,7 @@ async fn cancellation_resolves_permission_and_finishes_the_turn() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -422,6 +430,7 @@ async fn non_cooperative_cancel_closes_the_agent_connection() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -486,6 +495,7 @@ async fn claude_profile_requires_and_sets_manual_default_mode() {
             .create_session(CreateSession {
                 binding_id: SessionBindingId::new(),
                 project_root: std::env::temp_dir(),
+                room_messaging: None,
             })
             .await,
         Err(TransportError::UnsupportedCapability(
@@ -503,6 +513,7 @@ async fn claude_profile_requires_and_sets_manual_default_mode() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -524,6 +535,7 @@ async fn shutdown_cancels_and_drains_an_active_turn() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -587,6 +599,7 @@ async fn prompt_auth_failure_stays_typed() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -635,6 +648,7 @@ async fn shutdown_is_bounded_when_a_cancelled_create_never_returns() {
             transport.create_session(CreateSession {
                 binding_id: SessionBindingId::new(),
                 project_root: std::env::temp_dir(),
+                room_messaging: None,
             }),
         )
         .await
@@ -667,6 +681,7 @@ async fn forced_shutdown_responds_cancelled_before_aborting_a_hung_owner() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -692,6 +707,7 @@ async fn forced_shutdown_responds_cancelled_before_aborting_a_hung_owner() {
             transport.create_session(CreateSession {
                 binding_id: SessionBindingId::new(),
                 project_root: std::env::temp_dir(),
+                room_messaging: None,
             }),
         )
         .await
@@ -719,6 +735,7 @@ async fn shutdown_cancels_permission_requests_arriving_during_grace() {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -754,6 +771,7 @@ async fn create_rejects_a_duplicate_remote_session_without_replacing_the_first()
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: std::env::temp_dir(),
+            room_messaging: None,
         })
         .await
         .unwrap()
@@ -764,6 +782,7 @@ async fn create_rejects_a_duplicate_remote_session_without_replacing_the_first()
             .create_session(CreateSession {
                 binding_id: SessionBindingId::new(),
                 project_root: std::env::temp_dir(),
+                room_messaging: None,
             })
             .await,
         Err(TransportError::SessionReferenceMismatch(remote_id))
@@ -813,6 +832,7 @@ async fn run_live_smoke(profile: &str, no_browser: bool) {
         .create_session(CreateSession {
             binding_id: SessionBindingId::new(),
             project_root: connection.project_root,
+            room_messaging: None,
         })
         .await
         .unwrap()

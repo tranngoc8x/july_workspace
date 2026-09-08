@@ -607,7 +607,10 @@ async fn create_session(
     requires_default_mode: bool,
 ) -> Result<SessionCreated, TransportError> {
     let created = connection
-        .send_request(NewSessionRequest::new(request.project_root))
+        .send_request(
+            NewSessionRequest::new(request.project_root)
+                .mcp_servers(room_mcp_servers(request.room_messaging)),
+        )
         .block_task()
         .await
         .map_err(map_sdk_error)?;
@@ -645,10 +648,13 @@ async fn resume_session(
     requires_default_mode: bool,
 ) -> Result<SessionResumed, TransportError> {
     let resumed = connection
-        .send_request(ResumeSessionRequest::new(
-            request.session.remote_session_id.clone(),
-            request.project_root,
-        ))
+        .send_request(
+            ResumeSessionRequest::new(
+                request.session.remote_session_id.clone(),
+                request.project_root,
+            )
+            .mcp_servers(room_mcp_servers(request.room_messaging)),
+        )
         .block_task()
         .await
         .map_err(|error| {
@@ -1068,4 +1074,26 @@ fn read_identity(
         name: info.name.clone(),
         version: info.version.clone(),
     })
+}
+
+fn room_mcp_servers(
+    config: Option<super::RoomMessagingConfig>,
+) -> Vec<agent_client_protocol::schema::v1::McpServer> {
+    use agent_client_protocol::schema::v1::{EnvVariable, McpServer, McpServerStdio};
+    config
+        .map(|config| {
+            McpServer::Stdio(
+                McpServerStdio::new(
+                    "july-room",
+                    std::env::current_exe().expect("running executable has a path"),
+                )
+                .args(vec!["__room-mcp".into()])
+                .env(vec![
+                    EnvVariable::new("JULY_ROOM_SOCKET", config.socket.to_string_lossy()),
+                    EnvVariable::new("JULY_ROOM_TOKEN", config.token),
+                ]),
+            )
+        })
+        .into_iter()
+        .collect()
 }
