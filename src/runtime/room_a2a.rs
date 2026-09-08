@@ -1,7 +1,8 @@
-//! Storage-backed internal A2A Message boundary. ACP delivery belongs to the caller.
+//! Internal A2A Message validation and delivery through the shared runtime owner.
 
-use super::{RuntimeError, StorageHandle, StorageWorker};
+use super::{RoomActivation, RuntimeError, StorageHandle, StorageWorker, WorkspaceRuntime};
 use crate::domain::{AgentId, RoomMessage, RoomMessageId};
+use crate::transport::AgentTransport;
 use crate::transport::a2a::{A2aMessageError, encode_room_message, validate_room_message};
 use serde_json::Value;
 
@@ -70,5 +71,24 @@ impl StorageHandle {
             target,
             message: canonical,
         })
+    }
+}
+
+impl<T: AgentTransport + Send + 'static> WorkspaceRuntime<T> {
+    /// Validate canonical A2A intent, then claim and deliver through the existing
+    /// Room runtime. Activation rechecks current membership and prevents resend.
+    pub async fn receive_room_a2a_message(
+        &self,
+        target: AgentId,
+        value: &Value,
+        at: String,
+    ) -> Result<Option<RoomActivation>, RoomA2aError> {
+        let recipient = self
+            .storage()
+            .receive_room_a2a_message(target, value)
+            .await?;
+        Ok(self
+            .activate_room_message(recipient.message.id, recipient.target, at)
+            .await?)
     }
 }
