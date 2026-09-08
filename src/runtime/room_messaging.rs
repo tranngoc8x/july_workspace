@@ -38,6 +38,7 @@ impl RoomMessagingScope {
         message: RoomMessageId,
         agent: AgentId,
         alive: Arc<AtomicBool>,
+        publications: tokio::sync::mpsc::Sender<crate::domain::RoomMessage>,
     ) -> io::Result<Self> {
         // Short path also fits macOS's Unix socket path limit.
         let directory = std::env::temp_dir().join(format!("jr-{}", ulid::Ulid::generate()));
@@ -77,9 +78,12 @@ impl RoomMessagingScope {
                                     && task_alive.load(Ordering::SeqCst) =>
                             {
                                 match parse_arguments(&value["arguments"]) {
-                                    Ok(request) => storage.send_agent_room_message(message, agent, request, timestamp(), task_alive.clone()).await
-                                        .map(|saved| json!({"message_id": saved.id.to_string(), "status": "persisted"}))
-                                        .map_err(|_| "Room message rejected: inactive scope, invalid members, reply, or conflicting request_id".to_owned()),
+                                    Ok(request) => match publications.clone().reserve_owned().await {
+                                        Ok(permit) => storage.send_agent_room_message(message, agent, request, timestamp(), task_alive.clone(), Some(permit)).await
+                                            .map(|saved| json!({"message_id": saved.id.to_string(), "status": "persisted"}))
+                                            .map_err(|_| "Room message rejected: inactive scope, invalid members, reply, or conflicting request_id".to_owned()),
+                                        Err(_) => Err("Room messaging scope is unavailable".to_owned()),
+                                    },
                                     Err(error) => Err(error),
                                 }
                             }
@@ -163,7 +167,7 @@ fn parse_arguments(value: &Value) -> Result<SendRoomMessage, String> {
 }
 
 fn tool() -> Value {
-    json!({"name":"send_room_message","description":"Publish a shared message in the current Room to named Room agents. This saves the message; recipient activation is not yet supported. Use request_id to safely retry the same message.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1}},"required":["targets","body"],"additionalProperties":false}})
+    json!({"name":"send_room_message","description":"Publish a shared message in the current Room to named Room agents. This saves the message; July routes named recipients. Use request_id to safely retry the same message.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1}},"required":["targets","body"],"additionalProperties":false}})
 }
 
 async fn publish(arguments: &Value) -> Result<Value, String> {

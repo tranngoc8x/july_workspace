@@ -382,6 +382,12 @@ async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_complet
             .clone()
             .unwrap();
         assert!(publish(&config).await);
+        if ending != "complete" {
+            let shared = active.next_event(NOW.into()).await.unwrap().unwrap();
+            assert!(
+                matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == "shared")
+            );
+        }
         match ending {
             "cancel" => {
                 active.cancel(NOW.into()).await.unwrap();
@@ -404,6 +410,12 @@ async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_complet
                 .await
                 .unwrap();
                 assert!(!publish(&config).await);
+                // Scope is gone and terminal is queued, but the committed shared
+                // message must still be delivered first.
+                let shared = active.next_event(NOW.into()).await.unwrap().unwrap();
+                assert!(
+                    matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == "shared")
+                );
                 assert_eq!(
                     active.next_event(NOW.into()).await.unwrap(),
                     Some(RoomRuntimeEvent::Completed)

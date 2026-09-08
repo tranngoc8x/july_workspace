@@ -1,12 +1,13 @@
 use super::{RuntimeError, RuntimeSession, StorageHandle, timestamp};
-use crate::domain::{AgentId, PermissionOutcome, RoomMessageId, SessionBindingStatus};
+use crate::domain::{AgentId, PermissionOutcome, RoomMessage, RoomMessageId, SessionBindingStatus};
 use crate::transport::{
     PermissionRequest, PermissionRequestId, SessionRef, TransportEvent, TransportFailureKind,
 };
 
-/// Control events only. Private text, tool traces and usage never leave the owner.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Control events and explicitly published shared messages only. Private traces stay in the owner.
+#[derive(Clone, Debug, PartialEq)]
 pub enum RoomRuntimeEvent {
+    SharedMessage(RoomMessage),
     PermissionRequested(PermissionRequest),
     Completed,
     Cancelled,
@@ -24,11 +25,12 @@ pub struct RoomActivation {
     agent_id: AgentId,
     cancelled: bool,
     completion: Option<RoomCompletion>,
+    publications: tokio::sync::mpsc::Receiver<RoomMessage>,
 }
 
 struct RoomCompletion {
     event: Result<RoomRuntimeEvent, RuntimeError>,
-    cleanup: tokio::task::JoinHandle<Result<(), RuntimeError>>,
+    cleanup: Option<tokio::task::JoinHandle<Result<(), RuntimeError>>>,
 }
 
 impl RoomActivation {
@@ -38,6 +40,7 @@ impl RoomActivation {
         message_id: RoomMessageId,
         agent_id: AgentId,
         publication_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        publications: tokio::sync::mpsc::Receiver<RoomMessage>,
     ) -> Self {
         Self {
             publication_alive,
@@ -48,7 +51,12 @@ impl RoomActivation {
             agent_id,
             cancelled: false,
             completion: None,
+            publications,
         }
+    }
+
+    pub fn agent_id(&self) -> AgentId {
+        self.agent_id
     }
 
     pub fn session(&self) -> &SessionRef {
@@ -89,19 +97,40 @@ impl RoomActivation {
         at: String,
     ) -> Result<Option<RoomRuntimeEvent>, RuntimeError> {
         loop {
+            if let Ok(message) = self.publications.try_recv() {
+                return Ok(Some(RoomRuntimeEvent::SharedMessage(message)));
+            }
             if let Some(completion) = self.completion.as_mut() {
-                let cleaned = (&mut completion.cleanup).await;
-                let completion = self
-                    .completion
-                    .take()
-                    .expect("completion is retained while awaiting cleanup");
-                cleaned.map_err(|_| RuntimeError::OwnerTaskPanicked)??;
-                return completion.event.map(Some);
+                if let Some(cleanup) = completion.cleanup.as_mut() {
+                    let cleaned = cleanup.await;
+                    completion.cleanup = None;
+                    if let Err(error) = cleaned
+                        .map_err(|_| RuntimeError::OwnerTaskPanicked)
+                        .and_then(|result| result)
+                    {
+                        completion.event = Err(error);
+                    }
+                }
+                // Cleanup passed the storage-worker barrier: every committed
+                // publication was synchronously enqueued before terminal delivery.
+                if let Ok(message) = self.publications.try_recv() {
+                    return Ok(Some(RoomRuntimeEvent::SharedMessage(message)));
+                }
+                return self.completion.take().unwrap().event.map(Some);
             }
             let Some(runtime) = self.runtime.as_mut() else {
                 return Ok(None);
             };
-            let terminal = match runtime.next_event().await {
+            let event = tokio::select! {
+                message = self.publications.recv(), if !self.publications.is_closed() => {
+                    if let Some(message) = message {
+                        return Ok(Some(RoomRuntimeEvent::SharedMessage(message)));
+                    }
+                    continue;
+                }
+                event = runtime.next_event() => event,
+            };
+            let terminal = match event {
                 Some(TransportEvent::PermissionRequested(request)) => {
                     return Ok(Some(RoomRuntimeEvent::PermissionRequested(request)));
                 }
@@ -156,7 +185,10 @@ impl RoomActivation {
             let detached = runtime.detach(at).await;
             quarantined.and(recorded).and(detached)
         });
-        self.completion = Some(RoomCompletion { event, cleanup });
+        self.completion = Some(RoomCompletion {
+            event,
+            cleanup: Some(cleanup),
+        });
     }
 }
 

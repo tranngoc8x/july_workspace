@@ -6,6 +6,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("Room activation cancelled before prompt delivery")]
+    RoomActivationCancelled,
     #[error("Room messaging setup failed: {0}")]
     RoomMessaging(#[from] std::io::Error),
     #[error("agent {0} already has a runtime owner")]
