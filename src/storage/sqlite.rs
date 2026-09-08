@@ -2526,6 +2526,17 @@ impl SqliteStore {
         validate_room_activation(&self.connection, message_id, agent_id).map(|_| ())
     }
 
+    pub(crate) fn load_room_recipient_message(
+        &mut self,
+        message_id: RoomMessageId,
+        agent_id: AgentId,
+    ) -> Result<RoomMessage, StoreError> {
+        let transaction = self.connection.transaction()?;
+        let (_, message) = validate_room_activation(&transaction, message_id, agent_id)?;
+        transaction.commit()?;
+        Ok(message)
+    }
+
     pub fn get_room_session_binding(
         &self,
         room_id: RoomId,

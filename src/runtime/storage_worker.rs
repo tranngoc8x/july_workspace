@@ -26,6 +26,7 @@ const STORAGE_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
+    LoadRoomRecipientMessage(RoomMessageId, AgentId, Reply<RoomMessage>),
     SendAgentRoomMessage(
         RoomMessageId,
         AgentId,
@@ -524,6 +525,14 @@ impl StorageHandle {
         at: String,
     ) -> Result<Option<RoomActivationClaim>, RuntimeError> {
         self.request(|reply| Command::ClaimRoomActivation(message, agent, at, reply))
+            .await
+    }
+    pub(crate) async fn load_room_recipient_message(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+    ) -> Result<RoomMessage, RuntimeError> {
+        self.request(|reply| Command::LoadRoomRecipientMessage(message, agent, reply))
             .await
     }
     pub(crate) async fn validate_room_activation(
@@ -1605,6 +1614,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::ClaimRoomActivation(message, agent, at, reply) => {
                 let _ = reply.send(store.claim_room_activation(message, agent, &at));
+            }
+            Command::LoadRoomRecipientMessage(message, agent, reply) => {
+                let _ = reply.send(store.load_room_recipient_message(message, agent));
             }
             Command::ValidateRoomActivation(message, agent, reply) => {
                 let _ = reply.send(store.validate_room_activation(message, agent));
