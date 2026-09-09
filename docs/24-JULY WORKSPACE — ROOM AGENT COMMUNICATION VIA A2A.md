@@ -985,6 +985,12 @@ Sau restart:
 8. reconcile unfinished A2A interactions
 ```
 
+Implementation (Phase 10): runtime startup atomically marks interrupted Room activations (`claimed`/`sent`) as `failed` and retires their bindings as `lost`. Completed activations, Room history/membership, cursors, Work/Result and A2A bindings remain unchanged. Inspection-only opens do not reconcile live runtime state.
+
+Recovery is lazy on a new explicit Room message: reuse a resumable session, or create one durable replacement generation after a `lost` binding or a definitive ACP `SessionLost` response. Closed sessions remain terminal. An uncertain resume/send error never retries the old message. Persisted messages are not automatically dispatched at startup.
+
+A recreated session receives at most 50 preceding shared messages and 20 relevant unfinished Work references (including task IDs). History is context, not a request to repeat interrupted work. Normal resumes retain cursor-based incremental context. The cursor advances only after successful completion of the new turn.
+
 Không replay toàn bộ Room history vào mọi agent.
 
 ---

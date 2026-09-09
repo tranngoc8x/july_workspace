@@ -50,6 +50,8 @@ struct ObservedTransport {
     cancels: usize,
     fail_send: bool,
     lose_resume: bool,
+    fail_resume: bool,
+    close_on_resume: Option<PathBuf>,
     create_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -105,6 +107,23 @@ impl AgentTransport for FakeTransport {
         request: ResumeSession,
     ) -> Result<SessionResumed, TransportError> {
         self.observed.lock().unwrap().resumes.push(request.clone());
+        let close_path = self.observed.lock().unwrap().close_on_resume.clone();
+        if let Some(path) = close_path {
+            SqliteStore::open(path)
+                .unwrap()
+                .update_session_binding_status(
+                    request.session.binding_id,
+                    SessionBindingStatus::Closed,
+                    NOW,
+                )
+                .unwrap();
+            return Err(TransportError::SessionLost(
+                request.session.remote_session_id,
+            ));
+        }
+        if self.observed.lock().unwrap().fail_resume {
+            return Err(TransportError::Protocol("uncertain resume failure".into()));
+        }
         if self.observed.lock().unwrap().lose_resume {
             return Err(TransportError::SessionLost(
                 request.session.remote_session_id,
@@ -651,7 +670,7 @@ async fn ambiguous_send_is_recorded_and_never_automatically_retried() {
 }
 
 #[tokio::test]
-async fn lost_room_session_requires_explicit_recovery_and_never_sends_a_capsule() {
+async fn missing_room_session_recreates_for_new_turn_without_private_capsule() {
     let database = TestDatabase::new();
     let (pay, _, room, message) = seed(&database);
     let (transport, events, observed) = FakeTransport::new();
@@ -684,21 +703,31 @@ async fn lost_room_session_requires_explicit_recovery_and_never_sends_a_capsule(
     next.id = RoomMessageId::new();
     let mut store = SqliteStore::open(database.path()).unwrap();
     store.append_room_message(&next).unwrap();
+    let recovered = workspace
+        .activate_room_message(next.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.lock().unwrap().creates.len(), 2);
+    assert_eq!(observed.lock().unwrap().messages.len(), 2);
+    let binding = store
+        .get_room_session_binding(room.id, pay.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.generation, 2);
+    assert_eq!(binding.status, SessionBindingStatus::Active);
+    assert_eq!(binding.id, recovered.session().binding_id);
+    assert!(
+        observed.lock().unwrap().messages[1]
+            .content
+            .contains("Recovered shared Room context")
+    );
     assert!(
         workspace
             .activate_room_message(next.id, pay.id, NOW.into())
             .await
-            .is_err()
-    );
-    assert_eq!(observed.lock().unwrap().creates.len(), 1);
-    assert_eq!(observed.lock().unwrap().messages.len(), 1);
-    assert_eq!(
-        store
-            .get_room_session_binding(room.id, pay.id)
             .unwrap()
-            .unwrap()
-            .status,
-        SessionBindingStatus::Lost
+            .is_none()
     );
     workspace.shutdown(NOW.into()).await.unwrap();
 }
@@ -791,7 +820,7 @@ async fn two_rooms_share_one_owner_but_private_traffic_cannot_block_or_cross_ses
 }
 
 #[tokio::test]
-async fn unfinished_room_activation_cannot_be_resumed_for_a_new_message_after_shutdown() {
+async fn interrupted_room_activation_is_reconciled_without_resending_old_message() {
     let database = TestDatabase::new();
     let (pay, _, _, first) = seed(&database);
     let (transport, _events, _) = FakeTransport::new();
@@ -813,7 +842,7 @@ async fn unfinished_room_activation_cannot_be_resumed_for_a_new_message_after_sh
         .unwrap()
         .unwrap();
     workspace.shutdown(NOW.into()).await.unwrap();
-    let mut second = first;
+    let mut second = first.clone();
     second.id = RoomMessageId::new();
     SqliteStore::open(database.path())
         .unwrap()
@@ -832,14 +861,31 @@ async fn unfinished_room_activation_cannot_be_resumed_for_a_new_message_after_sh
         )
         .await
         .unwrap();
+    let recovered = restarted
+        .activate_room_message(second.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(observed.lock().unwrap().resumes.is_empty());
+    assert_eq!(observed.lock().unwrap().creates.len(), 1);
+    assert_eq!(observed.lock().unwrap().messages.len(), 1);
     assert!(
         restarted
-            .activate_room_message(second.id, pay.id, NOW.into())
+            .activate_room_message(first.id, pay.id, NOW.into())
             .await
-            .is_err()
+            .unwrap()
+            .is_none()
     );
-    assert!(observed.lock().unwrap().resumes.is_empty());
-    assert!(observed.lock().unwrap().messages.is_empty());
+    assert_eq!(
+        SqliteStore::open(database.path())
+            .unwrap()
+            .get_room_session_binding(second.room_id, pay.id)
+            .unwrap()
+            .unwrap()
+            .generation,
+        2
+    );
+    drop(recovered);
     restarted.shutdown(NOW.into()).await.unwrap();
 }
 
@@ -1410,4 +1456,199 @@ fn room_cursor_migration_preserves_existing_messages_and_stable_append_order() {
             .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+async fn recreated_session_receives_bounded_shared_context_and_relevant_work_without_moving_cursor()
+{
+    use july_workspace::domain::{WorkItem, WorkItemId, WorkScope, WorkStatus};
+    let database = TestDatabase::new();
+    let (pay, infra, room, first) = seed(&database);
+    let mut store = SqliteStore::open(database.path()).unwrap();
+    let mut last = first.clone();
+    for index in 0..60 {
+        last = RoomMessage {
+            id: RoomMessageId::new(),
+            body: format!("shared-history-{index:02}"),
+            ..first.clone()
+        };
+        store.append_room_message(&last).unwrap();
+    }
+    for index in 0_u128..26 {
+        let work = WorkItem {
+            id: WorkItemId::from(ulid::Ulid::from(index + 1)),
+            scope: WorkScope::Room(room.id),
+            title: format!("pending-work-{index:02}"),
+            goal: Some("preserve existing progress".into()),
+            status: WorkStatus::Open,
+            owner_agent_id: None,
+            is_primary: false,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            completed_at: None,
+        };
+        store.insert_work_item(&work).unwrap();
+        store
+            .assign_work_owner(work.id, if index == 25 { infra.id } else { pay.id }, NOW)
+            .unwrap();
+    }
+    let (transport, events, observed) = FakeTransport::new();
+    let mut workspace =
+        WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+    workspace
+        .register_agent(
+            AgentConnection {
+                agent_id: pay.id,
+                project_root: pay.project_root.into(),
+            },
+            transport,
+        )
+        .await
+        .unwrap();
+    let mut active = workspace
+        .activate_room_message(last.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    events
+        .send(TransportEvent::TurnCompleted {
+            session: active.session().clone(),
+        })
+        .await
+        .unwrap();
+    active.next_event(NOW.into()).await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let cursor: String = connection
+        .query_row(
+            "SELECT last_seen_message_id FROM agent_room_cursors WHERE agent_id=?1",
+            [pay.id.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let next = RoomMessage {
+        id: RoomMessageId::new(),
+        body: "new explicit reconciliation request".into(),
+        ..first.clone()
+    };
+    store.append_room_message(&next).unwrap();
+    let future = RoomMessage {
+        id: RoomMessageId::new(),
+        body: "future-shared-message".into(),
+        ..first
+    };
+    store.append_room_message(&future).unwrap();
+    observed.lock().unwrap().lose_resume = true;
+    let recovered = workspace
+        .activate_room_message(next.id, pay.id, NOW.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let prompt = observed
+        .lock()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .clone();
+    assert_eq!(prompt.matches("shared-history-").count(), 50);
+    assert!(prompt.contains("shared-history-10"));
+    assert!(prompt.contains("shared-history-59"));
+    assert!(!prompt.contains("shared-history-09"));
+    assert!(!prompt.contains("future-shared-message"));
+    assert_eq!(prompt.matches("Unfinished Work:").count(), 20);
+    assert!(prompt.contains("pending-work-24"));
+    assert!(!prompt.contains("pending-work-04"));
+    assert!(!prompt.contains("pending-work-25"));
+    assert!(prompt.contains("do not repeat interrupted actions"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT last_seen_message_id FROM agent_room_cursors WHERE agent_id=?1",
+                [pay.id.to_string()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        cursor
+    );
+    assert_eq!(observed.lock().unwrap().messages.len(), 2);
+    drop(recovered);
+    workspace.shutdown(NOW.into()).await.unwrap();
+}
+
+#[tokio::test]
+async fn uncertain_resume_error_does_not_create_replacement_or_send_new_prompt() {
+    for close_during_resume in [false, true] {
+        let database = TestDatabase::new();
+        let (pay, _, room, first) = seed(&database);
+        let (transport, events, observed) = FakeTransport::new();
+        let mut workspace =
+            WorkspaceRuntime::new(StorageWorker::open(database.path()).unwrap()).unwrap();
+        workspace
+            .register_agent(
+                AgentConnection {
+                    agent_id: pay.id,
+                    project_root: pay.project_root.into(),
+                },
+                transport,
+            )
+            .await
+            .unwrap();
+        let mut active = workspace
+            .activate_room_message(first.id, pay.id, NOW.into())
+            .await
+            .unwrap()
+            .unwrap();
+        events
+            .send(TransportEvent::TurnCompleted {
+                session: active.session().clone(),
+            })
+            .await
+            .unwrap();
+        active.next_event(NOW.into()).await.unwrap();
+        observed.lock().unwrap().fail_resume = !close_during_resume;
+        if close_during_resume {
+            observed.lock().unwrap().close_on_resume = Some(database.path().to_path_buf());
+        }
+        let next = RoomMessage {
+            id: RoomMessageId::new(),
+            ..first
+        };
+        let mut store = SqliteStore::open(database.path()).unwrap();
+        store.append_room_message(&next).unwrap();
+        assert!(
+            workspace
+                .activate_room_message(next.id, pay.id, NOW.into())
+                .await
+                .is_err()
+        );
+        assert_eq!(observed.lock().unwrap().creates.len(), 1);
+        assert_eq!(observed.lock().unwrap().messages.len(), 1);
+        assert_eq!(
+            store
+                .get_room_session_binding(room.id, pay.id)
+                .unwrap()
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(
+            workspace
+                .activate_room_message(next.id, pay.id, NOW.into())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if close_during_resume {
+            assert_eq!(
+                store
+                    .get_room_session_binding(room.id, pay.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                SessionBindingStatus::Closed
+            );
+        }
+        workspace.shutdown(NOW.into()).await.unwrap();
+    }
 }

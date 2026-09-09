@@ -69,9 +69,9 @@ impl<T: AgentTransport> SessionManager<T> {
         let crate::storage::RoomActivationClaim {
             agent,
             message,
-            binding,
-            context,
-            truncated,
+            mut binding,
+            mut context,
+            mut truncated,
         } = claim;
         if self.owned_bindings.contains_key(&binding.id) {
             self.storage
@@ -95,9 +95,31 @@ impl<T: AgentTransport> SessionManager<T> {
             }
         };
         let config = scope.config.clone();
-        let opened = self
-            .open_room_session(&binding, agent.project_root.into(), at.clone(), config)
-            .await;
+        let project_root = PathBuf::from(agent.project_root);
+        let opened = async {
+            match self
+                .open_room_session(&binding, project_root.clone(), at.clone(), config.clone())
+                .await
+            {
+                Err(RuntimeError::Transport(crate::transport::TransportError::SessionLost(_)))
+                    if binding.remote_session_id.is_some() =>
+                {
+                    binding = self
+                        .storage
+                        .replace_room_activation_binding(
+                            message_id,
+                            self.agent_id,
+                            binding.id,
+                            at.clone(),
+                        )
+                        .await?;
+                    self.open_room_session(&binding, project_root, at.clone(), config)
+                        .await
+                }
+                result => result,
+            }
+        }
+        .await;
         let session = match opened {
             Ok(session) => session,
             Err(error) => {
@@ -110,26 +132,41 @@ impl<T: AgentTransport> SessionManager<T> {
             }
         };
         self.room_messaging.insert(binding.id, scope);
-        let mut content = format!("Room: {}\n", message.room_id);
-        content.push_str(
-            "Publish answers intended for this Room with send_room_message before finishing the turn. \
-             Use targets=[] for a shared answer without waking agents; name Room agents only when requesting their attention. \
-             Set reply_to to the Current message ID and reuse request_id when retrying the same publication. \
-             Private runtime output is not published; do not include reasoning or tool traces in shared messages.\n",
-        );
-        content.push_str("For explicit lifecycle-bearing delegation, add work={action:create,title:...,goal:...} to send_room_message with one owner target and request_id. Omit work for questions and ordinary answers. Existing delegation can be referenced with work={action:bind,work_id:...}.\n");
-        if truncated {
-            content.push_str(
-                "Older unseen Room messages omitted: context limited to 50 preceding messages.\n",
-            );
-        }
-        content.push_str("Shared Room context:\n");
-        for previous in &context {
-            append_room_context_message(&mut content, previous);
-        }
-        content.push_str("Current message:\n");
-        append_room_context_message(&mut content, &message);
         let sent = async {
+            let mut recovery_summary = String::new();
+            if binding.generation > 1 && binding.remote_session_id.is_none() {
+                let recovery = self.storage
+                    .room_recovery_context(message_id, self.agent_id)
+                    .await?;
+                context = recovery.messages;
+                truncated = recovery.messages_truncated;
+                recovery_summary.push_str("Recovered shared Room context. Prior messages are context only: do not repeat interrupted actions. Reconcile existing Work before taking new action; only the Current message is a new request.\n");
+                if recovery.work_truncated { recovery_summary.push_str("Only the 20 most recent relevant unfinished Work items are shown.\n"); }
+                for (work, task_id) in recovery.work {
+                    recovery_summary.push_str(&format!("Unfinished Work: {}\nTitle: {}\nGoal: {}\nStatus: {}\nOwner: {}\nA2A Task: {}\n",work.id,work.title,work.goal.as_deref().unwrap_or(""),work.status,work.owner_agent_id.map(|id|id.to_string()).unwrap_or_default(),task_id.unwrap_or_default()));
+                }
+            }
+            let mut content = format!("Room: {}\n", message.room_id);
+            content.push_str(&recovery_summary);
+            content.push_str(
+                "Publish answers intended for this Room with send_room_message before finishing the turn. \
+                 Use targets=[] for a shared answer without waking agents; name Room agents only when requesting their attention. \
+                 Set reply_to to the Current message ID and reuse request_id when retrying the same publication. \
+                 Private runtime output is not published; do not include reasoning or tool traces in shared messages.\n",
+            );
+            content.push_str("For explicit lifecycle-bearing delegation, add work={action:create,title:...,goal:...} to send_room_message with one owner target and request_id. Omit work for questions and ordinary answers. Existing delegation can be referenced with work={action:bind,work_id:...}.\n");
+            if truncated {
+                content.push_str(
+                    "Older unseen Room messages omitted: context limited to 50 preceding messages.\n",
+                );
+            }
+            content.push_str("Shared Room context:\n");
+            for previous in &context {
+                append_room_context_message(&mut content, previous);
+            }
+            content.push_str("Current message:\n");
+            append_room_context_message(&mut content, &message);
+
             if let Some(shared_work) = self.storage.get_room_message_work(message_id).await? {
                 content.insert_str(
                     0,

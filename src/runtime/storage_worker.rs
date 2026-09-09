@@ -12,11 +12,11 @@ use crate::domain::{
     HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
     Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
     ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, RoomWork, SendRoomMessage, SessionBinding, SessionBindingId,
+    RoomMessageId, RoomSessionBinding, RoomWork, SendRoomMessage, SessionBinding, SessionBindingId,
     SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
     WorkStatus,
 };
-use crate::storage::{RoomActivationClaim, SqliteStore, StoreError};
+use crate::storage::{RoomActivationClaim, RoomRecoveryContext, SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::thread::JoinHandle;
@@ -27,6 +27,14 @@ const STORAGE_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
+    ReplaceRoomActivationBinding(
+        RoomMessageId,
+        AgentId,
+        SessionBindingId,
+        String,
+        Reply<RoomSessionBinding>,
+    ),
+    RoomRecoveryContext(RoomMessageId, AgentId, Reply<RoomRecoveryContext>),
     GetRoomMessageWork(RoomMessageId, Reply<Option<RoomWork>>),
     LoadRoomRecipientMessage(RoomMessageId, AgentId, Reply<RoomMessage>),
     SendAgentRoomMessage(
@@ -246,7 +254,7 @@ impl StorageWorker {
             let store = match SqliteStore::open(path) {
                 Ok(mut store) => {
                     if reconcile
-                        && let Err(error) = store.reconcile_pending_deliveries(&timestamp())
+                        && let Err(error) = store.reconcile_interrupted_runtime(&timestamp())
                     {
                         let _ = started.send(Err(error));
                         return;
@@ -504,6 +512,27 @@ impl StorageHandle {
         kind: Option<MemoryKind>,
     ) -> Result<Vec<Memory>, RuntimeError> {
         self.request(|reply| Command::ListMemories(scope_type, scope_id, kind, reply))
+            .await
+    }
+
+    pub(crate) async fn replace_room_activation_binding(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+        source: SessionBindingId,
+        at: String,
+    ) -> Result<RoomSessionBinding, RuntimeError> {
+        self.request(|reply| {
+            Command::ReplaceRoomActivationBinding(message, agent, source, at, reply)
+        })
+        .await
+    }
+    pub(crate) async fn room_recovery_context(
+        &self,
+        message: RoomMessageId,
+        agent: AgentId,
+    ) -> Result<RoomRecoveryContext, RuntimeError> {
+        self.request(|reply| Command::RoomRecoveryContext(message, agent, reply))
             .await
     }
 
@@ -1616,6 +1645,13 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::BuildRecoveryCapsule(command, reply) => {
                 let _ = reply.send(build_recovery_capsule(&store, command));
             }
+            Command::ReplaceRoomActivationBinding(message, agent, source, at, reply) => {
+                let _ =
+                    reply.send(store.replace_room_activation_binding(message, agent, source, &at));
+            }
+            Command::RoomRecoveryContext(message, agent, reply) => {
+                let _ = reply.send(store.room_recovery_context(message, agent));
+            }
             Command::GetRoomMessageWork(message, reply) => {
                 let _ = reply.send(store.get_room_message_work(message));
             }
@@ -2182,6 +2218,37 @@ fn map_publish_error(error: StoreError) -> PublishError {
 mod tests {
     use super::*;
     use crate::domain::{ConversationKind, MemberType};
+
+    #[tokio::test]
+    async fn inspection_open_preserves_live_room_state_but_runtime_startup_reconciles_it() {
+        let directory =
+            std::env::temp_dir().join(format!("july-room-inspection-{}", ulid::Ulid::generate()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("workspace.db");
+        drop(SqliteStore::open(&path).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch("INSERT INTO agents(id,name,project_root,transport_type,transport_config_json,status,metadata_json,created_at,updated_at) VALUES('agent','agent','/tmp','acp','{}','active','{}','now','now');
+            INSERT INTO rooms(id,name,status,created_at,updated_at) VALUES('room','room','active','now','now');
+            INSERT INTO room_messages(id,room_id,sender_type,sender_id,body,mentions_json,created_at) VALUES('message','room','user','local-user','request','[\"agent\"]','now');
+            INSERT INTO session_bindings(id,room_id,agent_id,transport_type,remote_session_id,status,created_at,last_used_at) VALUES('binding','room','agent','acp','remote','active','now','now');
+            INSERT INTO room_message_activations VALUES('message','agent','binding','sent','now');").unwrap();
+        let state = || {
+            connection.query_row("SELECT b.status,a.status,a.updated_at FROM room_message_activations a JOIN session_bindings b ON b.id=a.session_binding_id",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).unwrap()
+        };
+        let before = state();
+        let mut inspection = StorageWorker::open_for_inspection(&path).unwrap();
+        assert_eq!(state(), before);
+        inspection.shutdown().await.unwrap();
+        let mut startup = StorageWorker::open(&path).unwrap();
+        assert_eq!((state().0, state().1), ("lost".into(), "failed".into()));
+        startup.shutdown().await.unwrap();
+        let recovered = state();
+        let mut again = StorageWorker::open(&path).unwrap();
+        assert_eq!(state(), recovered);
+        again.shutdown().await.unwrap();
+        drop(connection);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn bounded_recent_message_request_preserves_order_limit_and_conversation() {
