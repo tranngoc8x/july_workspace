@@ -618,8 +618,8 @@ async fn transport_failure_does_not_roll_back_the_thread_aggregate() {
                 .get_work_item(fixture.primary_work_id)
                 .unwrap()
                 .unwrap()
-                .conversation_id,
-            fixture.thread.id
+                .scope,
+            july_workspace::domain::WorkScope::Conversation(fixture.thread.id)
         );
         assert_eq!(
             store

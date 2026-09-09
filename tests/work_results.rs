@@ -1,4 +1,5 @@
 use july_workspace::application::{CreateWorkResult, TransitionWork, WorkError, WorkService};
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, DomainError, ResultId, WorkItem, WorkItemId,
     WorkResult, WorkStatus,
@@ -51,7 +52,7 @@ fn seed_work(path: &Path, status: WorkStatus) -> WorkItem {
     };
     let work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id: conversation.id,
+        scope: WorkScope::Conversation(conversation.id),
         title: "Produce structured output".into(),
         goal: None,
         status: WorkStatus::Open,

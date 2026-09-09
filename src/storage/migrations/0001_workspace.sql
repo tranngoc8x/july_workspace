@@ -72,7 +72,8 @@ CREATE TABLE messages (
 
 CREATE TABLE work_items (
     id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    conversation_id TEXT REFERENCES conversations(id),
+    room_id TEXT REFERENCES rooms(id),
     title TEXT NOT NULL CHECK (trim(title) <> ''),
     goal TEXT,
     status TEXT NOT NULL CHECK (
@@ -81,7 +82,8 @@ CREATE TABLE work_items (
     owner_agent_id TEXT REFERENCES agents(id),
     created_at TEXT NOT NULL CHECK (trim(created_at) <> ''),
     updated_at TEXT NOT NULL CHECK (trim(updated_at) <> ''),
-    completed_at TEXT
+    completed_at TEXT,
+    CHECK ((conversation_id IS NOT NULL) <> (room_id IS NOT NULL))
 );
 
 CREATE TABLE work_dependencies (

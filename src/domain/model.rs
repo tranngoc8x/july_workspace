@@ -423,10 +423,16 @@ impl MessageDelivery {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkScope {
+    Conversation(ConversationId),
+    Room(RoomId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkItem {
     pub id: WorkItemId,
-    pub conversation_id: ConversationId,
+    pub scope: WorkScope,
     pub title: String,
     pub goal: Option<String>,
     pub status: WorkStatus,
@@ -1116,7 +1122,7 @@ mod tests {
     fn valid_work_item() -> WorkItem {
         WorkItem {
             id: WorkItemId::new(),
-            conversation_id: ConversationId::new(),
+            scope: WorkScope::Conversation(ConversationId::new()),
             title: "Implement domain".into(),
             goal: None,
             status: WorkStatus::Open,

@@ -1,3 +1,4 @@
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationKind, ConversationMember,
     DependencyStatus, DependencyType, DomainError, MemberType, Memory, MemoryKind, MemoryScopeType,
@@ -140,7 +141,7 @@ fn full_graph_round_trips_after_reopen() {
     };
     let upstream = WorkItem {
         id: Default::default(),
-        conversation_id: thread.id,
+        scope: WorkScope::Conversation(thread.id),
         title: "Storage rollout".into(),
         goal: Some("Persist the whole graph".into()),
         status: WorkStatus::Ready,
@@ -152,7 +153,7 @@ fn full_graph_round_trips_after_reopen() {
     };
     let downstream = WorkItem {
         id: Default::default(),
-        conversation_id: thread.id,
+        scope: WorkScope::Conversation(thread.id),
         title: "Review storage".into(),
         goal: None,
         status: WorkStatus::Open,

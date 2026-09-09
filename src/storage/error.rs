@@ -104,7 +104,7 @@ pub enum StoreError {
         upstream_work_id: WorkItemId,
         downstream_work_id: WorkItemId,
     },
-    #[error("agent {owner_agent_id} is not an active member of work {work_id}'s conversation")]
+    #[error("agent {owner_agent_id} is not an active member of work {work_id}'s scope")]
     WorkOwnerScopeRequired {
         work_id: WorkItemId,
         owner_agent_id: AgentId,

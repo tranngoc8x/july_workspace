@@ -1,6 +1,6 @@
 //! Ephemeral Room capability. The MCP process never receives database access.
 use super::{StorageHandle, timestamp};
-use crate::domain::{AgentId, RoomMessageId, SendRoomMessage};
+use crate::domain::{AgentId, RoomMessageId, RoomWorkIntent, SendRoomMessage};
 use crate::transport::RoomMessagingConfig;
 use serde_json::{Value, json};
 use std::io;
@@ -79,9 +79,16 @@ impl RoomMessagingScope {
                             {
                                 match parse_arguments(&value["arguments"]) {
                                     Ok(request) => match publications.clone().reserve_owned().await {
-                                        Ok(permit) => storage.send_agent_room_message(message, agent, request, timestamp(), task_alive.clone(), Some(permit)).await
-                                            .map(|saved| json!({"message_id": saved.id.to_string(), "status": "persisted"}))
-                                            .map_err(|_| "Room message rejected: inactive scope, invalid members, reply, or conflicting request_id".to_owned()),
+                                        Ok(permit) => async {
+                                            let saved = storage.send_agent_room_message(message, agent, request, timestamp(), task_alive.clone(), Some(permit)).await
+                                                .map_err(|_| "Room message rejected: inactive scope, invalid members, reply, work, or conflicting request_id".to_owned())?;
+                                            let mut value = json!({"message_id": saved.id.to_string(), "status": "persisted"});
+                                            if let Some(work) = storage.get_room_message_work(saved.id).await.map_err(|_| "Room work unavailable; retry with the same request_id".to_owned())? {
+                                                value["work_id"] = json!(work.work.id.to_string());
+                                                value["task_id"] = json!(work.binding.task_id);
+                                            }
+                                            Ok(value)
+                                        }.await,
                                         Err(_) => Err("Room messaging scope is unavailable".to_owned()),
                                     },
                                     Err(error) => Err(error),
@@ -122,12 +129,15 @@ impl Drop for RoomMessagingScope {
 
 fn parse_arguments(value: &Value) -> Result<SendRoomMessage, String> {
     let object = value.as_object().ok_or("arguments must be an object")?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "targets" | "body" | "reply_to" | "request_id"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "targets" | "body" | "reply_to" | "request_id" | "work"
+        )
+    }) {
         return Err(
-            "Unknown argument; only targets, body, reply_to and request_id are accepted".into(),
+            "Unknown argument; only targets, body, reply_to, request_id and work are accepted"
+                .into(),
         );
     }
     let targets = object
@@ -156,6 +166,7 @@ fn parse_arguments(value: &Value) -> Result<SendRoomMessage, String> {
         }
     };
     Ok(SendRoomMessage {
+        work: object.get("work").map(parse_work).transpose()?,
         targets,
         body,
         reply_to: optional_string("reply_to")?
@@ -166,8 +177,39 @@ fn parse_arguments(value: &Value) -> Result<SendRoomMessage, String> {
     })
 }
 
+fn parse_work(value: &Value) -> Result<RoomWorkIntent, String> {
+    let object = value.as_object().ok_or("work must be an object")?;
+    let action = value["action"].as_str().ok_or("work.action is required")?;
+    let allowed: &[&str] = match action {
+        "create" => &["action", "title", "goal"],
+        "bind" => &["action", "work_id"],
+        _ => return Err("unknown work action".into()),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("unknown work field".into());
+    }
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("work.{key} must be nonempty text"))
+    };
+    match action {
+        "create" => Ok(RoomWorkIntent::Create {
+            title: text("title")?.into(),
+            goal: object
+                .get("goal")
+                .map(|_| text("goal").map(str::to_owned))
+                .transpose()?,
+        }),
+        _ => Ok(RoomWorkIntent::Bind {
+            work_id: text("work_id")?.parse().map_err(|_| "invalid work_id")?,
+        }),
+    }
+}
+
 fn tool() -> Value {
-    json!({"name":"send_room_message","description":"Publish an explicit shared message in the current Room. Use targets=[] to answer the Room without waking agents; name Room agents only when requesting their attention. Set reply_to to the message being answered. Private runtime output is not published. Use request_id to safely retry the same message.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":0,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1}},"required":["targets","body"],"additionalProperties":false}})
+    json!({"name":"send_room_message","description":"Publish an explicit shared message in the current Room. Use targets=[] to answer the Room without waking agents; name Room agents only when requesting their attention. Set reply_to to the message being answered. Private runtime output is not published. Use request_id to safely retry the same message. For lifecycle-bearing delegation only, add work with action=create and title (optional goal), or action=bind and work_id. Work requires one owner target and request_id; omit work for ordinary chat.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":0,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1},"work":{"oneOf":[{"type":"object","properties":{"action":{"const":"create"},"title":{"type":"string","minLength":1},"goal":{"type":"string","minLength":1}},"required":["action","title"],"additionalProperties":false},{"type":"object","properties":{"action":{"const":"bind"},"work_id":{"type":"string","minLength":1}},"required":["action","work_id"],"additionalProperties":false}]}},"required":["targets","body"],"additionalProperties":false}})
 }
 
 async fn publish(arguments: &Value) -> Result<Value, String> {
@@ -290,5 +332,22 @@ pub async fn run_room_mcp_stdio() -> io::Result<()> {
         };
         output.write_all(format!("{response}\n").as_bytes()).await?;
         output.flush().await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_work_is_explicit_and_strictly_parsed() {
+        let request = json!({"targets":["pay"],"body":"Implement X","request_id":"job-1","work":{"action":"create","title":"Implement X","goal":"Return test evidence"}});
+        assert!(parse_arguments(&request).is_ok());
+        let mut invalid = request.clone();
+        invalid["work"]["room_id"] = json!("forged");
+        assert!(parse_arguments(&invalid).is_err());
+        invalid = request;
+        invalid["work"]["action"] = json!("guess");
+        assert!(parse_arguments(&invalid).is_err());
     }
 }

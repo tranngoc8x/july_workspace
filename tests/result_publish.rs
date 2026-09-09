@@ -1,4 +1,5 @@
 use july_workspace::application::{PublishError, PublishResult, PublishService, PublishedResult};
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, MemberType, Message, MessageId, PublishId,
     ResultId, WorkItem, WorkItemId, WorkResult, WorkStatus,
@@ -66,7 +67,7 @@ fn seed_result(
     } else {
         let work = WorkItem {
             id: WorkItemId::new(),
-            conversation_id: source.id,
+            scope: WorkScope::Conversation(source.id),
             title: "Produce structured output".into(),
             goal: None,
             status: WorkStatus::Open,

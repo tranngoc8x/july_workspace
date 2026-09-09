@@ -1,3 +1,4 @@
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, PublishId, ResultId, WorkItem, WorkItemId,
     WorkResult, WorkStatus,
@@ -50,7 +51,7 @@ impl TestWorkspace {
         let target = conversation();
         let work = WorkItem {
             id: WorkItemId::new(),
-            conversation_id: source.id,
+            scope: WorkScope::Conversation(source.id),
             title: "Publish result".into(),
             goal: None,
             status: WorkStatus::Open,

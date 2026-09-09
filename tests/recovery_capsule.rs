@@ -1,6 +1,7 @@
 use july_workspace::application::{
     BuildRecoveryCapsule, RECENT_MESSAGE_LIMIT, RecoveryError, RecoveryService,
 };
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
     MemberType, Memory, MemoryId, MemoryKind, MemoryScopeType, Message, MessageId, PublishId, Room,
@@ -429,7 +430,7 @@ async fn thread_includes_only_current_project_and_own_room_memories() {
 fn seed_result(store: &mut SqliteStore, source: &Conversation) -> WorkResult {
     let work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id: source.id,
+        scope: WorkScope::Conversation(source.id),
         title: "Publish compact result".into(),
         goal: None,
         status: WorkStatus::Open,

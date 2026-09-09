@@ -1,4 +1,4 @@
-//! Internal A2A 0.3 Message profile, not an HTTP binding or Task implementation.
+//! Internal A2A 0.3 Message and Task projections; no independent protocol state.
 
 use crate::domain::{AgentId, MemberType, RoomMessage};
 use serde_json::{Value, json};
@@ -51,6 +51,64 @@ pub fn validate_room_message(
         return Err(A2aMessageError);
     }
     Ok(())
+}
+
+/// Stable task correlation on a message; task lifecycle is projected separately.
+pub fn encode_room_work_message(
+    message: &RoomMessage,
+    target: AgentId,
+    shared: Option<&crate::domain::RoomWork>,
+) -> Result<Value, A2aMessageError> {
+    let mut value = encode_room_message(message, target)?;
+    if let Some(shared) = shared {
+        if shared.binding.room_id != message.room_id
+            || shared.work.scope != crate::domain::WorkScope::Room(message.room_id)
+            || shared.binding.work_id != shared.work.id
+            || shared.binding.owner_agent_id != target
+            || shared.work.owner_agent_id != Some(target)
+            || shared.binding.requester_agent_id.to_string() != message.sender_id
+            || shared.binding.task_id.trim().is_empty()
+        {
+            return Err(A2aMessageError);
+        }
+        value["taskId"] = json!(shared.binding.task_id);
+        value["metadata"]["july.work_id"] = json!(shared.work.id.to_string());
+    }
+    Ok(value)
+}
+
+/// A2A 0.3 Task projection. July Work and Result are the only state authorities.
+pub fn encode_room_task(
+    message: &RoomMessage,
+    target: AgentId,
+    shared: &crate::domain::RoomWork,
+) -> Result<Value, A2aMessageError> {
+    use crate::domain::WorkStatus;
+    let history = encode_room_work_message(message, target, Some(shared))?;
+    let state = match shared.work.status {
+        WorkStatus::Open => "submitted",
+        WorkStatus::Working | WorkStatus::Blocked | WorkStatus::Ready => "working",
+        WorkStatus::Done => "completed",
+        WorkStatus::Failed => "failed",
+        WorkStatus::Cancelled => "canceled",
+    };
+    let mut artifacts = Vec::new();
+    for result in &shared.results {
+        if result.work_id != shared.work.id {
+            return Err(A2aMessageError);
+        }
+        artifacts.push(json!({
+            "artifactId":result.id.to_string(),
+            "parts":[{"kind":"text","text":result.summary},{"kind":"data","data":{"outputs":result.outputs,"evidence":result.evidence}}],
+            "metadata":{"july.result_id":result.id.to_string(),"july.result_status":result.status,"july.supersedes_result_id":result.supersedes_result_id.map(|id|id.to_string())}
+        }));
+    }
+    Ok(json!({
+        "kind":"task", "id":shared.binding.task_id,"contextId":message.room_id.to_string(),
+        "status":{"state":state,"timestamp":shared.work.updated_at},
+        "history":[history],"artifacts":artifacts,
+        "metadata":{"july.work_id":shared.work.id.to_string(),"july.work_status":shared.work.status.to_string(),"july.requester_agent_id":shared.binding.requester_agent_id.to_string(),"july.owner_agent_id":target.to_string()}
+    }))
 }
 
 #[cfg(test)]

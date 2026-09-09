@@ -1,4 +1,5 @@
 use super::StoreError;
+use crate::domain::WorkScope;
 use crate::domain::{
     Agent, Checkpoint, Conversation, ConversationId, ConversationMember, Decision, DomainError,
     Handoff, Memory, Message, MessageDelivery, PermissionDecision, PermissionOption,
@@ -163,9 +164,21 @@ pub(super) fn message_delivery(row: &Row<'_>) -> Result<MessageDelivery, StoreEr
 }
 
 pub(super) fn work_item(row: &Row<'_>) -> Result<WorkItem, StoreError> {
+    let scope = match (
+        row.get::<_, Option<String>>(1)?,
+        row.get::<_, Option<String>>(10)?,
+    ) {
+        (Some(conversation), None) => WorkScope::Conversation(id(conversation)?),
+        (None, Some(room)) => WorkScope::Room(id(room)?),
+        _ => {
+            return Err(StoreError::InvalidStoredValue(
+                "work must have exactly one scope",
+            ));
+        }
+    };
     let work_item = WorkItem {
         id: id(row.get(0)?)?,
-        conversation_id: id(row.get(1)?)?,
+        scope,
         title: row.get(2)?,
         goal: row.get(3)?,
         status: domain_enum(row.get(4)?)?,

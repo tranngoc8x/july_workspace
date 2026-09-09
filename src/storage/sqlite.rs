@@ -1,5 +1,7 @@
+mod room_work;
 use super::{StoreError, records};
 use crate::application::FailedMessageDelivery;
+use crate::domain::WorkScope;
 use crate::domain::{
     Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
     ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner, DecisionStatus,
@@ -34,7 +36,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 19] = [
+const MIGRATIONS: [Migration; 20] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -111,6 +113,10 @@ const MIGRATIONS: [Migration; 19] = [
         version: 19,
         sql: include_str!("migrations/0019_room_publications.sql"),
     },
+    Migration {
+        version: 20,
+        sql: include_str!("migrations/0020_room_work.sql"),
+    },
 ];
 
 pub(crate) struct RoomActivationClaim {
@@ -165,6 +171,14 @@ impl SqliteStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        let obsolete_work_schema: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='work_items') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('work_items') WHERE name='room_id')",
+            [], |row| row.get(0))?;
+        if obsolete_work_schema {
+            return Err(StoreError::InvalidStoredValue(
+                "pre-Phase9 Work schema; use a fresh workspace database",
+            ));
+        }
         apply_migrations(&mut connection, &MIGRATIONS)?;
         Ok(Self { connection })
     }
@@ -674,7 +688,7 @@ impl SqliteStore {
         user.validate()?;
         let work = WorkItem {
             id: primary_work_id,
-            conversation_id: thread.id,
+            scope: WorkScope::Conversation(thread.id),
             title: thread.title.clone().expect("validated thread has a title"),
             goal: thread.goal.clone(),
             status: WorkStatus::Open,
@@ -1010,7 +1024,7 @@ impl SqliteStore {
             reply_to: request.reply_to,
             created_at: at.into(),
         };
-        if let Some(id) = existing_id {
+        if let Some(ref id) = existing_id {
             let previous = query_optional(&transaction,
                 "SELECT id, room_id, sender_type, sender_id, body, mentions_json, reply_to, created_at FROM room_messages WHERE id = ?1",
                 params![id], records::room_message)?.ok_or(StoreError::InvalidStoredValue("room publication message"))?;
@@ -1021,6 +1035,7 @@ impl SqliteStore {
             }
         }
         let message = append_room_message(&transaction, &message)?;
+        room_work::bind_publication(&transaction, &message, request, existing_id.is_some())?;
         if let Some(key) = &request.request_id {
             transaction.execute("INSERT OR IGNORE INTO room_message_publications(trigger_message_id, agent_id, request_id, published_message_id) VALUES (?1, ?2, ?3, ?4)",
                 params![trigger.to_string(), agent.to_string(), key, message.id.to_string()])?;
@@ -1390,7 +1405,7 @@ impl SqliteStore {
         query_all(
             &self.connection,
             "SELECT id, conversation_id, title, goal, status, owner_agent_id,
-                    is_primary, created_at, updated_at, completed_at
+                    is_primary, created_at, updated_at, completed_at, room_id
              FROM work_items WHERE conversation_id = ?1
              ORDER BY is_primary DESC, created_at, id",
             params![conversation_id.to_string()],
@@ -1681,7 +1696,11 @@ impl SqliteStore {
         let result = get_work_result(&transaction, result_id)?
             .ok_or(StoreError::PublishResultNotFound(result_id))?;
         let work = require_work_item(&transaction, result.work_id)?;
-        let source_conversation_id = work.conversation_id;
+        let WorkScope::Conversation(source_conversation_id) = work.scope else {
+            return Err(StoreError::InvalidStoredValue(
+                "Room work cannot publish to a conversation",
+            ));
+        };
         if get_conversation(&transaction, source_conversation_id)?.is_none() {
             return Err(StoreError::PublishSourceNotFound(source_conversation_id));
         }
@@ -1755,7 +1774,7 @@ impl SqliteStore {
             };
         }
         let work = require_work_item(&transaction, handoff.work_id)?;
-        if work.conversation_id != handoff.thread_id {
+        if work.scope != WorkScope::Conversation(handoff.thread_id) {
             return Err(StoreError::HandoffWorkOutOfThread {
                 work_id: handoff.work_id,
                 thread_id: handoff.thread_id,
@@ -2315,7 +2334,7 @@ impl SqliteStore {
         for item in items {
             let work = WorkItem {
                 id: item.work_id,
-                conversation_id: decision.thread_id,
+                scope: WorkScope::Conversation(decision.thread_id),
                 title: item.title.clone(),
                 goal: item.goal.clone(),
                 status: WorkStatus::Open,
@@ -2330,7 +2349,7 @@ impl SqliteStore {
                 Some(stored) => {
                     // Only work this decision already generated may be reused.
                     if !decision_generated_work(&transaction, decision_id, item.work_id)?
-                        || stored.conversation_id != work.conversation_id
+                        || stored.scope != work.scope
                         || stored.title != work.title
                         || stored.goal != work.goal
                         || stored.owner_agent_id != work.owner_agent_id
@@ -2381,7 +2400,7 @@ impl SqliteStore {
             &self.connection,
             "SELECT work.id, work.conversation_id, work.title, work.goal, work.status,
                     work.owner_agent_id, work.is_primary, work.created_at, work.updated_at,
-                    work.completed_at
+                    work.completed_at, work.room_id
              FROM decision_work_items AS link
              JOIN work_items AS work ON work.id = link.work_id
              WHERE link.decision_id = ?1
@@ -3553,7 +3572,7 @@ fn get_work_item(
     query_optional(
         connection,
         "SELECT id, conversation_id, title, goal, status, owner_agent_id,
-                is_primary, created_at, updated_at, completed_at
+                is_primary, created_at, updated_at, completed_at, room_id
          FROM work_items WHERE id = ?1",
         params![work_id.to_string()],
         records::work_item,
@@ -3711,12 +3730,18 @@ fn assign_work_owner(
         return Err(StoreError::TerminalWorkOwnerImmutable(work_id));
     }
     require_active_agent(connection, owner_agent_id)?;
-    require_active_conversation_membership(
-        connection,
-        work.conversation_id,
-        work_id,
-        owner_agent_id,
-    )?;
+    match work.scope {
+        WorkScope::Conversation(conversation_id) => require_active_conversation_membership(
+            connection,
+            conversation_id,
+            work_id,
+            owner_agent_id,
+        )?,
+        WorkScope::Room(room_id) => {
+            require_active_room(connection, room_id)?;
+            require_active_room_membership(connection, room_id, owner_agent_id)?;
+        }
+    }
     work.owner_agent_id = Some(owner_agent_id);
     work.updated_at = assigned_at.into();
     work.validate()?;
@@ -4081,14 +4106,21 @@ fn require_work_timestamp(timestamp: &str) -> Result<(), StoreError> {
 
 fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(), StoreError> {
     work_item.validate()?;
+    let (conversation_id, room_id) = match work_item.scope {
+        WorkScope::Conversation(id) => (Some(id.to_string()), None),
+        WorkScope::Room(id) => {
+            require_active_room(connection, id)?;
+            (None, Some(id.to_string()))
+        }
+    };
     connection.execute(
         "INSERT INTO work_items(
             id, conversation_id, title, goal, status, owner_agent_id,
-            is_primary, created_at, updated_at, completed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            is_primary, created_at, updated_at, completed_at, room_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             work_item.id.to_string(),
-            work_item.conversation_id.to_string(),
+            conversation_id,
             work_item.title,
             work_item.goal,
             work_item.status.to_string(),
@@ -4097,6 +4129,7 @@ fn insert_work_item(connection: &Connection, work_item: &WorkItem) -> Result<(),
             work_item.created_at,
             work_item.updated_at,
             work_item.completed_at,
+            room_id,
         ],
     )?;
     Ok(())
@@ -4579,6 +4612,39 @@ mod tests {
     use std::path::{Path, PathBuf};
     use ulid::Ulid;
 
+    #[test]
+    fn pre_room_work_database_is_rejected_without_conversion() {
+        let db = TestDatabase::new();
+        let connection = Connection::open(db.path()).unwrap();
+        connection.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES(19); CREATE TABLE work_items(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL); INSERT INTO work_items VALUES('old','conversation');").unwrap();
+        assert!(matches!(
+            SqliteStore::open(db.path()),
+            Err(StoreError::InvalidStoredValue(
+                "pre-Phase9 Work schema; use a fresh workspace database"
+            ))
+        ));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT conversation_id FROM work_items WHERE id='old'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "conversation"
+        );
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 19);
+    }
+
+    #[test]
+    fn room_work_has_one_canonical_scope() {
+        let db = TestDatabase::new();
+        let store = SqliteStore::open(&db.path).expect("open store");
+        store.connection.execute_batch("INSERT INTO rooms(id,name,status,created_at,updated_at) VALUES ('room-work','work','active','now','now');
+            INSERT INTO work_items(id,room_id,title,status,created_at,updated_at) VALUES ('work-room','room-work','shared task','open','now','now');").expect("insert Room work without conversation");
+        assert!(store.connection.execute("INSERT INTO work_items(id,title,status,created_at,updated_at) VALUES ('no-scope','invalid','open','now','now')", []).is_err());
+    }
+
     struct TestDatabase {
         directory: PathBuf,
         path: PathBuf,
@@ -4675,7 +4741,7 @@ mod tests {
         let before = snapshot(&connection);
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
         assert_eq!(snapshot(&connection), before);
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 19);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 20);
         assert!(
             !connection
                 .prepare("PRAGMA foreign_key_check")
@@ -4760,6 +4826,7 @@ mod tests {
             .unwrap();
         let alive = AtomicBool::new(true);
         let mut request = SendRoomMessage {
+            work: None,
             targets: vec!["target".into(), "target".into()],
             body: "hello".into(),
             reply_to: Some(trigger.id),
@@ -4772,6 +4839,7 @@ mod tests {
         assert_eq!(sent.room_id, room.id);
         assert_eq!(sent.mentions, vec![agents[1].id]);
         let shared_request = SendRoomMessage {
+            work: None,
             targets: vec![],
             request_id: Some("shared-answer".into()),
             ..request.clone()
@@ -4878,7 +4946,7 @@ mod tests {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 19);
+        assert_eq!(store.schema_version().unwrap(), 20);
     }
 
     #[test]
@@ -4934,6 +5002,8 @@ mod tests {
             "messages",
             "message_deliveries",
             "work_items",
+            "room_a2a_task_bindings",
+            "room_message_work",
             "work_dependencies",
             "work_results",
             "publishes",
@@ -4963,7 +5033,7 @@ mod tests {
             }
         }
 
-        assert_eq!(foreign_key_count, 36);
+        assert_eq!(foreign_key_count, 43);
     }
 
     #[test]
@@ -5251,14 +5321,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            19
+            20
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            19
+            20
         );
     }
 
@@ -5927,7 +5997,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 19);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 20);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -6415,15 +6485,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (20);",
+                 INSERT INTO schema_migrations(version) VALUES (21);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 20,
-                supported: 19,
+                found: 21,
+                supported: 20,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

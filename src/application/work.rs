@@ -28,7 +28,7 @@ pub enum WorkError {
     OwnerNotFound(AgentId),
     #[error("owner agent {0} is not active")]
     OwnerInactive(AgentId),
-    #[error("agent {owner_agent_id} is not an active member of work {work_id}'s conversation")]
+    #[error("agent {owner_agent_id} is not an active member of work {work_id}'s scope")]
     OwnerOutOfScope {
         work_id: WorkItemId,
         owner_agent_id: AgentId,
