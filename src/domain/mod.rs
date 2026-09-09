@@ -11,6 +11,7 @@ pub use model::*;
 /// Agent-facing arguments. Sender and Room come from the host activation.
 #[derive(Clone, Debug)]
 pub struct SendRoomMessage {
+    /// Names of agents to activate; empty publishes to the Room without activation.
     pub targets: Vec<String>,
     pub body: String,
     pub reply_to: Option<RoomMessageId>,

@@ -2878,6 +2878,7 @@ fn room_agent_mcp_publishes_authenticated_messages_and_rotates_scope_on_resume()
         assert_eq!(results[0]["result"]["protocolVersion"], "2025-03-26");
         let tool = &results[1]["result"]["tools"][0];
         assert_eq!(tool["name"], "send_room_message");
+        assert_eq!(tool["inputSchema"]["properties"]["targets"]["minItems"], 0);
         assert!(tool["inputSchema"]["properties"].get("sender_id").is_none());
         assert!(tool["inputSchema"]["properties"].get("room_id").is_none());
         assert_eq!(results[2]["result"]["isError"], false);
@@ -2945,6 +2946,146 @@ fn room_mcp_stdio_rejects_malformed_requests_and_requires_initialization() {
     assert_eq!(replies[3]["result"]["protocolVersion"], "2024-11-05");
     assert_eq!(replies[4]["result"]["isError"], true);
     assert_eq!(replies[5]["result"], json!({}));
+}
+
+#[tokio::test]
+async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
+    for tui in [false, true] {
+        let workspace = TestWorkspace::new();
+        let room = workspace.seed_room("vna");
+        let other_room = workspace.seed_room("other");
+        let fixture = workspace.root.join("room_shared_reply.py");
+        let source = include_str!("fixtures/acp_agent.py");
+        let marker = "        if \"--room-mcp\" in sys.argv:";
+        let hook = r#"        role = os.environ["ROOM_TEST_ROLE"]
+        content = message["params"]["prompt"][0]["text"]
+        trigger = content.split("Current message:\nMessage: ", 1)[1].split("\n", 1)[0]
+        args = {
+            "targets": ["pay"] if role == "cashpoint" else [],
+            "body": "check shared refund contract" if role == "cashpoint" else "shared refund answer",
+            "reply_to": trigger,
+            "request_id": "shared-reply",
+        }
+        config = dict(room_configs[session_id][0])
+        config["command"] = os.environ["ROOM_TEST_JULY"]
+        results = call_room_mcp(config, [args, args])
+        assert results[2]["result"]["isError"] is False, results
+        assert results[2]["result"] == results[3]["result"], results
+"#;
+        std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
+        let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+        let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+        let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
+        let connection = Connection::open(&workspace.database).unwrap();
+        for agent in [&cashpoint, &pay, &idle] {
+            workspace.add_member(&room, agent);
+            let mut config = agent.transport_config.clone();
+            config["arguments"][0] = json!(fixture);
+            config["environment"] = json!({
+                "ROOM_TEST_ROLE": agent.name,
+                "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
+                "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
+            });
+            connection
+                .execute(
+                    "UPDATE agents SET transport_config_json = ?1 WHERE id = ?2",
+                    [config.to_string(), agent.id.to_string()],
+                )
+                .unwrap();
+        }
+        let transcript = if tui {
+            let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+            let mut app = App::new(bridge.initial_context());
+            let opened = bridge
+                .execute(tui_command(&mut app, "/room vna"))
+                .await
+                .unwrap();
+            app.reduce(opened);
+            let origin = app.context().id().clone();
+            bridge
+                .dispatch(tui_command(&mut app, "@cashpoint investigate refund"))
+                .unwrap();
+            let mut publications = 0;
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let event = bridge.next_event().await.unwrap().unwrap();
+                    assert!(!matches!(&event, AppEvent::Chat(ChatEvent::TextDelta(_))));
+                    if matches!(&event, AppEvent::RoomMessage(_)) {
+                        publications += 1;
+                    }
+                    app.reduce(event);
+                    if !app.turn_active() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("shared Room reply must finish");
+            assert_eq!(publications, 2, "{}", app.transcript());
+            assert_eq!(app.context().id(), &origin);
+            let transcript = app.transcript().to_owned();
+            bridge.shutdown().await.unwrap();
+            transcript
+        } else {
+            let output = workspace.repl("/room vna\n@cashpoint investigate refund\n/quit\n");
+            assert!(output.status.success(), "{}", stderr(&output));
+            stdout(&output)
+        };
+        assert_eq!(
+            transcript.matches("shared refund answer").count(),
+            1,
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains(&format!("[agent:{}] shared refund answer", pay.id)),
+            "{transcript}"
+        );
+        assert!(!transcript.contains("fixture reply"));
+        for name in ["cashpoint", "pay"] {
+            let prompts =
+                std::fs::read_to_string(workspace.root.join(format!("{name}.prompts"))).unwrap();
+            assert_eq!(prompts.lines().count(), 1, "no reactivation of {name}");
+        }
+        assert!(!workspace.root.join("idle.prompts").exists());
+        let store = SqliteStore::open(&workspace.database).unwrap();
+        let messages = store.list_recent_room_messages(room.id, 20).unwrap().0;
+        assert_eq!(messages.len(), 3);
+        let request = messages
+            .iter()
+            .find(|m| m.sender_id == cashpoint.id.to_string())
+            .unwrap();
+        let reply = messages
+            .iter()
+            .find(|m| m.sender_id == pay.id.to_string())
+            .unwrap();
+        assert_eq!(request.mentions, vec![pay.id]);
+        assert_eq!(reply.sender_type, MemberType::Agent);
+        assert_eq!(reply.room_id, room.id);
+        assert_eq!(reply.reply_to, Some(request.id));
+        assert_eq!(reply.body, "shared refund answer");
+        assert!(reply.mentions.is_empty());
+        assert!(
+            store
+                .list_recent_room_messages(other_room.id, 20)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let activations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM room_message_activations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(activations, 2);
+        for table in ["conversations", "messages", "work_items"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+    }
 }
 
 #[tokio::test]

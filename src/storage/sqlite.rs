@@ -962,11 +962,6 @@ impl SqliteStore {
         if !active {
             return Err(StoreError::RoomPublicationUnavailable);
         }
-        if request.targets.is_empty() {
-            return Err(StoreError::InvalidRoomMessageRequest(
-                "targets must not be empty",
-            ));
-        }
         if request
             .request_id
             .as_ref()
@@ -4776,6 +4771,38 @@ mod tests {
         assert_eq!(sent.sender_id, agents[0].id.to_string());
         assert_eq!(sent.room_id, room.id);
         assert_eq!(sent.mentions, vec![agents[1].id]);
+        let shared_request = SendRoomMessage {
+            targets: vec![],
+            request_id: Some("shared-answer".into()),
+            ..request.clone()
+        };
+        let shared = store
+            .send_agent_room_message(trigger.id, agents[0].id, &shared_request, "now", &alive)
+            .unwrap();
+        assert_eq!(shared.sender_type, MemberType::Agent);
+        assert_eq!(shared.sender_id, agents[0].id.to_string());
+        assert_eq!(shared.room_id, room.id);
+        assert_eq!(shared.reply_to, Some(trigger.id));
+        assert!(shared.mentions.is_empty());
+        assert_eq!(
+            store
+                .send_agent_room_message(trigger.id, agents[0].id, &shared_request, "later", &alive)
+                .unwrap(),
+            shared
+        );
+        assert!(matches!(
+            store.send_agent_room_message(
+                trigger.id,
+                agents[0].id,
+                &SendRoomMessage {
+                    body: "conflicting".into(),
+                    ..shared_request.clone()
+                },
+                "later",
+                &alive
+            ),
+            Err(StoreError::RoomPublicationConflict)
+        ));
         assert_eq!(
             store
                 .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
@@ -4812,6 +4839,7 @@ mod tests {
         store
             .remove_room_member(room.id, agents[0].id, "later")
             .unwrap();
+        request = shared_request;
         assert!(
             store
                 .send_agent_room_message(trigger.id, agents[0].id, &request, "later", &alive)
@@ -4841,7 +4869,7 @@ mod tests {
                 .unwrap()
                 .0
                 .len(),
-            2
+            3
         );
     }
 

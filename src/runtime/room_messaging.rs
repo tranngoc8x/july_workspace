@@ -167,7 +167,7 @@ fn parse_arguments(value: &Value) -> Result<SendRoomMessage, String> {
 }
 
 fn tool() -> Value {
-    json!({"name":"send_room_message","description":"Publish a shared message in the current Room to named Room agents. This saves the message; July routes named recipients. Use request_id to safely retry the same message.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1}},"required":["targets","body"],"additionalProperties":false}})
+    json!({"name":"send_room_message","description":"Publish an explicit shared message in the current Room. Use targets=[] to answer the Room without waking agents; name Room agents only when requesting their attention. Set reply_to to the message being answered. Private runtime output is not published. Use request_id to safely retry the same message.","inputSchema":{"type":"object","properties":{"targets":{"type":"array","minItems":0,"items":{"type":"string","minLength":1}},"body":{"type":"string","minLength":1},"reply_to":{"type":"string"},"request_id":{"type":"string","minLength":1}},"required":["targets","body"],"additionalProperties":false}})
 }
 
 async fn publish(arguments: &Value) -> Result<Value, String> {
