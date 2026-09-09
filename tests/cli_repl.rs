@@ -3419,3 +3419,157 @@ async fn room_a2a_stalled_recipient_does_not_hide_sender_permission_and_can_be_c
     assert!(!workspace.root.join("slow.prompts").exists());
     assert!(!workspace.root.join("idle.prompts").exists());
 }
+
+#[test]
+fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let fixture = workspace.root.join("room_restart.py");
+    let marker = "        if \"--room-mcp\" in sys.argv:";
+    let hook = r#"        role = os.environ["ROOM_TEST_ROLE"]
+        content = message["params"]["prompt"][0]["text"]
+        current = content.split("Current message:\nMessage: ", 1)[1]
+        trigger = current.split("\n", 1)[0]
+        recovered = "Recovered shared Room context." in content
+        args = {
+            "targets": ["pay"] if role == "cashpoint" else [],
+            "body": "delegated restart contract" if role == "cashpoint" else ("recovered shared answer" if recovered else "initial shared answer"),
+            "reply_to": trigger,
+            "request_id": "stable-publication",
+        }
+        if role == "cashpoint":
+            args["work"] = {"action": "create", "title": "Restart contract", "goal": "Keep task identity"}
+        config = dict(room_configs[session_id][0])
+        config["command"] = os.environ["ROOM_TEST_JULY"]
+        results = call_room_mcp(config, [args, args])
+        assert results[2]["result"]["isError"] is False, results
+        assert results[2]["result"] == results[3]["result"], results
+"#;
+    std::fs::write(
+        &fixture,
+        include_str!("fixtures/acp_agent.py").replace(marker, &format!("{hook}{marker}")),
+    )
+    .unwrap();
+    let connection = Connection::open(&workspace.database).unwrap();
+    for agent in [&cashpoint, &pay] {
+        workspace.add_member(&room, agent);
+        let mut config = agent.transport_config.clone();
+        config["arguments"][0] = json!(fixture);
+        config["environment"] = json!({
+            "ROOM_TEST_ROLE": agent.name,
+            "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
+            "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
+        });
+        connection
+            .execute(
+                "UPDATE agents SET transport_config_json=?1 WHERE id=?2",
+                [config.to_string(), agent.id.to_string()],
+            )
+            .unwrap();
+    }
+    let first = workspace.repl("/room vna\n@cashpoint start contract\n/quit\n");
+    assert!(
+        first.status.success() && stderr(&first).is_empty(),
+        "{}",
+        stderr(&first)
+    );
+    assert_eq!(stdout(&first).matches("initial shared answer").count(), 1);
+    assert!(!stdout(&first).contains("fixture reply"));
+    let before = SqliteStore::open(&workspace.database).unwrap();
+    let messages = before.list_recent_room_messages(room.id, 20).unwrap().0;
+    assert_eq!(messages.len(), 3);
+    let delegation = messages
+        .iter()
+        .find(|m| m.body == "delegated restart contract")
+        .unwrap();
+    let shared = before
+        .get_room_message_work(delegation.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(shared.work.owner_agent_id, Some(pay.id));
+    let first_binding = before
+        .get_room_session_binding(room.id, pay.id)
+        .unwrap()
+        .unwrap();
+    drop(before);
+
+    let second = workspace.repl("/room vna\n@pay continue existing contract\n/quit\n");
+    assert!(
+        second.status.success() && stderr(&second).is_empty(),
+        "{}",
+        stderr(&second)
+    );
+    let transcript = stdout(&second);
+    assert_eq!(
+        transcript.matches("recovered shared answer").count(),
+        1,
+        "{transcript}"
+    );
+    assert!(!transcript.contains("fixture reply"));
+    let after = SqliteStore::open(&workspace.database).unwrap();
+    let current = after.get_room_message_work(delegation.id).unwrap().unwrap();
+    assert_eq!(current.work, shared.work);
+    assert_eq!(current.binding, shared.binding);
+    let replacement = after
+        .get_room_session_binding(room.id, pay.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement.generation, first_binding.generation + 1);
+    assert_ne!(replacement.id, first_binding.id);
+    let messages = after.list_recent_room_messages(room.id, 20).unwrap().0;
+    assert_eq!(messages.len(), 5);
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m.body == "delegated restart contract")
+            .count(),
+        1
+    );
+    let answer = messages
+        .iter()
+        .find(|m| m.body == "recovered shared answer")
+        .unwrap();
+    assert_eq!(answer.sender_id, pay.id.to_string());
+    assert_eq!(
+        answer.reply_to,
+        Some(
+            messages
+                .iter()
+                .find(|m| m.body.contains("continue existing contract"))
+                .unwrap()
+                .id
+        )
+    );
+    for table in ["work_items", "room_a2a_task_bindings"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "{table}");
+    }
+    for table in ["messages", "conversations"] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    let prompts = std::fs::read_to_string(workspace.root.join("pay.prompts")).unwrap();
+    let prompts: Vec<String> = prompts
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert!(!prompts[0].contains("Recovered shared Room context."));
+    assert!(prompts[1].contains("Recovered shared Room context."));
+    assert!(prompts[1].contains(&format!("Unfinished Work: {}", shared.work.id)));
+    assert!(prompts[1].contains(&format!("A2A Task: {}", shared.binding.task_id)));
+    assert!(!prompts[1].contains("fixture reply"));
+    assert_eq!(
+        std::fs::read_to_string(workspace.root.join("cashpoint.prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}

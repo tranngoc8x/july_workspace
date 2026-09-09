@@ -1,3 +1,4 @@
+mod room_recovery;
 mod room_work;
 use super::{StoreError, records};
 use crate::application::FailedMessageDelivery;
@@ -14,6 +15,7 @@ use crate::domain::{
     SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
     WorkStatus,
 };
+pub(crate) use room_recovery::RoomRecoveryContext;
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1208,7 +1210,7 @@ impl SqliteStore {
         )? == 1)
     }
 
-    pub(crate) fn reconcile_pending_deliveries(
+    pub(crate) fn reconcile_interrupted_runtime(
         &mut self,
         failed_at: &str,
     ) -> Result<(), StoreError> {
@@ -1221,6 +1223,12 @@ impl SqliteStore {
              WHERE status = 'pending'",
             params![failed_at],
         )?;
+        // A stopped Room turn may have reached ACP. Retire its session rather than resend it.
+        transaction.execute("UPDATE session_bindings SET status='lost', last_used_at=?1
+            WHERE room_id IS NOT NULL AND status IN ('active','disconnected')
+            AND EXISTS(SELECT 1 FROM room_message_activations a WHERE a.session_binding_id=session_bindings.id AND a.status IN ('claimed','sent'))", params![failed_at])?;
+        transaction.execute("UPDATE room_message_activations SET status='failed',updated_at=?1 WHERE status IN ('claimed','sent')", params![failed_at])?;
+        transaction.execute("UPDATE session_bindings SET status='disconnected',last_used_at=?1 WHERE room_id IS NOT NULL AND status='active'", params![failed_at])?;
         transaction.commit()?;
         Ok(())
     }
@@ -2472,13 +2480,11 @@ impl SqliteStore {
              FROM session_bindings WHERE room_id = ?1 AND agent_id = ?2 ORDER BY generation DESC LIMIT 1",
             params![message.room_id.to_string(), agent_id.to_string()], records::room_session_binding)?;
         let binding = match binding {
-            Some(binding)
-                if matches!(
-                    binding.status,
-                    SessionBindingStatus::Lost | SessionBindingStatus::Closed
-                ) =>
-            {
+            Some(binding) if binding.status == SessionBindingStatus::Closed => {
                 return Err(StoreError::RoomSessionUnavailable(binding.id));
+            }
+            Some(binding) if binding.status == SessionBindingStatus::Lost => {
+                room_recovery::replacement_binding(&transaction, &binding, activated_at)?
             }
             Some(binding) => binding,
             None => {
@@ -2704,7 +2710,10 @@ impl SqliteStore {
         last_used_at: &str,
     ) -> Result<bool, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE session_bindings SET status = ?1, last_used_at = ?2 WHERE id = ?3",
+            "UPDATE session_bindings
+             SET status = CASE WHEN status = 'closed' THEN status ELSE ?1 END,
+                 last_used_at = CASE WHEN status = 'closed' THEN last_used_at ELSE ?2 END
+             WHERE id = ?3",
             params![status.to_string(), last_used_at, id.to_string()],
         )? != 0)
     }
