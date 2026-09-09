@@ -111,6 +111,12 @@ impl<T: AgentTransport> SessionManager<T> {
         };
         self.room_messaging.insert(binding.id, scope);
         let mut content = format!("Room: {}\n", message.room_id);
+        content.push_str(
+            "Publish answers intended for this Room with send_room_message before finishing the turn. \
+             Use targets=[] for a shared answer without waking agents; name Room agents only when requesting their attention. \
+             Set reply_to to the Current message ID and reuse request_id when retrying the same publication. \
+             Private runtime output is not published; do not include reasoning or tool traces in shared messages.\n",
+        );
         if truncated {
             content.push_str(
                 "Older unseen Room messages omitted: context limited to 50 preceding messages.\n",

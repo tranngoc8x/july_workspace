@@ -1146,6 +1146,12 @@ async fn room_cursor_delivers_bounded_context_and_advances_only_after_completion
         .unwrap();
     let content = observed.lock().unwrap().messages[0].content.clone();
     assert!(content.contains("shared-context-05"), "{content}");
+    assert!(content.contains("send_room_message"), "{content}");
+    assert!(content.contains("targets=[]"), "{content}");
+    assert!(
+        content.contains("Private runtime output is not published"),
+        "{content}"
+    );
     assert!(!content.contains("shared-context-04"));
     assert!(content.contains("omitted"));
     assert_eq!(content.matches("current-trigger").count(), 1);
