@@ -1,3 +1,4 @@
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, MemberType, Memory, MemoryId, MemoryKind,
     MemoryScopeType, Message, MessageId, ResultId, WorkItem, WorkItemId, WorkResult, WorkStatus,
@@ -203,7 +204,7 @@ async fn raw_message_and_work_result_do_not_create_memory() {
     };
     let work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id: source.id,
+        scope: WorkScope::Conversation(source.id),
         title: "Produce raw result".into(),
         goal: None,
         status: WorkStatus::Open,

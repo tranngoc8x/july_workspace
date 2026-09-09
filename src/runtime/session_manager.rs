@@ -117,6 +117,7 @@ impl<T: AgentTransport> SessionManager<T> {
              Set reply_to to the Current message ID and reuse request_id when retrying the same publication. \
              Private runtime output is not published; do not include reasoning or tool traces in shared messages.\n",
         );
+        content.push_str("For explicit lifecycle-bearing delegation, add work={action:create,title:...,goal:...} to send_room_message with one owner target and request_id. Omit work for questions and ordinary answers. Existing delegation can be referenced with work={action:bind,work_id:...}.\n");
         if truncated {
             content.push_str(
                 "Older unseen Room messages omitted: context limited to 50 preceding messages.\n",
@@ -129,6 +130,21 @@ impl<T: AgentTransport> SessionManager<T> {
         content.push_str("Current message:\n");
         append_room_context_message(&mut content, &message);
         let sent = async {
+            if let Some(shared_work) = self.storage.get_room_message_work(message_id).await? {
+                content.insert_str(
+                    0,
+                    &format!(
+                        "Structured Work: {}\nTitle: {}\nGoal: {}\nA2A Task: {}\nWork status: {}\nOwner: {}\n",
+                        shared_work.work.id,
+                        shared_work.work.title,
+                        shared_work.work.goal.as_deref().unwrap_or(""),
+                        shared_work.binding.task_id,
+                        shared_work.work.status,
+                        shared_work.binding.owner_agent_id
+                    ),
+                );
+            }
+
             self.storage
                 .validate_room_activation(message_id, self.agent_id)
                 .await?;

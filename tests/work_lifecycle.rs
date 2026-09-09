@@ -1,4 +1,5 @@
 use july_workspace::application::{AssignWorkOwner, TransitionWork, WorkError, WorkService};
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, DomainError, Room, RoomId,
     WorkItem, WorkItemId, WorkStatus,
@@ -118,7 +119,7 @@ fn seed(path: &Path) -> Seeded {
     store
         .insert_work_item(&WorkItem {
             id: secondary_work_id,
-            conversation_id: conversation.id,
+            scope: WorkScope::Conversation(conversation.id),
             title: "Secondary work".into(),
             goal: None,
             status: WorkStatus::Open,
@@ -143,7 +144,7 @@ fn seed(path: &Path) -> Seeded {
 fn insert_work(path: &Path, conversation_id: ConversationId, status: WorkStatus) -> WorkItem {
     let work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id,
+        scope: WorkScope::Conversation(conversation_id),
         title: format!("{status} work"),
         goal: None,
         status: WorkStatus::Open,
@@ -251,11 +252,15 @@ fn work_validation_requires_completed_at_exactly_for_terminal_status() {
 fn public_work_insert_accepts_only_open_unowned_non_primary_work() {
     let database = TestDatabase::new();
     let seeded = seed(database.path());
-    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let WorkScope::Conversation(conversation_id) =
+        read_work(database.path(), seeded.primary_work_id).scope
+    else {
+        panic!("expected conversation work")
+    };
     let store = SqliteStore::open(database.path()).unwrap();
     let mut work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id,
+        scope: WorkScope::Conversation(conversation_id),
         title: "Guard public insert".into(),
         goal: None,
         status: WorkStatus::Ready,
@@ -414,7 +419,11 @@ async fn every_directly_allowed_transition_persists_terminal_semantics_and_exact
  {
     let database = TestDatabase::new();
     let seeded = seed(database.path());
-    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let WorkScope::Conversation(conversation_id) =
+        read_work(database.path(), seeded.primary_work_id).scope
+    else {
+        panic!("expected conversation work")
+    };
     let allowed = [
         (WorkStatus::Open, WorkStatus::Working),
         (WorkStatus::Open, WorkStatus::Blocked),
@@ -465,7 +474,11 @@ async fn every_directly_allowed_transition_persists_terminal_semantics_and_exact
 async fn direct_ready_transition_is_rejected_until_result_creation_can_be_atomic() {
     let database = TestDatabase::new();
     let seeded = seed(database.path());
-    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let WorkScope::Conversation(conversation_id) =
+        read_work(database.path(), seeded.primary_work_id).scope
+    else {
+        panic!("expected conversation work")
+    };
     let working = insert_work(database.path(), conversation_id, WorkStatus::Working);
     let mut service = WorkService::new(StorageWorker::open(database.path()).unwrap());
 
@@ -490,7 +503,11 @@ async fn direct_ready_transition_is_rejected_until_result_creation_can_be_atomic
 async fn invalid_transition_and_timestamp_leave_work_unchanged() {
     let database = TestDatabase::new();
     let seeded = seed(database.path());
-    let conversation_id = read_work(database.path(), seeded.primary_work_id).conversation_id;
+    let WorkScope::Conversation(conversation_id) =
+        read_work(database.path(), seeded.primary_work_id).scope
+    else {
+        panic!("expected conversation work")
+    };
     let invalid = [
         (WorkStatus::Open, WorkStatus::Ready),
         (WorkStatus::Working, WorkStatus::Done),

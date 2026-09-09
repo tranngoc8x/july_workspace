@@ -172,7 +172,10 @@ fn a_decision_generates_owned_work_with_its_dependency() {
     assert!(created.iter().all(|work| !work.is_primary));
     assert_eq!(created[0].owner_agent_id, Some(seeded.pay));
     assert_eq!(created[1].owner_agent_id, Some(seeded.cashpoint));
-    assert_eq!(created[0].conversation_id, seeded.thread_id);
+    assert_eq!(
+        created[0].scope,
+        july_workspace::domain::WorkScope::Conversation(seeded.thread_id)
+    );
 
     let dependency = store
         .get_work_dependency(implement.work_id, verify.work_id)

@@ -1,3 +1,4 @@
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, MemberType, Room, RoomId,
     WorkItem, WorkItemId, WorkStatus,
@@ -400,7 +401,7 @@ fn thread_primary_work_creation_is_atomic_and_deduplicates_initial_agents() {
         2
     );
     assert_eq!(work.id, work_id);
-    assert_eq!(work.conversation_id, conversation.id);
+    assert_eq!(work.scope, WorkScope::Conversation(conversation.id));
     assert_eq!(work.title, conversation.title.clone().unwrap());
     assert_eq!(work.goal, conversation.goal);
     assert_eq!(work.status, WorkStatus::Open);
@@ -509,7 +510,7 @@ fn thread_creation_conflicts_and_validation_roll_back_the_entire_aggregate() {
     let occupied_work_id = WorkItemId::new();
     let occupied_work = WorkItem {
         id: occupied_work_id,
-        conversation_id: existing_dm.id,
+        scope: WorkScope::Conversation(existing_dm.id),
         title: "occupied".into(),
         goal: None,
         status: WorkStatus::Open,

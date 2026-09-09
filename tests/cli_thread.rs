@@ -1,3 +1,4 @@
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{Agent, AgentId, ConversationId, WorkItemId};
 use july_workspace::storage::SqliteStore;
 use rusqlite::Connection;
@@ -121,7 +122,7 @@ fn thread_create_and_list_render_durable_ids_for_humans_and_json() {
         .get_work_item(primary_work_id)
         .unwrap()
         .unwrap();
-    assert_eq!(primary_work.conversation_id, thread_id);
+    assert_eq!(primary_work.scope, WorkScope::Conversation(thread_id));
     assert!(primary_work.is_primary);
     assert_eq!(workspace.threads(), 1);
 
@@ -153,7 +154,10 @@ fn thread_create_and_list_render_durable_ids_for_humans_and_json() {
         .get_work_item(json_primary_work_id)
         .unwrap()
         .unwrap();
-    assert_eq!(json_primary_work.conversation_id, json_thread_id);
+    assert_eq!(
+        json_primary_work.scope,
+        WorkScope::Conversation(json_thread_id)
+    );
     assert!(json_primary_work.is_primary);
 
     let listed = workspace.run(&["thread", "list", "--room", &room_id]);

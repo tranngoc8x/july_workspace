@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use july_workspace::application::ChatEvent;
 use july_workspace::cli::InactiveTuiBridge;
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Agent, AgentId, Conversation, ConversationId, ConversationKind, Decision, DecisionId,
     DecisionOwner, DecisionStatus, DecisionType, MemberType, Message, MessageId, ResultId, Room,
@@ -271,7 +272,7 @@ impl TestWorkspace {
     fn seed_result_in(&self, conversation_id: ConversationId) -> ResultId {
         let work = WorkItem {
             id: WorkItemId::new(),
-            conversation_id,
+            scope: WorkScope::Conversation(conversation_id),
             title: "Publish result".into(),
             goal: None,
             status: WorkStatus::Open,
@@ -2950,7 +2951,7 @@ fn room_mcp_stdio_rejects_malformed_requests_and_requires_initialization() {
 
 #[tokio::test]
 async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
-    for tui in [false, true] {
+    for (tui, structured) in [(false, false), (true, false), (false, true), (true, true)] {
         let workspace = TestWorkspace::new();
         let room = workspace.seed_room("vna");
         let other_room = workspace.seed_room("other");
@@ -2966,6 +2967,8 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             "reply_to": trigger,
             "request_id": "shared-reply",
         }
+        if role == "cashpoint" and os.environ["ROOM_TEST_STRUCTURED"] == "true":
+            args["work"] = {"action": "create", "title": "Implement refund contract", "goal": "Return test evidence"}
         config = dict(room_configs[session_id][0])
         config["command"] = os.environ["ROOM_TEST_JULY"]
         results = call_room_mcp(config, [args, args])
@@ -2983,6 +2986,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             config["arguments"][0] = json!(fixture);
             config["environment"] = json!({
                 "ROOM_TEST_ROLE": agent.name,
+                "ROOM_TEST_STRUCTURED": structured.to_string(),
                 "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
                 "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
             });
@@ -3028,7 +3032,11 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             transcript
         } else {
             let output = workspace.repl("/room vna\n@cashpoint investigate refund\n/quit\n");
-            assert!(output.status.success(), "{}", stderr(&output));
+            assert!(
+                output.status.success() && stderr(&output).is_empty(),
+                "structured={structured}: {}",
+                stderr(&output)
+            );
             stdout(&output)
         };
         assert_eq!(
@@ -3071,13 +3079,76 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
                 .0
                 .is_empty()
         );
+        let works: i64 = connection
+            .query_row("SELECT COUNT(*) FROM work_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(works, i64::from(structured));
+        if structured {
+            let (work_id, binding_room, requester, owner): (String, String, String, String) = connection.query_row(
+                "SELECT b.work_id,b.room_id,b.requester_agent_id,b.owner_agent_id FROM room_a2a_task_bindings b JOIN room_message_work m ON m.work_id=b.work_id WHERE m.message_id=?1",
+                [request.id.to_string()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            let work = store
+                .get_work_item(work_id.parse().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(work.scope, WorkScope::Room(room.id));
+            assert_eq!(work.owner_agent_id, Some(pay.id));
+            assert_eq!(binding_room, room.id.to_string());
+            assert_eq!(requester, cashpoint.id.to_string());
+            assert_eq!(owner, pay.id.to_string());
+            let prompts = std::fs::read_to_string(workspace.root.join("pay.prompts")).unwrap();
+            assert!(prompts.contains(&work_id));
+            assert!(prompts.contains("Implement refund contract"));
+            assert!(prompts.contains("Return test evidence"));
+            let mut worker =
+                july_workspace::runtime::StorageWorker::open(&workspace.database).unwrap();
+            let wire = worker
+                .prepare_room_a2a_message(request.id, pay.id)
+                .await
+                .unwrap();
+            let task = worker
+                .prepare_room_a2a_task(request.id, pay.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task["kind"], "task");
+            assert_eq!(task["status"]["state"], "submitted");
+            assert_eq!(task["id"], wire["taskId"]);
+            assert_eq!(wire["metadata"]["july.work_id"], work_id);
+            assert_eq!(
+                worker
+                    .receive_room_a2a_message(pay.id, &wire)
+                    .await
+                    .unwrap()
+                    .message
+                    .id,
+                request.id
+            );
+            for pointer in ["/taskId", "/metadata/july.work_id"] {
+                let mut forged = wire.clone();
+                *forged.pointer_mut(pointer).unwrap() = json!("forged");
+                assert!(
+                    worker
+                        .receive_room_a2a_message(pay.id, &forged)
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(
+                worker
+                    .receive_room_a2a_message(idle.id, &wire)
+                    .await
+                    .is_err()
+            );
+            worker.shutdown().await.unwrap();
+        }
         let activations: i64 = connection
             .query_row("SELECT COUNT(*) FROM room_message_activations", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(activations, 2);
-        for table in ["conversations", "messages", "work_items"] {
+        for table in ["conversations", "messages"] {
             let count: i64 = connection
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)

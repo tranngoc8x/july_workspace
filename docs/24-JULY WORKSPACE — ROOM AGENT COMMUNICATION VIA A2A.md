@@ -1330,6 +1330,14 @@ A2A Task binding
 
 Simple conversation không tạo Work.
 
+Implementation (Phase 9):
+
+- `WorkItem.scope` is one `WorkScope::Conversation` or `WorkScope::Room`; Room Work does not create a Thread.
+- `send_room_message` accepts optional `work`: `{"action":"create","title":"...","goal":"..."}` or `{"action":"bind","work_id":"..."}`. Structured delegation requires `request_id` and exactly one owner target. Omit `work` for chat.
+- Message, Work, task binding, and retry intent commit atomically. The authenticated sender becomes requester. Existing bindings can be referenced by their requester; only the owner can first bind previously unbound Room Work. Bound task scope and owner remain fixed.
+- A2A message correlation carries `taskId` and July Work ID. Task snapshots derive status and artifacts from canonical Work/Result through existing Work APIs; ACP turn completion does not complete Work. `ready` remains nonterminal until July accepts it as `done`. Blocked Work retains its exact July status in metadata without claiming user input is required.
+- This is a pre-release schema replacement: use a fresh workspace database. Old Work schema is rejected without converting or deleting data; no legacy compatibility layer is maintained.
+
 ---
 
 ## Phase 10 — Recovery

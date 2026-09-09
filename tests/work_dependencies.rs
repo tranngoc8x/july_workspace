@@ -2,6 +2,7 @@ use july_workspace::application::{
     AddWorkDependency, CreateWorkResult, DependencyError, DependencyOutcome, DependencyService,
     TransitionWork, WorkError, WorkService,
 };
+use july_workspace::domain::WorkScope;
 use july_workspace::domain::{
     Conversation, ConversationId, ConversationKind, DependencyStatus, MemberType, Message,
     MessageId, ResultId, WorkDependency, WorkItem, WorkItemId, WorkResult, WorkStatus,
@@ -59,7 +60,7 @@ fn seed_work_with_status(store: &mut SqliteStore, title: &str, status: WorkStatu
     };
     let work = WorkItem {
         id: WorkItemId::new(),
-        conversation_id: conversation.id,
+        scope: WorkScope::Conversation(conversation.id),
         title: title.into(),
         goal: None,
         status: WorkStatus::Open,
@@ -253,7 +254,10 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
         let messages = [
             Message {
                 id: MessageId::new(),
-                conversation_id: downstream.conversation_id,
+                conversation_id: (match downstream.scope {
+                    WorkScope::Conversation(id) => id,
+                    _ => panic!("expected conversation"),
+                }),
                 sender_type: MemberType::User,
                 sender_id: "tony".into(),
                 body: "consumer transcript".into(),
@@ -263,7 +267,10 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
             },
             Message {
                 id: MessageId::new(),
-                conversation_id: unrelated_downstream.conversation_id,
+                conversation_id: (match unrelated_downstream.scope {
+                    WorkScope::Conversation(id) => id,
+                    _ => panic!("expected conversation"),
+                }),
                 sender_type: MemberType::User,
                 sender_id: "tony".into(),
                 body: "unrelated transcript".into(),
@@ -318,12 +325,20 @@ async fn ready_satisfies_only_outgoing_edges_with_result_reference_without_consu
     }
     let store = SqliteStore::open(database.path()).unwrap();
     assert_eq!(
-        store.list_messages(downstream.conversation_id).unwrap(),
+        store
+            .list_messages(match downstream.scope {
+                WorkScope::Conversation(id) => id,
+                _ => panic!("expected conversation"),
+            })
+            .unwrap(),
         vec![messages[0].clone()]
     );
     assert_eq!(
         store
-            .list_messages(unrelated_downstream.conversation_id)
+            .list_messages(match unrelated_downstream.scope {
+                WorkScope::Conversation(id) => id,
+                _ => panic!("expected conversation"),
+            })
             .unwrap(),
         vec![messages[1].clone()]
     );
