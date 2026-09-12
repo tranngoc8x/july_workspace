@@ -1,5 +1,11 @@
 # JULY WORKSPACE — AGENT INTEROPERABILITY PREPARATION PLAN
 
+> Historical preparation plan. Its reusable identity, Work, runtime binding and
+> recovery boundaries remain relevant. [Room agent communication via A2A](<24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>) supersedes all A2A-as-runtime
+> adapter examples, external-first goals and future adapter acceptance below.
+> ACP executes runtimes; A2A is a separate Room communication layer. The earlier
+> “do not implement A2A” restriction applies to this preparation slice only.
+
 ## 1. Mục tiêu
 
 Chuẩn bị architecture hiện tại để tương lai có thể thêm A2A hoặc protocol khác mà không phải rewrite Task Manager.

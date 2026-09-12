@@ -8,7 +8,7 @@ Refactor July's command surface so that:
 - application APIs remain the complete domain interface;
 - the REPL does not become an orchestration layer;
 - agents communicate through the collaboration protocol rather than user-facing commands;
-- the design remains compatible with future ACP/A2A transports;
+- the design remains compatible with ACP runtime execution and separate A2A Room communication;
 - existing Phase 1–9 + Phase 6.5 behavior is preserved.
 
 Core principle:
@@ -615,19 +615,11 @@ terminal pane/tab ID
 
 Runtime-specific connection details belong below the Agent Gateway / adapter boundary.
 
-### Future A2A onboarding
+### A2A scope
 
-Do not implement A2A onboarding as part of this consolidation.
-
-Future external agents may eventually use an administrative form such as:
-
-```text
-july agent add external-pay --adapter a2a ...
-```
-
-but the exact external-agent syntax belongs to the A2A interoperability plan.
-
-The current command plan only needs to preserve the abstraction so `/agents`, `/dm`, Room membership, and Thread collaboration do not depend on whether an agent is internal ACP/native or future external A2A.
+[Room agent communication via A2A](<24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>) governs A2A. July-managed Room agents are the primary target;
+external onboarding and its CLI syntax are deferred. Preserve logical agent
+identity while keeping ACP runtime execution separate from A2A communication.
 
 ---
 
@@ -648,7 +640,7 @@ Work
 Result
 ```
 
-Transport belongs below the collaboration layer:
+Runtime execution and agent communication have separate responsibilities:
 
 ```text
 Slash Command
@@ -657,10 +649,9 @@ Workspace API
       ↓
 Collaboration
       ↓
-Agent Gateway
-      ├── ACP
-      ├── A2A
-      └── future transport
+July Room bridge → A2A → target logical Agent
+                              ↓
+                       runtime gateway → ACP
 ```
 
 ---
@@ -1218,7 +1209,7 @@ with:
 8. Control Commands
 9. Administrative CLI
 10. Agent Onboarding
-11. Future A2A / Agent Transport
+11. Room A2A communication / ACP runtime execution
 ```
 
 Explicitly document:
@@ -1336,12 +1327,7 @@ collaboration protocol
 Pay
 ```
 
-Future transport can be:
-
-```text
-ACP / A2A / other
-```
-
+ACP executes the runtime; the A2A bridge carries Room interactions
 without changing the user-facing command model.
 
 The intended result is:

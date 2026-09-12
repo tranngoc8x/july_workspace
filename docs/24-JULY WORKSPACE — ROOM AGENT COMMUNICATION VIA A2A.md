@@ -1374,6 +1374,21 @@ Thread-required A2A flows
 
 Không xóa code reusable như mapping/normalization nếu có thể move sang communication layer.
 
+Implementation (Phase 11): README and architecture/command documentation describe
+A2A as Room communication and ACP as runtime execution. The older preparation
+plan is explicitly historical. Internal A2A Message/Task mappings remain reusable;
+there is no external A2A runtime to remove. The CLI test rejecting A2A as a runtime
+configuration remains a boundary check. Existing Thread features are separate
+from the Room flow and are not removed by this phase.
+
+The deterministic acceptance test is
+`tests/cli_repl.rs::room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room`.
+It runs the July CLI with ACP/MCP subprocess fixtures: both mentioned agents
+publish initial replies, cashpoint asks pay, pay replies to cashpoint, and a
+final untargeted publication ends the exchange. It checks shared output,
+session reuse, idle-member isolation and no Conversation/Work creation.
+This verifies local protocol integration, not a live Codex/Claude provider run.
+
 ---
 
 # 32. Required tests

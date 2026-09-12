@@ -15,7 +15,7 @@ Instead of putting another supervisor LLM in front of Claude, Codex, or other co
 - session recovery;
 - durable local state;
 - runtime-independent agent identity;
-- future interoperability with external agents through A2A.
+- Room-scoped communication between July-managed agents through A2A.
 
 July is intended for developers who work across multiple repositories and want coding agents to behave more like a persistent engineering team rather than isolated chat sessions.
 
@@ -337,13 +337,12 @@ July
   ↓
 Agent Gateway
   ├── ACP
-  ├── native / SDK adapters
-  └── A2A
+  └── native / SDK adapters (future)
 ```
 
 The core workspace should not depend on provider-specific session IDs or runtime details.
 
-A2A support is intended to live at this adapter boundary rather than becoming July's internal task model.
+ACP executes agent runtimes. A2A carries agent-to-agent interactions inside a Room through July’s collaboration bridge. RoomMessage and July Work remain canonical.
 
 ---
 
@@ -429,7 +428,7 @@ src/
 ├── application/     use cases and application services
 ├── storage/         SQLite persistence
 ├── runtime/         agent sessions and lifecycle
-├── adapters/        ACP / future A2A / runtime integrations
+├── adapters/        ACP / runtime integrations
 ├── collaboration/   Work, Result, Decision, Dependency flows
 ├── commands/        CLI / REPL command handling
 └── main.rs          application entry point
@@ -526,21 +525,23 @@ finite command / --json      unchanged CLI output
 The TUI deliberately has no mouse workflow, theme/plugin system, syntax
 highlighting, daemon, new command grammar or transcript replay.
 
-The next major interoperability area is **A2A**.
-
-A2A is intended to work as an external agent adapter:
+Room collaboration follows [Room agent communication via A2A](<docs/24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>).
 
 ```text
-July Task
-   ↓
-Agent Gateway
-   ↓
-A2A Adapter
-   ↓
-External A2A Agent
+RoomMessage → July Room bridge → A2A → target logical Agent
+                                           ↓ ACP
+                                     coding-agent runtime
 ```
 
-July's own task and collaboration state remains canonical.
+Explicit mentions activate only Room members. Agents publish shared replies
+through the Room messaging tool; private runtime transcripts stay isolated.
+Plain conversation requires no Thread or Work. Structured requests can attach
+canonical Work and Results, with A2A Task IDs stored as bindings.
+
+After restart, a new explicit message resumes or replaces the ACP session with
+bounded shared context. Interrupted messages are not automatically resent.
+External agents, cross-Room routing and agent-agent DM remain deferred.
+See the [implementation roadmap](docs/11-IMPLEMENTATION-ROADMAP.md) for validation status.
 
 ---
 

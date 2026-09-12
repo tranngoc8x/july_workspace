@@ -1,5 +1,16 @@
 # July Workspace — Architecture
 
+> Room collaboration architecture: [Room agent communication via A2A](<24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>) supersedes older external-first A2A assumptions.
+> July is a shared workspace where project agents collaborate like teammates
+> inside Rooms. Rooms own shared human-visible conversation; mentions determine
+> attention and routing. A2A carries agent-to-agent interactions; ACP runs each
+> agent runtime. July bridges identity, routing, persistence, recovery and Room
+> membership without acting as a supervisor brain. Agents may communicate only
+> within a shared Room. Shared messages and explicit Results/Artifacts may cross
+> agent boundaries; private runtime transcripts do not.
+>
+> See docs/11 for implementation and verification status.
+
 ## 1. System overview
 
 ```text

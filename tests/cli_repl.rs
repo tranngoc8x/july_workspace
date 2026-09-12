@@ -3573,3 +3573,152 @@ fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
         1
     );
 }
+
+#[test]
+fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let fixture = workspace.root.join("room_complete_demo.py");
+    let source = include_str!("fixtures/acp_agent.py");
+    let marker = "        if \"--room-mcp\" in sys.argv:";
+    assert!(source.contains(marker));
+    let hook = r#"        role = os.environ["ROOM_TEST_ROLE"]
+        gate = Path(os.environ["ROOM_TEST_GATE"])
+        content = message["params"]["prompt"][0]["text"]
+        trigger = content.split("Current message:\nMessage: ", 1)[1].split("\n", 1)[0]
+        config = dict(room_configs[session_id][0])
+        config["command"] = os.environ["ROOM_TEST_JULY"]
+        def publish(body, targets, key):
+            args = {"body": body, "targets": targets, "reply_to": trigger, "request_id": key}
+            results = call_room_mcp(config, [args, args])
+            assert results[2]["result"]["isError"] is False, results
+            assert results[2]["result"] == results[3]["result"], results
+        initial = gate / (role + "-initial")
+        if not initial.exists():
+            publish(role + " initial public reply", [], "initial")
+            initial.write_text("published")
+            if role == "cashpoint":
+                deadline = time.monotonic() + 10
+                while not (gate / "pay-initial").exists():
+                    assert time.monotonic() < deadline, "pay initial reply"
+                    time.sleep(0.005)
+                publish("Is payment_ref the payment identifier?", ["pay"], "question")
+        elif role == "pay":
+            publish("Use reference_id for the payment identifier.", ["cashpoint"], "answer")
+        elif role == "cashpoint":
+            publish("Confirmed: cashpoint will use reference_id.", [], "final")
+        else:
+            raise AssertionError("idle agent must not activate")
+"#;
+    std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
+    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
+    let connection = Connection::open(&workspace.database).unwrap();
+    for agent in [&cashpoint, &pay, &idle] {
+        workspace.add_member(&room, agent);
+        let mut config = agent.transport_config.clone();
+        config["arguments"][0] = json!(fixture);
+        config["environment"] = json!({
+            "ROOM_TEST_ROLE": agent.name,
+            "ROOM_TEST_JULY": env!("CARGO_BIN_EXE_july"),
+            "ROOM_TEST_GATE": workspace.root,
+            "ACP_PROMPT_LOG": workspace.root.join(format!("{}.prompts", agent.name)),
+        });
+        connection
+            .execute(
+                "UPDATE agents SET transport_config_json = ?1 WHERE id = ?2",
+                [config.to_string(), agent.id.to_string()],
+            )
+            .unwrap();
+    }
+    let output = workspace.repl("/room vna\n@cashpoint @pay review payment contract\n/quit\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let transcript = stdout(&output);
+    assert!(!transcript.contains("fixture reply"), "{transcript}");
+    let store = SqliteStore::open(&workspace.database).unwrap();
+    let messages = store.list_recent_room_messages(room.id, 20).unwrap().0;
+    assert_eq!(messages.len(), 6, "{transcript}");
+    assert_eq!(messages[0].sender_type, MemberType::User);
+    assert_eq!(messages[0].mentions, vec![cashpoint.id, pay.id]);
+    for message in &messages[1..] {
+        assert_eq!(message.room_id, room.id);
+        assert_eq!(message.sender_type, MemberType::Agent);
+        assert_eq!(transcript.matches(&message.body).count(), 1, "{transcript}");
+        assert!(!message.body.contains("fixture reply"));
+    }
+    for agent in [&cashpoint, &pay] {
+        let initial = messages[1..3]
+            .iter()
+            .find(|m| m.sender_id == agent.id.to_string())
+            .unwrap();
+        assert_eq!(initial.body, format!("{} initial public reply", agent.name));
+        assert!(initial.mentions.is_empty());
+        assert_eq!(initial.reply_to, Some(messages[0].id));
+        let prompts =
+            std::fs::read_to_string(workspace.root.join(format!("{}.prompts", agent.name)))
+                .unwrap();
+        let prompts: Vec<String> = prompts
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(prompts.len(), 2, "{} prompts", agent.name);
+        let received = if agent.id == pay.id {
+            &messages[3]
+        } else {
+            &messages[4]
+        };
+        let current = prompts[1].split_once("Current message:\n").unwrap().1;
+        assert!(current.contains(&format!("Message: {}", received.id)));
+        assert!(current.contains(&received.body), "{current}");
+        assert!(!prompts[1].contains("fixture reply"));
+        let bindings: (i64, i64, i64) = connection.query_row(
+            "SELECT COUNT(*), MIN(generation), MAX(generation) FROM session_bindings WHERE agent_id = ?1",
+            [agent.id.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(
+            bindings,
+            (1, 1, 1),
+            "{} must reuse its Room session",
+            agent.name
+        );
+    }
+    let question = &messages[3];
+    assert_eq!(question.body, "Is payment_ref the payment identifier?");
+    assert_eq!(question.sender_id, cashpoint.id.to_string());
+    assert_eq!(question.mentions, vec![pay.id]);
+    let answer = &messages[4];
+    assert_eq!(answer.body, "Use reference_id for the payment identifier.");
+    assert_eq!(answer.sender_id, pay.id.to_string());
+    assert_eq!(answer.mentions, vec![cashpoint.id]);
+    assert_eq!(answer.reply_to, Some(question.id));
+    let final_reply = &messages[5];
+    assert_eq!(
+        final_reply.body,
+        "Confirmed: cashpoint will use reference_id."
+    );
+    assert_eq!(final_reply.sender_id, cashpoint.id.to_string());
+    assert_eq!(final_reply.reply_to, Some(answer.id));
+    assert!(final_reply.mentions.is_empty());
+    assert!(!workspace.root.join("idle.prompts").exists());
+    let activations: (i64, i64) = connection
+        .query_row(
+            "SELECT COUNT(*), SUM(status = 'completed') FROM room_message_activations",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(activations, (4, 4));
+    for table in [
+        "conversations",
+        "messages",
+        "work_items",
+        "room_a2a_task_bindings",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "Q&A must not create {table}");
+    }
+}
