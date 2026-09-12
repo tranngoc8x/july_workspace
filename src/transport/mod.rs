@@ -1,4 +1,4 @@
-//! Transport boundary for external agent protocol implementations.
+//! ACP runtime transport and internal A2A Room communication mappings.
 
 pub mod a2a;
 mod acp;

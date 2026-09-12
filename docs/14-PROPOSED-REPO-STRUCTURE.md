@@ -135,9 +135,11 @@ Owns:
 
 ### `transport/`
 
-External agent protocol boundary.
+ACP runtime transport and internal A2A Room communication mappings.
 
-`acp.rs` is the only initial implementation.
+`acp.rs` executes coding-agent runtimes; `a2a.rs` maps shared Room messages
+and structured Work to the internal communication profile. A2A is not a
+runtime adapter. See [the active A2A plan](<24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>).
 Raw ACP SDK types must not escape this module into the domain.
 
 ### `storage/`

@@ -21,7 +21,7 @@ pub mod tui;
 /// Long-lived process and session lifecycle ownership.
 pub mod runtime;
 
-/// Boundary for external agent protocols and adapters.
+/// ACP runtime transport and internal A2A Room communication mappings.
 pub mod transport;
 
 /// Boundary for durable workspace state and persistence implementations.

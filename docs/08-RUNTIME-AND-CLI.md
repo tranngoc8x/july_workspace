@@ -348,15 +348,14 @@ exposes only the common interactive operations. The two surfaces do not need
 identical command sets; the application layer remains the authoritative domain
 API, and a command is not removed merely because the REPL does not expose it.
 
-### Future agent transport
+### Runtime and Room communication
 
-The command layer operates on July concepts — Conversation, Room, Thread,
-Agent, Work, Result — and never on ACP, A2A, Codex, Claude Code or a terminal
-tool. Transport lives below the collaboration layer, behind the Agent Gateway,
-so `/agents`, `/dm`, Room membership and Thread collaboration do not depend on
-whether an agent is internal or external. No transport-specific slash command
-exists, and external-agent onboarding syntax belongs to the A2A
-interoperability plan, not here.
+The command layer operates on July concepts, not protocol or provider details.
+ACP remains the runtime execution boundary. Under [Room agent communication via A2A](<24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>), A2A carries
+interactions between July-managed agents in the same Room through July’s bridge.
+It is not an alternative runtime adapter. No protocol-specific slash command,
+Thread or Work is required for the Room chat flow. External onboarding
+is deferred beyond this plan. See docs/11 for the implementation status.
 
 Switching shell context must not merge underlying LLM session histories. Only
 the top descriptor is live; a cold descriptor holds no transcript or model

@@ -548,10 +548,10 @@ Work item. These commands reuse the existing Decision and Work transactions.
 This slice adds no voting, scoring, semantic facilitator, automatic debate,
 schema, Room chat or A2A behavior.
 
-## Future phase — Room agent communication via A2A
+## A2A program — Room agent communication via A2A
 
-Status: deferred. It is not part of the current supplemental-feature phase and
-must not resume until explicitly scheduled.
+Status: Phases 1–11 implemented and verified with deterministic local tests.
+This is a separate A2A program from the non-A2A supplemental slices.
 
 The active design is
 `docs/24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md`:
@@ -565,10 +565,19 @@ The active design is
 - simple chat does not require Thread or Work;
 - external agents, cross-Room messaging and agent-agent DM are deferred.
 
-Future implementation order: audit, durable Room chat, mention routing, incremental
+Implementation order: audit, durable Room chat, mention routing, incremental
 Room cursors, agent-facing messaging, internal A2A bridge, ACP recipient
 delivery, shared-response normalization, structured Work integration,
 recovery, then cleanup of the obsolete external-first direction.
+
+Tracking: `JULY_WORKSPACE-sca.1` owns the eleven phases, including shared
+publication, structured Work/A2A Task bindings, restart recovery and cleanup.
+The full docs/24 Room demo is covered by
+`tests/cli_repl.rs::room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room`;
+the two-process restart regression is
+`room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work` in the
+same file. These use the July CLI and ACP/MCP subprocess fixtures, not live
+Codex/Claude provider runs. The acceptance contract remains docs/24 sections 32–34.
 
 `JULY_WORKSPACE-sca.5` is required only before structured Work integration;
 the human Decision inbox is not a prerequisite for Room chat.
