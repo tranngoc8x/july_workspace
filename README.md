@@ -1,10 +1,14 @@
 # July Workspace
 
-**July Workspace** is a local-first workspace for working with multiple persistent coding agents across multiple projects.
+> **Status:** Actively developed and usable today. The core multi-project agent workflow is implemented and ready for hands-on use, while advanced collaboration capabilities continue to evolve.
 
-July is built around a simple idea:
+July Workspace is a local-first workspace for coordinating persistent coding agents across multiple software projects.
 
-> Coding agents are already strong. The next bottleneck is coordination, not coding intelligence.
+It is built for developers who use Codex, Claude Code, ACP-compatible runtimes, or other coding agents across multiple repositories and want those agents to behave more like a persistent engineering team than isolated chat sessions.
+
+July gives each project a durable agent identity, keeps working contexts isolated, and lets agents collaborate through explicit Results, Artifacts, Decisions, Work, and Dependencies instead of sharing entire transcripts.
+
+**The problem July focuses on is coordination, not coding intelligence.**
 
 Instead of putting another supervisor LLM in front of Claude, Codex, or other coding agents, July gives each project its own persistent agent and provides the workspace around them:
 
@@ -25,7 +29,7 @@ Hướng dẫn tiếng Việt: [docs/21-USER-GUIDE-VI.md](docs/21-USER-GUIDE-VI.
 
 ## Installation
 
-> The exact installation command depends on how the repository is currently packaged. If the project already provides a release installer or package command, use that instead of the development commands below.
+July is currently installed from source.
 
 ### Build from source
 
@@ -69,6 +73,20 @@ july
 
 With both standard streams attached to a terminal, this opens the full-screen
 TUI. Piped or redirected use keeps the line REPL for script compatibility.
+
+---
+
+## Who is July for?
+
+July is useful when you:
+
+- work across multiple repositories with coding agents;
+- want each project to keep a persistent logical agent identity;
+- need isolated conversations instead of one growing shared context;
+- want agents to exchange explicit results and artifacts without leaking full working transcripts;
+- want coordination state to survive runtime restarts or session replacement.
+
+Typical examples include coordinating backend, frontend, infrastructure, and integration work across separate repositories, or keeping long-running coding-agent workflows organized without introducing another supervisor LLM.
 
 ---
 
@@ -509,10 +527,9 @@ Rust
 
 ## Current status
 
-The main July architecture, July Next work and Phase 10 interactive TUI are
-implemented. The TUI provides application-owned scrollback, progressive
-Markdown, multiline input, context navigation, permission handling and
-cancel-once active-turn behavior while preserving the existing CLI contracts.
+July is under active development, but the core workflow is usable today.
+
+The main architecture, July Next work, and the Phase 10 interactive TUI are implemented. The TUI provides application-owned scrollback, progressive Markdown, multiline input, context navigation, permission handling, and cancel-once active-turn behavior while preserving the existing CLI contracts.
 
 ```text
 july                         both streams TTY → TUI
