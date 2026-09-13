@@ -37,7 +37,7 @@ pub const ADAPTERS: &[AdapterSpec] = &[
     AdapterSpec {
         id: "codex",
         package: "@agentclientprotocol/codex-acp",
-        version: "1.6.2",
+        version: "1.10.0",
         bin: "codex-acp",
         installer: Npm,
         tier: Core,
