@@ -110,6 +110,13 @@ impl PackageInstaller for SystemInstaller {
 }
 
 impl AdapterStore {
+    pub(crate) fn installed_bin(spec: &AdapterSpec, root: &Path) -> PathBuf {
+        match spec.installer {
+            Installer::Npm => root.join("node_modules/.bin").join(spec.bin),
+            Installer::Cargo => root.join("bin").join(spec.bin),
+        }
+    }
+
     pub fn new(home: PathBuf) -> Self {
         Self { home }
     }
@@ -133,13 +140,7 @@ impl AdapterStore {
 
     /// Đường dẫn tuyệt đối tới file thực thi mà trình cài sinh ra.
     pub fn bin_path(&self, spec: &AdapterSpec) -> PathBuf {
-        match spec.installer {
-            Installer::Npm => self
-                .adapters_root()
-                .join("node_modules/.bin")
-                .join(spec.bin),
-            Installer::Cargo => self.adapters_root().join("bin").join(spec.bin),
-        }
+        Self::installed_bin(spec, &self.adapters_root())
     }
 
     /// Phiên bản đang cài, đọc từ metadata của chính trình cài. Manifest hỏng coi như chưa cài.
@@ -209,29 +210,92 @@ impl AdapterStore {
 
     /// Ghi danh tính một adapter, giữ nguyên các adapter đã có.
     pub fn record_identity(&self, id: &str, identity: AdapterIdentity) -> Result<(), AdapterError> {
-        let mut identities = self.identities()?;
-        identities.insert(id.to_owned(), identity);
-        let document = Value::Object(
-            identities
-                .into_iter()
-                .map(|(id, identity)| {
-                    (
-                        id,
-                        serde_json::json!({
-                            "name": identity.name,
-                            "version": identity.version,
-                            "bin": identity.bin.to_string_lossy(),
-                        }),
-                    )
-                })
-                .collect(),
-        );
+        self.write_identity(id, identity, None)
+    }
+
+    /// Only successful July installations receive this explicit ownership receipt.
+    pub(crate) fn record_verified(
+        &self,
+        spec: &AdapterSpec,
+        identity: AdapterIdentity,
+        installation_root: Option<&Path>,
+    ) -> Result<(), AdapterError> {
+        self.write_identity(spec.id, identity, installation_root)
+    }
+
+    fn write_identity(
+        &self,
+        id: &str,
+        identity: AdapterIdentity,
+        installation_root: Option<&Path>,
+    ) -> Result<(), AdapterError> {
+        let path = self.identities_path();
+        let mut document: Value = match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(error) => return Err(error.into()),
+        };
+        let entries = document.as_object_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "identities must be an object")
+        })?;
+        let mut entry = serde_json::json!({"name": identity.name, "version": identity.version, "bin": identity.bin});
+        if let Some(root) = installation_root {
+            entry["installation_root"] = serde_json::json!(root);
+        }
+        entries.insert(id.to_owned(), entry);
         std::fs::create_dir_all(self.adapters_root())?;
-        std::fs::write(
-            self.identities_path(),
-            format!("{}\n", serde_json::to_string_pretty(&document)?),
-        )?;
-        Ok(())
+        let temporary = self
+            .adapters_root()
+            .join(format!(".identities-{}.tmp", ulid::Ulid::generate()));
+        let result = (|| -> Result<(), AdapterError> {
+            std::fs::write(&temporary, serde_json::to_vec_pretty(&document)?)?;
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
+    }
+
+    pub(crate) fn managed_candidate(
+        &self,
+        spec: &AdapterSpec,
+    ) -> Result<(PathBuf, Option<PathBuf>), AdapterError> {
+        let raw = match std::fs::read_to_string(self.identities_path()) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok((std::path::absolute(self.bin_path(spec))?, None));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let parsed: Value = serde_json::from_str(&raw)?;
+        if let Some(receipt) = parsed
+            .get(spec.id)
+            .and_then(|entry| entry.get("installation_root"))
+        {
+            let root = receipt.as_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid July installation receipt",
+                )
+            })?;
+            let root = PathBuf::from(root);
+            let expected_parent =
+                std::path::absolute(self.adapters_root().join("installations").join(spec.id))?;
+            if root.is_absolute() && root.parent() == Some(expected_parent.as_path()) {
+                let bin = Self::installed_bin(spec, &root);
+                if parsed[spec.id]["bin"].as_str() == bin.to_str() {
+                    return Ok((bin, Some(root)));
+                }
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid July installation receipt",
+            )
+            .into());
+        }
+        Ok((std::path::absolute(self.bin_path(spec))?, None))
     }
 
     /// `transport_config` đầy đủ cho một agent dùng adapter `id`.
@@ -570,5 +634,23 @@ mod tests {
             Err(AdapterError::InvalidAgentName(_))
         ));
         assert!(!root.join("../../tmp/x").exists());
+    }
+    #[test]
+    fn malformed_receipts_never_fall_back_to_legacy_candidate() {
+        let store = AdapterStore::new(scratch());
+        let spec = find("codex").unwrap();
+        std::fs::create_dir_all(store.adapters_root()).unwrap();
+        for root in [
+            serde_json::json!(null),
+            serde_json::json!(5),
+            serde_json::json!("/external"),
+        ] {
+            std::fs::write(
+                store.identities_path(),
+                serde_json::json!({"codex": {"installation_root": root}}).to_string(),
+            )
+            .unwrap();
+            assert!(store.managed_candidate(spec).is_err());
+        }
     }
 }

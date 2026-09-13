@@ -122,8 +122,9 @@ Mặc định July sử dụng:
 ~/.july/
 ├── workspace.db       SQLite database của workspace
 ├── adapters/
-│   ├── ...             package và binary ACP adapter
-│   └── identities.json danh tính adapter đã xác minh
+│   ├── installations/  mỗi lần cài mới nằm trong một thư mục riêng
+│   ├── ...             các package và binary cài theo bố cục cũ
+│   └── identities.json danh tính đã xác minh và thông tin bản cài do July quản lý
 └── state/             state directory riêng của agent runtime
 ```
 
@@ -178,10 +179,16 @@ Nếu stdin không phải TTY và không có `--adapters`, July mặc định ch
 Một adapter thành công sẽ có dòng xác minh, sau đó July in hướng dẫn tạo Agent:
 
 ```text
-Đang cài codex (@agentclientprotocol/codex-acp <version>)
-  đã xác minh: <agent-name> <agent-version>
+codex: giữ executable tương thích
+codex: đã xác minh <executable>; cấu hình agent hiện có được giữ nguyên
 Xong. Tạo agent cho thư mục hiện tại bằng: july init
 ```
+
+Setup kiểm tra version từ executable được chọn và giữ nguyên bản tương thích,
+kể cả bản tìm thấy trên `PATH`. Nếu thiếu adapter, July cài version đã được
+chỉ định trong catalog. Bản quá cũ hoặc hỏng chỉ được thay khi có thông tin
+xác nhận lần cài do July quản lý; các trường hợp khác được báo để xử lý thủ công.
+Bản vừa cài phải qua kiểm tra version và ACP trước khi được chọn cho Agent mới.
 
 ### Bước 2: Thêm project agent
 
@@ -340,14 +347,17 @@ Chỉ dùng `--json` một lần.
 
 ### Cập nhật Agent sau khi nâng cấp adapter
 
-Chạy lại `july setup` có thể nâng package adapter, nhưng không tự thay
-`transport_config` đã lưu trong Agent. Sau khi nâng adapter, đồng bộ từng Agent:
+Chạy lại `july setup` có thể cài bản adapter mới vào thư mục riêng, giữ toàn bộ
+bản cũ và không thay `transport_config` đã lưu trong Agent. Agent hiện có tiếp
+tục dùng executable cũ. Khi muốn chuyển một Agent sang bản vừa xác minh:
 
 ```bash
 july agent update cashpoint --adapter codex
 ```
 
-Nếu bỏ qua bước này, ACP handshake có thể báo version hoặc identity mismatch.
+Nếu executable cũ đã hỏng, setup không tự sửa cấu hình Agent đó; dùng lệnh trên
+để chuyển sang bản mới. Cấu hình tùy chỉnh cần được kiểm tra trước khi thay bằng
+cấu hình sinh từ `--adapter`.
 
 ### Dùng custom transport config
 
