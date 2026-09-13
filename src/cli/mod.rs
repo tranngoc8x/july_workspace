@@ -36,6 +36,7 @@ mod keys;
 mod mention;
 pub mod registry;
 mod setup;
+mod update;
 
 use registry::CommandScope;
 
@@ -43,6 +44,7 @@ const TUI_HISTORY_LIMIT: usize = 50;
 const USAGE: &str = "usage: july dm <agent>";
 const PROJECT_INIT_USAGE: &str = "usage: july init";
 const SETUP_USAGE: &str = "usage: july setup [--adapters <ids>]      cài ACP adapter";
+const UPDATE_USAGE: &str = "usage: july update";
 const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]\n\
                           usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]\n\
                           usage: july agent update <agent> --adapter <id>\n\
@@ -74,6 +76,14 @@ pub enum CliError {
     SetupUsage,
     #[error("{PROJECT_INIT_USAGE}")]
     ProjectInitUsage,
+    #[error("{UPDATE_USAGE}")]
+    UpdateUsage,
+    #[error("{0}")]
+    Update(String),
+    #[error(
+        "july update cannot install releases yet; download the release from https://github.com/tranngoc8x/july_workspace/releases"
+    )]
+    UpdateNotInstallable,
     #[error("chưa có adapter đã cài; chạy july setup trước")]
     NoInstalledAdapters,
     #[error("{AGENT_USAGE}")]
@@ -144,6 +154,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         Command::Version { json } => run_version(json),
         Command::Setup { adapters } => setup::run_setup(adapters).await,
         Command::ProjectInit => run_project_init().await,
+        Command::Update => update::run_update().await,
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Agent { operation, .. } => run_agent(operation, json).await,
@@ -177,10 +188,13 @@ impl CliError {
             Self::Usage
             | Self::SetupUsage
             | Self::ProjectInitUsage
+            | Self::UpdateUsage
             | Self::AgentUsage
             | Self::InvalidAgentName
             | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
+            Self::Update(_) => "update_failed",
+            Self::UpdateNotInstallable => "update_not_installable",
             Self::Adapter(_) => "adapter",
             Self::MissingAdapter => "missing_adapter",
             Self::NoAdapterSelected => "no_adapter_selected",
@@ -259,6 +273,7 @@ enum Command {
         adapters: Option<Vec<String>>,
     },
     ProjectInit,
+    Update,
     Dm(String),
     ThreadOpen {
         thread_id: ConversationId,
@@ -556,6 +571,8 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("setup") => parse_setup(args, json),
         Some("init") if args.len() == 1 && !json => Ok(Command::ProjectInit),
         Some("init") => Err(CliError::ProjectInitUsage),
+        Some("update") if args.len() == 1 && !json => Ok(Command::Update),
+        Some("update") => Err(CliError::UpdateUsage),
         Some("agent") => parse_agent(args, json),
         Some("room") => parse_room(args, json),
         Some("thread") => parse_thread(args, json),

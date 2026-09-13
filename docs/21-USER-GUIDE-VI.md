@@ -359,6 +359,37 @@ Nếu executable cũ đã hỏng, setup không tự sửa cấu hình Agent đó
 để chuyển sang bản mới. Cấu hình tùy chỉnh cần được kiểm tra trước khi thay bằng
 cấu hình sinh từ `--adapter`.
 
+### Kiểm tra bản phát hành July mới
+
+```bash
+july update
+```
+
+Lệnh đọc bản phát hành ổn định mới nhất của July trên GitHub Releases, so sánh
+theo SemVer với phiên bản đang chạy, rồi chọn asset đúng nền tảng:
+
+```text
+July Update
+
+Current July    0.1.0
+Latest stable   0.9.0
+Asset           july-v0.9.0-aarch64-apple-darwin.tar.gz
+
+July 0.1.0 → 0.9.0 is available.
+```
+
+Hiện tại lệnh mới dừng ở bước lập kế hoạch: nó chưa tải và chưa thay thế
+binary, nên khi có bản mới nó thoát với mã lỗi kèm liên kết tải thủ công thay
+vì báo đã cập nhật. Các trường hợp còn lại:
+
+- July đã là bản mới nhất: in `already up to date`, thoát 0;
+- bản cục bộ mới hơn bản phát hành: in `No downgrade was performed.`, thoát 0;
+- không đọc được GitHub: in `Unable to check for July updates`, thoát khác 0 và
+  không đụng tới bản cài đặt hiện tại.
+
+Bản prerelease, draft và asset không thuộc repository phát hành của July đều bị
+từ chối.
+
 ### Dùng custom transport config
 
 Đường `--adapter` là lựa chọn thông thường. Chỉ dùng `--transport` + `--config`
@@ -726,6 +757,7 @@ Không dùng `--json` với:
 
 - `july init`;
 - `july setup`;
+- `july update`;
 - `july` không đối số;
 - `july dm`;
 - `july thread open`.

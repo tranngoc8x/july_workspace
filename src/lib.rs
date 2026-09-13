@@ -26,3 +26,6 @@ pub mod transport;
 
 /// Boundary for durable workspace state and persistence implementations.
 pub mod storage;
+
+/// Khám phá bản phát hành ổn định và lập kế hoạch cập nhật July.
+pub mod update;
