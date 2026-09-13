@@ -130,6 +130,12 @@ impl AdapterStore {
         Ok(Self::new(PathBuf::from(home).join(".july")))
     }
 
+    /// Thư mục gốc July sở hữu; các boundary khác dựng đường dẫn riêng từ đây
+    /// thay vì đọc lại `JULY_HOME`.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
     pub fn adapters_root(&self) -> PathBuf {
         self.home.join("adapters")
     }

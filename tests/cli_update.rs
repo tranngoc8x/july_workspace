@@ -50,9 +50,15 @@ fn update_never_reports_success_without_installing() {
             stderr.contains("Unable to check for July updates")
                 || stderr.contains("cannot install releases yet")
                 || stderr.contains("no stable release")
-                || stderr.contains("publishes no asset"),
+                || stderr.contains("publishes no asset")
+                || stderr.contains("failed checksum verification")
+                || stderr.contains("release download"),
             "{stderr}"
         );
     }
     assert!(!stdout.contains("is ready."), "{stdout}");
+    // Tải và xác minh xong vẫn chưa phải đã cài; chỉ Part 8 mới thay binary.
+    if stdout.contains("Verified release") {
+        assert!(!output.status.success(), "{stdout}");
+    }
 }

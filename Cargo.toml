@@ -27,6 +27,7 @@ ratatui-textarea = { version = "=0.9.2", default-features = false, features = ["
 rusqlite = { version = "=0.40.1", features = ["bundled"] }
 semver = "=1.0.28"
 serde_json = "=1.0.151"
+sha2 = "=0.10.9"
 thiserror = "=2.0.19"
 tokio = { version = "=1.53.1", features = ["io-std", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 tracing = "=0.1.44"

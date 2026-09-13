@@ -375,12 +375,23 @@ Current July    0.1.0
 Latest stable   0.9.0
 Asset           july-v0.9.0-aarch64-apple-darwin.tar.gz
 
-July 0.1.0 → 0.9.0 is available.
+Updating July
+✓ Downloaded july-v0.9.0-aarch64-apple-darwin.tar.gz
+✓ Verified release
+  /Users/tony/.july/updates/july-v0.9.0-aarch64-apple-darwin.tar.gz
+
+July 0.1.0 → 0.9.0 was downloaded and verified.
 ```
 
-Hiện tại lệnh mới dừng ở bước lập kế hoạch: nó chưa tải và chưa thay thế
-binary, nên khi có bản mới nó thoát với mã lỗi kèm liên kết tải thủ công thay
-vì báo đã cập nhật. Các trường hợp còn lại:
+Bản tải về nằm trong `~/.july/updates` (hoặc `$JULY_HOME/updates`), tách hẳn
+khỏi nơi July đang chạy. July so SHA-256 của file với digest GitHub công bố
+kèm asset; chỉ khi khớp file mới được đặt đúng tên asset. Digest lệch, tải
+hỏng giữa chừng hay URL không thuộc repository phát hành của July đều làm lệnh
+dừng lại, xoá file tạm và không đụng tới bản cài đặt hiện tại.
+
+Hiện tại lệnh mới dừng trước bước thay thế binary, nên kể cả khi tải và xác
+minh xong nó vẫn thoát với mã lỗi kèm liên kết tải thủ công thay vì báo đã cập
+nhật. Các trường hợp còn lại:
 
 - July đã là bản mới nhất: in `already up to date`, thoát 0;
 - bản cục bộ mới hơn bản phát hành: in `No downgrade was performed.`, thoát 0;
