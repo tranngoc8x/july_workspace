@@ -95,7 +95,10 @@ pub(crate) async fn run_setup(adapters: Option<Vec<String>>) -> Result<(), CliEr
     let installer = SystemInstaller;
     let mut failures = Vec::new();
     for spec in chosen {
-        println!("Đang cài {} ({} {})", spec.id, spec.package, spec.version);
+        println!(
+            "Đang cài {} ({} {})",
+            spec.id, spec.package, spec.install_version
+        );
         if let Err(error) = installer.install(spec, &store.adapters_root()) {
             println!("  thất bại: {error}");
             failures.push(spec.id);
@@ -195,8 +198,7 @@ fn render(selection: &Selection, store: &AdapterStore, first: bool) -> Result<()
             " "
         };
         let state = match store.installed_version(spec) {
-            Some(version) if version == spec.version => format!(" (đã cài {version})"),
-            Some(version) => format!(" (đã cài {version} → có {})", spec.version),
+            Some(version) => format!(" (đã cài {version})"),
             None => String::new(),
         };
         write!(

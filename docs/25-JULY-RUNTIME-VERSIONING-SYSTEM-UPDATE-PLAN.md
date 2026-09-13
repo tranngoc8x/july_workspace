@@ -306,18 +306,23 @@ Do đó:
 
 > **Resolved executable + its reported version is canonical runtime detection.**
 
+Probe phải giới hạn thời gian và kích thước stdout/stderr; phân biệt missing, command failure và unparseable output. Không chạy probe không giới hạn mỗi lần UI redraw.
+
+Package SemVer từ `--version` và identity từ ACP initialize là hai contract riêng. Giữ kiểm tra ACP identity/protocol. Existing agents lưu `expected_agent_name`/`expected_agent_version` trong transport config; chỉ cập nhật `identities.json` không cập nhật các expectations đó. Reconciliation phải xử lý expectations được July quản lý và kiểm chứng agent launch sau upgrade, không ghi đè custom config.
+
 ---
 
 ## 9. Binary resolution policy
 
-Reuse existing resolver nếu repo đã có.
-
-Nếu chưa có:
+Precedence cho executable:
 
 ```text
-PATH lookup
-→ resolved executable path
+explicit executable trong agent config
+→ nếu không có explicit config: managed binary khi tồn tại
+→ nếu managed binary không tồn tại: PATH lookup
 ```
+
+Explicit configured executable luôn được giữ; lỗi probe không cho phép tự chuyển sang binary khác. Với onboarding, detect/probe, record identity và launch phải dùng cùng executable đã chọn. Managed candidate bị broken/incompatible phải được report/reconcile theo ownership policy, không âm thầm đổi sang PATH candidate. Reuse resolver hiện có nếu đáp ứng contract này.
 
 Ví dụ:
 
@@ -411,7 +416,7 @@ UnknownVersion
 
 Nếu existing implementation phân biệt managed/unmanaged install, giữ distinction đó.
 
-Nếu chưa có, không bắt buộc thêm ownership model phức tạp trong phase đầu.
+Nếu chưa có, không bắt buộc thêm ownership model phức tạp trong phase đầu. Tuy nhiên, `--adapter` và `--config` hiện cùng lưu vào `transport_config` mà không có ownership marker: không suy ra quyền overwrite từ JSON shape hoặc đường dẫn. Khi không chứng minh được field do July quản lý, preserve và report để xử lý rõ ràng.
 
 ---
 
@@ -527,16 +532,15 @@ latest < current
 
 ## 15. Release asset strategy
 
-Release nên publish platform-specific artifacts.
-
-Ví dụ:
+Packaging hiện tại ở `scripts/release.sh` dùng Cargo version không có tiền tố `v` trong tên asset, mặc định hai target macOS:
 
 ```text
-july-v0.9.0-aarch64-apple-darwin.tar.gz
-july-v0.9.0-x86_64-apple-darwin.tar.gz
-july-v0.9.0-x86_64-unknown-linux-gnu.tar.gz
-...
+july-0.9.0-aarch64-apple-darwin.tar.gz
+july-0.9.0-x86_64-apple-darwin.tar.gz
+SHA256SUMS
 ```
+
+Tag release có thể dùng `v`; normalize tag riêng, không thêm `v` vào asset filename. Linux/target khác chỉ được hỗ trợ khi producer tạo và kiểm chứng artifact tương ứng. Repo hiện chưa có workflow publish release; publish stable release với assets/checksums đúng contract là prerequisite cho live updater, không coi local packaging là bằng chứng release đã tồn tại.
 
 Updater detect:
 
@@ -566,7 +570,7 @@ download
 Release nên có:
 
 ```text
-checksums.sha256
+SHA256SUMS
 ```
 
 hoặc dùng release asset digest nếu update implementation/API hiện tại hỗ trợ đủ tin cậy.
@@ -701,12 +705,15 @@ Recommended:
 3. download
 4. verify
 5. install new July
-6. run schema/config migration
-7. load new system specs
-8. reconcile adapters/runtimes
-9. verify
-10. report
+6. hand control to new July binary
+7. run supported schema/config migration
+8. load new system specs
+9. reconcile adapters/runtimes
+10. verify
+11. report
 ```
+
+Handoff cần một internal invocation contract ổn định giữa old/new binary, giữ update lock xuyên handoff và báo chính xác partial failure. Thay file executable không thay specs đang nằm trong old process. Already-latest vẫn chạy migration/reconciliation bằng binary hiện tại; không cần self-replacement.
 
 Không update adapters theo **old specs** rồi mới update July.
 
@@ -762,6 +769,10 @@ history
 ---
 
 ## 22. Config migration
+
+July hiện chưa release; dữ liệu development cũ là test data có thể bỏ theo quyết định của Tony. Không xây historical/legacy migration cho các schema development đã bị loại, gồm pre-Phase9 Work schema. Nếu gặp DB development không được hỗ trợ, report rõ boundary và reset đúng DB test chỉ khi cần, với thông báo reset; không tự xóa dữ liệu trong slice đổi spec/plan này. Quyết định này không áp dụng cho dữ liệu người dùng sau release.
+
+Sau release, giữ explicit migration cho các schema/config được hỗ trợ, ownership preservation và failure reporting. Migration hiện tại commit từng version riêng; lỗi ở version sau không rollback các version đã commit.
 
 Nếu config schema thay đổi:
 
@@ -1126,6 +1137,17 @@ install_version
 
 Update all specs.
 
+Giữ nguyên install pins hiện tại. Theo policy conservative cho 0.x đã được Tony duyệt, Part 2 dùng các requirement sau (từ pin hiện tại đến trước minor kế tiếp):
+
+| Adapter | version_req | install_version |
+| --- | --- | --- |
+| Codex | `>=1.10.0, <2.0.0` | `1.10.0` |
+| Claude | `>=0.70.0, <0.71.0` | `0.70.0` |
+| Claude Rust | `>=0.1.22, <0.2.0` | `0.1.22` |
+| DeepSeek | `>=0.4.26, <0.5.0` | `0.4.26` |
+
+Validate mỗi install_version thỏa version_req bằng SemVer; không coi mọi version 0.x tương thích. Các version cũ trong ví dụ minh họa không thay thế bảng pin này.
+
 ### Workstream C — Version detection
 
 Implement/normalize:
@@ -1187,7 +1209,7 @@ Implement safe replacement for supported install mode.
 
 ### Workstream J — Migration runner
 
-Run schema/config migrations after binary update.
+New binary runs supported schema/config migrations after handoff. Không triển khai historical migration cho disposable pre-release test DB; áp dụng boundary/reset reporting ở section 22 khi cần. Future post-release data/config vẫn phải được preserve qua supported migrations.
 
 ### Workstream K — System reconciliation
 

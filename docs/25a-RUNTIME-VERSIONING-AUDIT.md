@@ -25,9 +25,9 @@ Current flow: catalog → setup selection → package install → managed binary
 
 `src/transport/acp.rs:490` compares both handshake name and version exactly against persisted expectations. Updating identities.json alone does not refresh existing agents' persisted expectations. Reconciliation must include an explicit, narrowly scoped solution for generated identity expectations before claiming an upgraded existing agent still works. Preserve identity/protocol validation and custom configuration; package SemVer and ACP-reported identity are distinct contracts.
 
-Detection and launch must use the same selected executable. Preserve explicit configured paths. For onboarding, define and test managed-path/PATH candidate precedence before adding reuse. A compatible PATH executable is not useful if subsequent setup still records or launches a different managed binary. Probe failure and unparseable output must remain distinct from missing installation. Bound process time and output; do not let a UI redraw spawn repeated unbounded probes.
+Detection and launch must use the same selected executable. The approved plan preserves explicit configured paths first; onboarding selects an existing managed binary, otherwise PATH. A failed explicit/managed candidate does not silently fall through to another binary. Test this precedence before adding reuse. A compatible PATH executable is not useful if subsequent setup still records or launches a different managed binary. Probe failure and unparseable output must remain distinct from missing installation. Bound process time and output; do not let a UI redraw spawn repeated unbounded probes.
 
-For initial version requirements, keep current install pins. Codex's documented range is >=1.10.0, <2.0.0. The 0.x adapters need explicit conservative compatibility bounds and tests in Part 2; do not infer all 0.x versions are compatible. Validate every install_version against its requirement. Future-major and unknown-version results must not silently trigger a downgrade.
+Under Tony's approved conservative 0.x policy, Part 2 sets these initial requirements with unchanged install pins: Codex `>=1.10.0, <2.0.0` / `1.10.0`; Claude `>=0.70.0, <0.71.0` / `0.70.0`; Claude Rust `>=0.1.22, <0.2.0` / `0.1.22`; DeepSeek `>=0.4.26, <0.5.0` / `0.4.26`. Part 2 validates every install_version against its requirement and tests boundaries; do not infer all 0.x versions are compatible. Future-major and unknown-version results must not silently trigger a downgrade.
 
 ## July update integration audit
 
@@ -39,7 +39,7 @@ For initial version requirements, keep current install pins. Codex's documented 
 | Publishing | `.github/workflows/ci.yml` runs quality/build checks; no release publishing workflow found | Local packaging is not proof of a published stable release. Verify expected repository and live assets in the provider slice. |
 | CLI | `src/cli/mod.rs:142` dispatches current commands | Add parser/help/dispatch and tests for update; never report success for an unimplemented stage. |
 | Storage migration | `src/storage/sqlite.rs:4564` applies each migration in its own transaction; latest embedded version is 20 at line 118 | Reuse migration machinery and DatabaseTooNew protection. |
-| Legacy schema | `src/storage/sqlite.rs:176` rejects pre-Phase9 Work schema and requests a fresh database | This conflicts with a blanket preservation claim; Part 9 must define supported migration boundary and safe failure. Never delete/recreate the user's DB as an update fallback. |
+| Legacy schema | `src/storage/sqlite.rs:176` rejects pre-Phase9 Work schema and requests a fresh database | Resolved by Tony: July is unreleased and old development data is disposable test data. No historical migration is required; report unsupported development DB and reset that test DB only if needed. No reset occurs in this slice. Future post-release user data still requires preservation and supported migrations. |
 | State roots | Adapter store honors JULY_HOME; `src/cli/mod.rs:4610` resolves DB using JULY_WORKSPACE_DB or HOME/.july/workspace.db | JULY_HOME alone does not isolate workspace data. Test with explicit isolated DB. |
 
 Self-update must hand control to the new binary before migration/reconciliation. Replacing a file does not replace the old process's compiled specs. Lock ownership across handoff, partial failure reporting, and migration failure after replacement belong in the updater slices.
@@ -58,7 +58,7 @@ Beads is the authoritative status/dependency tracker. Each part receives tests/r
 | 6 / qqg.6 | F/G | CLI plus stable release/asset planning; fixture-based provider tests, truthful incomplete-stage behavior. |
 | 7 / qqg.7 | H | Verified HTTPS download; checksum failure preserves installation. |
 | 8 / qqg.8 | I + lock | Ownership-aware safe replacement and new-binary handoff; concurrent-update/failure tests. |
-| 9 / qqg.9 | J/K | Explicit migrations and reconciliation under new specs, including already-latest case. |
+| 9 / qqg.9 | J/K | Supported migrations and reconciliation under new specs, including already-latest case; no historical migration for disposable pre-release test DB. |
 | 10 / qqg.10 | L + final acceptance | Reporting, partial failures and end-to-end acceptance from plan sections 34–39. |
 
 Primary existing edit boundaries for Parts 2–5: `src/adapter/catalog.rs`, `src/adapter/store.rs`, `src/adapter/mod.rs`, `src/cli/setup.rs`, `Cargo.toml`/`Cargo.lock`. Existing-agent configuration integration additionally requires `src/cli/mod.rs`, `src/runtime/direct_message.rs`, `src/transport/acp.rs` and the relevant storage API after a bounded ownership design. Preserve custom ACP config contracts and existing tests in `tests/cli_agent.rs` and `tests/acp_transport.rs`.

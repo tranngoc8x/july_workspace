@@ -60,7 +60,7 @@ pub fn install_command(spec: &AdapterSpec, root: &Path) -> (&'static str, Vec<St
                 "install".into(),
                 "--prefix".into(),
                 root,
-                format!("{}@{}", spec.package, spec.version),
+                format!("{}@{}", spec.package, spec.install_version),
             ],
         ),
         Installer::Cargo => (
@@ -69,7 +69,7 @@ pub fn install_command(spec: &AdapterSpec, root: &Path) -> (&'static str, Vec<St
                 "install".into(),
                 spec.package.into(),
                 "--version".into(),
-                spec.version.into(),
+                spec.install_version.into(),
                 "--root".into(),
                 root,
             ],
@@ -381,7 +381,7 @@ mod tests {
                 "install".to_string(),
                 "--prefix".to_string(),
                 "/opt/july/adapters".to_string(),
-                "@agentclientprotocol/codex-acp@1.6.2".to_string(),
+                "@agentclientprotocol/codex-acp@1.10.0".to_string(),
             ]
         );
     }
@@ -403,6 +403,41 @@ mod tests {
                 "/opt/july/adapters".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn installers_use_the_install_pin_instead_of_the_compatibility_range() {
+        for (id, pin, expected) in [
+            (
+                "codex",
+                "1.12.0",
+                vec![
+                    "install",
+                    "--prefix",
+                    "/opt/july/adapters",
+                    "@agentclientprotocol/codex-acp@1.12.0",
+                ],
+            ),
+            (
+                "claude-rust",
+                "0.1.23",
+                vec![
+                    "install",
+                    "claude-code-acp-rs",
+                    "--version",
+                    "0.1.23",
+                    "--root",
+                    "/opt/july/adapters",
+                ],
+            ),
+        ] {
+            let spec = AdapterSpec {
+                install_version: pin,
+                ..*find(id).expect("adapter")
+            };
+            let (_, arguments) = install_command(&spec, Path::new("/opt/july/adapters"));
+            assert_eq!(arguments, expected, "{id}");
+        }
     }
 
     #[test]
