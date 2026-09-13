@@ -1,5 +1,7 @@
 # Lessons
 
+- Khi Sếp xác nhận sản phẩm chưa release và dữ liệu cũ chỉ là test data có thể bỏ, không tự mở rộng scope để xây historical/legacy migrations. Chỉ reset đúng development DB khi cần và thông báo rõ; vẫn giữ migration và ownership preservation cho dữ liệu người dùng sau release.
+
 - Khi Sếp yêu cầu bỏ qua mọi phase có thể bị plan A2A mới làm thay đổi, phải coi mention routing/activation, `AgentRoomCursor` và agent-facing Room API là A2A-coupled dù chưa tạo A2A Message/Task; chỉ tiếp tục feature độc lập hoàn toàn, không dùng việc thiếu type/import A2A làm tiêu chí an toàn.
 - Khi Sếp nói các tính năng đang làm chỉ là feature bổ sung và A2A thuộc phase khác, phải dừng mọi RoomMessage/A2A implementation, rollback đúng các hunk vừa tạo và quay lại Beads non-A2A đang sẵn sàng; không dùng tên roadmap cũ để suy diễn scope hiện tại.
 - Trước khi kết luận một feature chưa được implement hoặc rollback feature đó, phải audit cả `git log --all`, branch/ref liên quan và từng hunk chưa commit; không suy ra từ semantic search hay `git status` tổng quát khi worktree đang chứa nhiều slice trộn lẫn.
