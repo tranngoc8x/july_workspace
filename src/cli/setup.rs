@@ -93,14 +93,40 @@ pub(crate) async fn run_setup(adapters: Option<Vec<String>>) -> Result<(), CliEr
     let installer = SystemInstaller;
     let mut failures = Vec::new();
     let search = std::env::var_os("PATH");
+    // Database sẵn có mở được thì agent mới được trỏ lại và root cũ mới được thu
+    // hồi; không thì setup vẫn chạy, chỉ bỏ phần dọn dẹp. Setup không tự tạo
+    // workspace: onboarding chỉ đụng tới `~/.july/adapters`.
+    let database = super::database_path()
+        .ok()
+        .filter(|path| path.exists())
+        .and_then(|path| crate::storage::SqliteStore::open(&path).ok());
     for spec in chosen {
         match reconcile_adapter(spec, &store, &installer, search.as_deref(), true).await {
-            Ok(report) => println!(
-                "{}: đã xác minh {} {}; cấu hình agent hiện có được giữ nguyên",
-                report.id,
-                report.to,
-                report.bin.display()
-            ),
+            Ok(report) => {
+                println!(
+                    "{}: đã xác minh {} {}",
+                    report.id,
+                    report.to,
+                    report.identity.bin.display()
+                );
+                if let Some(database) = &database {
+                    let housekeeping =
+                        super::reconcile::repoint_and_reclaim(spec, &store, &report, database);
+                    if !housekeeping.repointed.is_empty() {
+                        println!(
+                            "  đã trỏ lại {} agent: {}",
+                            housekeeping.repointed.len(),
+                            housekeeping.repointed.join(", ")
+                        );
+                    }
+                    if !housekeeping.reclaimed.is_empty() {
+                        println!("  đã thu hồi {} bản cài cũ", housekeeping.reclaimed.len());
+                    }
+                    for warning in housekeeping.warnings {
+                        println!("  ! {warning}");
+                    }
+                }
+            }
             Err(error) => {
                 println!("  {}: {error}", spec.id);
                 failures.push(spec.id);
