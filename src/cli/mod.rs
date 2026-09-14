@@ -81,9 +81,9 @@ pub enum CliError {
     #[error("{0}")]
     Update(String),
     #[error(
-        "july update cannot install releases yet; download the release from https://github.com/tranngoc8x/july_workspace/releases"
+        "july update installed the new binary but migrations and runtime reconciliation are not implemented yet"
     )]
-    UpdateNotInstallable,
+    UpdateIncomplete,
     #[error("chưa có adapter đã cài; chạy july setup trước")]
     NoInstalledAdapters,
     #[error("{AGENT_USAGE}")]
@@ -155,6 +155,7 @@ pub async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), CliErro
         Command::Setup { adapters } => setup::run_setup(adapters).await,
         Command::ProjectInit => run_project_init().await,
         Command::Update => update::run_update().await,
+        Command::UpdateFinalize { version, fd } => update::finalize_update(&version, fd),
         Command::Dm(agent_name) => run_dm(agent_name).await,
         Command::ThreadOpen { thread_id, agent } => run_thread_open(thread_id, agent).await,
         Command::Agent { operation, .. } => run_agent(operation, json).await,
@@ -194,7 +195,7 @@ impl CliError {
             | Self::InvalidUtf8 => "usage",
             Self::InvalidCommand => "invalid_command",
             Self::Update(_) => "update_failed",
-            Self::UpdateNotInstallable => "update_not_installable",
+            Self::UpdateIncomplete => "update_incomplete",
             Self::Adapter(_) => "adapter",
             Self::MissingAdapter => "missing_adapter",
             Self::NoAdapterSelected => "no_adapter_selected",
@@ -274,6 +275,10 @@ enum Command {
     },
     ProjectInit,
     Update,
+    UpdateFinalize {
+        version: String,
+        fd: i32,
+    },
     Dm(String),
     ThreadOpen {
         thread_id: ConversationId,
@@ -571,6 +576,15 @@ fn parse_command(mut args: Vec<String>) -> Result<Command, CliError> {
         Some("setup") => parse_setup(args, json),
         Some("init") if args.len() == 1 && !json => Ok(Command::ProjectInit),
         Some("init") => Err(CliError::ProjectInitUsage),
+        Some("--update-finalize") if args.len() == 3 && !json => {
+            let fd = args[2]
+                .parse()
+                .map_err(|_| CliError::Update("invalid update handoff descriptor".into()))?;
+            Ok(Command::UpdateFinalize {
+                version: args[1].clone(),
+                fd,
+            })
+        }
         Some("update") if args.len() == 1 && !json => Ok(Command::Update),
         Some("update") => Err(CliError::UpdateUsage),
         Some("agent") => parse_agent(args, json),

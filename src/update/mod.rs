@@ -1,8 +1,14 @@
 //! Khám phá bản phát hành ổn định của July trên GitHub Releases.
 //!
-//! Module này chỉ lập kế hoạch: nó đọc metadata release, chuẩn hoá tag về
-//! SemVer và chọn asset đúng nền tảng. Việc tải, xác minh và thay thế binary
-//! thuộc các phần sau của kế hoạch 25, nên ở đây không có mutation cục bộ nào.
+//! Đọc metadata, chọn asset theo SemVer/nền tảng và tải vào staging để xác minh.
+//! Việc thay binary và bàn giao tiến trình nằm trong các module con.
+
+pub(crate) mod handoff;
+mod install;
+
+pub use install::{
+    InstallError, InstallOwnership, UpdateLock, classify_install, install_release, lock_path,
+};
 
 use semver::Version;
 use serde_json::Value;
@@ -89,10 +95,11 @@ pub fn target_triple() -> Option<&'static str> {
     }
 }
 
-/// Tên asset là quy ước cố định, nên việc chọn asset là tra cứu đúng tên chứ
-/// không phải đoán theo chuỗi con.
+/// Tên asset là quy ước cố định do `scripts/release.sh` sinh ra, nên việc chọn
+/// asset là tra cứu đúng tên chứ không phải đoán theo chuỗi con. Đổi tên ở
+/// script thì phải đổi cả ở đây.
 pub fn asset_name(version: &Version, target: &str) -> String {
-    format!("july-v{version}-{target}.tar.gz")
+    format!("july-{version}-{target}.tar.gz")
 }
 
 pub fn select_asset<'a>(release: &'a Release, target: &str) -> Option<&'a ReleaseAsset> {
@@ -332,19 +339,25 @@ pub async fn download_verified_asset(
     }
     std::fs::create_dir_all(staging).map_err(|error| DownloadError::Io(error.to_string()))?;
     let verified = staging.join(&asset.name);
-    let partial = staging.join(format!("{}.part", asset.name));
-    let _ = std::fs::remove_file(&verified);
+    // Exclusive private directory: curl cannot follow a preexisting .part symlink.
+    use std::os::unix::fs::DirBuilderExt;
+    let temporary = staging.join(format!(".download-{}", ulid::Ulid::generate()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&temporary)
+        .map_err(|error| DownloadError::Io(error.to_string()))?;
+    let partial = temporary.join("asset.part");
     let status = download(&asset.download_url, &partial).await;
     let outcome = match status {
         Err(error) => Err(error),
         Ok(200) => verify_file(&partial, &asset.name, &asset.sha256),
         Ok(code) => Err(DownloadError::Http(code)),
     };
-    if let Err(error) = outcome {
-        let _ = std::fs::remove_file(&partial);
-        return Err(error);
-    }
-    std::fs::rename(&partial, &verified).map_err(|error| DownloadError::Io(error.to_string()))?;
+    let outcome = outcome.and_then(|()| {
+        std::fs::rename(&partial, &verified).map_err(|error| DownloadError::Io(error.to_string()))
+    });
+    let _ = std::fs::remove_dir_all(&temporary);
+    outcome?;
     Ok(verified)
 }
 
@@ -462,8 +475,8 @@ mod tests {
         let good = release(
             "v0.9.0",
             &[(
-                "july-v0.9.0-aarch64-apple-darwin.tar.gz",
-                "https://github.com/tranngoc8x/july_workspace/releases/download/v0.9.0/july-v0.9.0-aarch64-apple-darwin.tar.gz",
+                "july-0.9.0-aarch64-apple-darwin.tar.gz",
+                "https://github.com/tranngoc8x/july_workspace/releases/download/v0.9.0/july-0.9.0-aarch64-apple-darwin.tar.gz",
             )],
         );
         let parsed = parse_release(&good).unwrap();
@@ -473,7 +486,7 @@ mod tests {
         let foreign = release(
             "v0.9.0",
             &[(
-                "july-v0.9.0-aarch64-apple-darwin.tar.gz",
+                "july-0.9.0-aarch64-apple-darwin.tar.gz",
                 "https://example.com/evil.tar.gz",
             )],
         );
@@ -491,7 +504,7 @@ mod tests {
 
     #[test]
     fn assets_without_a_usable_digest_or_plain_name_are_rejected() {
-        let url = format!("{ASSET_URL_PREFIX}v0.9.0/july-v0.9.0-aarch64-apple-darwin.tar.gz");
+        let url = format!("{ASSET_URL_PREFIX}v0.9.0/july-0.9.0-aarch64-apple-darwin.tar.gz");
         let body = |name: &str, digest: Value| {
             serde_json::json!({
                 "tag_name": "v0.9.0",
@@ -501,7 +514,7 @@ mod tests {
             })
             .to_string()
         };
-        let good = "july-v0.9.0-aarch64-apple-darwin.tar.gz";
+        let good = "july-0.9.0-aarch64-apple-darwin.tar.gz";
         assert!(parse_release(&body(good, serde_json::json!(format!("sha256:{DIGEST}")))).is_ok());
         // Digest viết hoa vẫn hợp lệ nhưng được chuẩn hoá về chữ thường.
         let upper = body(
@@ -540,8 +553,8 @@ mod tests {
         let scratch = std::env::temp_dir().join(format!("july-update-{}", ulid::Ulid::generate()));
         let staging = staging_root(&scratch);
         let asset = ReleaseAsset {
-            name: "july-v0.9.0-aarch64-apple-darwin.tar.gz".into(),
-            download_url: "https://example.com/july-v0.9.0-aarch64-apple-darwin.tar.gz".into(),
+            name: "july-0.9.0-aarch64-apple-darwin.tar.gz".into(),
+            download_url: "https://example.com/july-0.9.0-aarch64-apple-darwin.tar.gz".into(),
             sha256: DIGEST.into(),
         };
         assert!(matches!(
@@ -591,7 +604,7 @@ mod tests {
         let scratch = std::env::temp_dir().join(format!("july-update-{}", ulid::Ulid::generate()));
         let staging = staging_root(&scratch);
         std::fs::create_dir_all(&staging).unwrap();
-        let name = "july-v0.9.0-aarch64-apple-darwin.tar.gz";
+        let name = "july-0.9.0-aarch64-apple-darwin.tar.gz";
         let partial = staging.join(format!("{name}.part"));
         std::fs::write(&partial, b"abd").unwrap();
         // Chính là bước download_verified_asset chạy sau khi tải: digest lệch
@@ -609,7 +622,7 @@ mod tests {
         let parsed = stable("v0.9.0", target);
         assert_eq!(
             select_asset(&parsed, target).unwrap().name,
-            "july-v0.9.0-aarch64-apple-darwin.tar.gz"
+            "july-0.9.0-aarch64-apple-darwin.tar.gz"
         );
         // Asset của nền tảng khác và của phiên bản khác đều không được nhận nhầm.
         assert!(select_asset(&parsed, "x86_64-unknown-linux-gnu").is_none());
