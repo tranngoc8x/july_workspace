@@ -403,6 +403,8 @@ Migrating
 Runtimes
 ✓ codex 1.10.0
 ↑ claude 0.6.1 → 0.70.0
+  ↻ repointed 2 agent(s): cashpoint, ops
+  ⌫ reclaimed 1 superseded installation(s)
 
 July 0.9.0 is ready.
 ```
@@ -449,9 +451,25 @@ Nửa sau gồm hai việc, và chúng chạy bằng spec của bản July mới
    adapter chưa dùng được. Phiên bản luôn được đo lại sau khi cài, không tin
    trình cài báo gì.
 
+Mỗi lần nâng, adapter được cài vào một thư mục mới dưới
+`~/.july/adapters/installations/<adapter>/`. Ngay sau đó July làm hai việc nữa,
+in thụt vào dưới dòng của adapter:
+
+- `↻ repointed` - agent nào đang trỏ vào thư mục vừa bị thay được chuyển sang
+  bản mới. July chỉ ghi lại ba trường nó tự sinh: `executable`,
+  `expected_agent_name`, `expected_agent_version`. Agent trỏ ra chỗ khác không
+  bị đụng tới.
+- `⌫ reclaimed` - xoá các thư mục cài đặt đã quá hai đời. Thư mục đang dùng và
+  thư mục ngay trước nó luôn được giữ, để phiên đang chạy không bị cắt giữa
+  chừng và để còn đường lùi. Thư mục nào vẫn còn agent trỏ vào cũng được giữ.
+
+Việc dọn dẹp không bao giờ chạy khi không mở được workspace database, vì chỉ
+database mới trả lời được "thư mục này còn ai dùng không". Dọn dẹp lỗi chỉ in
+cảnh báo `!`, không làm lệnh update thất bại.
+
 Cấu hình do người dùng sở hữu - agent, project path, model, custom
-instructions, Room membership, dữ liệu workspace - không bị bước nào ở đây ghi
-đè. July chỉ ghi lại danh tính adapter mà chính nó quản lý.
+instructions, `arguments`, `environment`, Room membership, dữ liệu workspace -
+không bị bước nào ở đây ghi đè.
 
 Nửa sau này chạy cả khi binary không đổi, vì `AdapterSpec` nằm trong binary và
 có thể đã khác so với lần cài adapter gần nhất:

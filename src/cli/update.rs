@@ -151,9 +151,9 @@ async fn reconcile_system(installed: &Version, updated: bool) -> Result<(), CliE
         from if from == to => println!("✓ Workspace schema {to}"),
         from => println!("✓ Workspace schema {from} → {to}"),
     }
-    drop(store);
-    // Cấu hình do người dùng sở hữu không bị đụng tới ở đây; reconciliation chỉ
-    // ghi lại danh tính adapter mà July tự quản.
+    // Store được giữ mở tới hết phần Runtimes: chỉ database mới trả lời được
+    // "root này còn agent nào dùng không". Cấu hình do người dùng sở hữu không bị
+    // đụng tới; reconciliation chỉ ghi lại danh tính adapter mà July tự quản.
 
     println!("\nRuntimes");
     let adapters = AdapterStore::open_default()
@@ -174,16 +174,22 @@ async fn reconcile_system(installed: &Version, updated: bool) -> Result<(), CliE
             continue;
         };
         match reconcile_adapter(spec, &adapters, &installer, search.as_deref(), false).await {
-            Ok(report) => match report.from {
-                Some(from) if report.changed => println!("↑ {id} {from} → {}", report.to),
-                _ => println!("✓ {id} {}", report.to),
-            },
+            Ok(report) => {
+                match &report.from {
+                    Some(from) if report.changed => println!("↑ {id} {from} → {}", report.to),
+                    _ => println!("✓ {id} {}", report.to),
+                }
+                report_housekeeping(super::reconcile::repoint_and_reclaim(
+                    spec, &adapters, &report, &store,
+                ));
+            }
             Err(error) => {
                 println!("✗ {id}");
                 failures.push(format!("{id}: {error}"));
             }
         }
     }
+    drop(store);
 
     if failures.is_empty() {
         if updated {
@@ -207,6 +213,26 @@ async fn reconcile_system(installed: &Version, updated: bool) -> Result<(), CliE
             .collect::<Vec<_>>()
             .join("\n")
     )))
+}
+
+/// Dọn dẹp không làm hỏng bản cài, nên chỉ được báo chứ không làm update thất bại.
+fn report_housekeeping(housekeeping: crate::cli::reconcile::Housekeeping) {
+    if !housekeeping.repointed.is_empty() {
+        println!(
+            "  ↻ repointed {} agent(s): {}",
+            housekeeping.repointed.len(),
+            housekeeping.repointed.join(", ")
+        );
+    }
+    if !housekeeping.reclaimed.is_empty() {
+        println!(
+            "  ⌫ reclaimed {} superseded installation(s)",
+            housekeeping.reclaimed.len()
+        );
+    }
+    for warning in housekeeping.warnings {
+        println!("  ! {warning}");
+    }
 }
 
 fn current_executable() -> Result<PathBuf, CliError> {
