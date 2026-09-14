@@ -105,6 +105,20 @@ cargo install --path .
 july --version
 ```
 
+### Cài standalone để dùng self-update
+
+Từ thư mục source, chạy:
+
+```bash
+./scripts/install.sh
+# Hoặc chọn vị trí cài:
+./scripts/install.sh --prefix "$HOME/.local"
+```
+
+Script ghi thông tin xác nhận bản cài để `july update` có thể kiểm tra quyền
+thay binary. Bản cài bằng Cargo tiếp tục cập nhật bằng Cargo. Binary chép tay
+hoặc bản cài chưa có thông tin xác nhận sẽ không được tự động ghi đè.
+
 Kết quả phiên bản hiện tại:
 
 ```text
@@ -373,14 +387,14 @@ July Update
 
 Current July    0.1.0
 Latest stable   0.9.0
-Asset           july-v0.9.0-aarch64-apple-darwin.tar.gz
+Asset           july-0.9.0-aarch64-apple-darwin.tar.gz
 
 Updating July
-✓ Downloaded july-v0.9.0-aarch64-apple-darwin.tar.gz
+✓ Downloaded july-0.9.0-aarch64-apple-darwin.tar.gz
 ✓ Verified release
-  /Users/tony/.july/updates/july-v0.9.0-aarch64-apple-darwin.tar.gz
+✓ Installed July 0.9.0 at /Users/tony/.local/bin/july
 
-July 0.1.0 → 0.9.0 was downloaded and verified.
+July 0.1.0 → 0.9.0 is installed.
 ```
 
 Bản tải về nằm trong `~/.july/updates` (hoặc `$JULY_HOME/updates`), tách hẳn
@@ -389,9 +403,33 @@ kèm asset; chỉ khi khớp file mới được đặt đúng tên asset. Diges
 hỏng giữa chừng hay URL không thuộc repository phát hành của July đều làm lệnh
 dừng lại, xoá file tạm và không đụng tới bản cài đặt hiện tại.
 
-Hiện tại lệnh mới dừng trước bước thay thế binary, nên kể cả khi tải và xác
-minh xong nó vẫn thoát với mã lỗi kèm liên kết tải thủ công thay vì báo đã cập
-nhật. Các trường hợp còn lại:
+Bản vừa bung ra phải tự chạy `--version` và báo đúng phiên bản trước khi được
+cài. Chỉ khi đó July mới đặt nó cạnh file đang dùng rồi đổi tên đè lên bằng một
+thao tác `rename` duy nhất. Hỏng ở bất kỳ bước nào trước đó chỉ để lại file tạm
+đã bị dọn, còn July đang chạy vẫn nguyên vẹn.
+
+Nếu file thực thi thuộc một package manager, July không ghi đè mà báo lệnh
+đúng:
+
+```text
+/Users/tony/.cargo/bin/july is managed by cargo; update it with:
+  cargo install --path . --force
+Current installation was not changed.
+```
+
+Nếu không xác nhận được đây là bản standalone do script cài, July dừng trước
+khi tải và giữ nguyên binary. Đường dẫn nằm ngoài thư mục package manager
+không tự động được coi là bằng chứng cho phép ghi đè.
+
+Hai lần `july update` dùng cùng thư mục staging không chạy chồng nhau; lần thứ hai dừng ngay với
+`Another July update is in progress.` Khoá giữ bằng `flock` nên một lần update
+bị kill không để lại khoá kẹt.
+
+Sau khi thay binary, July chuyển điều khiển sang chính binary mới và giữ khoá
+update xuyên bước chuyển này. Binary mới kiểm tra phiên bản và khoá được bàn
+giao. Hiện tại migration và reconciliation runtime chưa được triển khai, nên
+binary mới vẫn báo cập nhật chưa hoàn tất và thoát khác 0. Nếu bước chuyển
+điều khiển lỗi, thông báo nêu rõ binary đã được thay. Các trường hợp còn lại:
 
 - July đã là bản mới nhất: in `already up to date`, thoát 0;
 - bản cục bộ mới hơn bản phát hành: in `No downgrade was performed.`, thoát 0;

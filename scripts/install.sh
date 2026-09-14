@@ -17,6 +17,12 @@ cargo build --release
 mkdir -p "$prefix/bin"
 install -m 755 target/release/july "$prefix/bin/july"
 "$prefix/bin/july" --version
+# Bind standalone update permission to this exact path and installed content.
+installed_path="$(cd "$prefix/bin" && pwd -P)/july"
+receipt="$(mktemp "$prefix/bin/.july-receipt.XXXXXX")"
+trap 'rm -f "$receipt"' EXIT
+printf '%s\n%s\n' "$installed_path" "$(shasum -a 256 "$installed_path" | awk '{print $1}')" > "$receipt"
+mv -f "$receipt" "$prefix/bin/.july-install-receipt"
 
 case ":$PATH:" in
   *":$prefix/bin:"*) ;;
