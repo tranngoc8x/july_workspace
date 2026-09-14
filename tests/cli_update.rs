@@ -1,5 +1,6 @@
-//! `july update` chỉ nhận đúng một dạng lời gọi và không bao giờ báo thành công
-//! khi bước cài đặt chưa tồn tại.
+//! `july update` chỉ nhận đúng một dạng lời gọi, luôn chạy migration và
+//! reconciliation bằng spec của binary đang chạy, và không bao giờ báo thành
+//! công khi còn một phần chưa xong.
 
 use std::process::{Command, Output};
 
@@ -173,13 +174,14 @@ fn internal_update_requires_matching_version_and_inherited_lock() {
     let file = std::fs::File::create(&path).unwrap();
     let fd = file.as_raw_fd();
     for (locked, version, expected) in [
-        (false, env!("CARGO_PKG_VERSION"), "update lock was not held"),
-        (true, "99.0.0", "binary version mismatch"),
         (
-            true,
+            false,
             env!("CARGO_PKG_VERSION"),
-            "migrations and runtime reconciliation",
+            Some("update lock was not held"),
         ),
+        (true, "99.0.0", Some("binary version mismatch")),
+        // Khoá hợp lệ: binary mới chạy nốt migration và reconciliation.
+        (true, env!("CARGO_PKG_VERSION"), None),
     ] {
         if locked {
             assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
@@ -198,12 +200,21 @@ fn internal_update_requires_matching_version_and_inherited_lock() {
             });
         }
         let output = command.output().unwrap();
-        assert!(!output.status.success());
-        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
-        if locked && version == env!("CARGO_PKG_VERSION") {
-            assert!(
-                String::from_utf8_lossy(&output.stdout).contains("Continuing update with July")
-            );
+        let out = String::from_utf8_lossy(&output.stdout);
+        match expected {
+            Some(reason) => {
+                assert!(!output.status.success());
+                assert!(stderr(&output).contains(reason), "{}", stderr(&output));
+            }
+            None => {
+                assert!(output.status.success(), "{out}\n{}", stderr(&output));
+                assert!(out.contains("Continuing update with July"), "{out}");
+                assert!(out.contains("Workspace schema"), "{out}");
+                assert!(
+                    out.contains(&format!("July {} is ready.", env!("CARGO_PKG_VERSION"))),
+                    "{out}"
+                );
+            }
         }
     }
     drop(file);
@@ -213,6 +224,196 @@ fn internal_update_requires_matching_version_and_inherited_lock() {
     std::os::unix::fs::symlink(&sentinel, &path).unwrap();
     assert!(july_workspace::update::UpdateLock::acquire(&staging).is_err());
     assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "preserve");
-    assert!(!root.join("db").exists());
+    // Migration của handoff hợp lệ đã tạo workspace database.
+    assert!(root.join("db").exists());
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Môi trường update khép kín: curl giả trả metadata từ file, PATH chỉ có công
+/// cụ do test đặt, và mọi trạng thái nằm trong một thư mục tạm.
+#[cfg(unix)]
+struct Sandbox {
+    root: std::path::PathBuf,
+    tools: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Sandbox {
+    fn new(tag: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("july-{tag}-{}", ulid::Ulid::generate()));
+        let tools = root.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(
+            tools.join("curl"),
+            "#!/usr/bin/python3\nimport sys, os\nprint(open(os.environ['TEST_METADATA']).read()); print('200', end='')\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(tools.join("curl"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        Self { root, tools }
+    }
+
+    /// Release ổn định duy nhất mà July nhìn thấy, không kèm asset nào vì các
+    /// đường không thay binary không bao giờ chọn asset.
+    fn publishes(&self, tag: &str) -> &Self {
+        std::fs::write(
+            self.root.join("metadata"),
+            serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false, "assets": []})
+                .to_string(),
+        )
+        .unwrap();
+        self
+    }
+
+    fn database(&self) -> std::path::PathBuf {
+        self.root.join("db")
+    }
+
+    /// Adapter đã được ghi nhận nhưng chưa có receipt cài đặt của July.
+    fn records_adapter(&self, id: &str, bin: &std::path::Path) -> &Self {
+        let adapters = self.root.join("home/adapters");
+        std::fs::create_dir_all(&adapters).unwrap();
+        std::fs::write(
+            adapters.join("identities.json"),
+            serde_json::json!({id: {"name": "test-acp-agent", "version": "1.0.0", "bin": bin}})
+                .to_string(),
+        )
+        .unwrap();
+        self
+    }
+
+    fn update(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_july"))
+            .arg("update")
+            .env("PATH", &self.tools)
+            .env("HOME", &self.root)
+            .env("JULY_HOME", self.root.join("home"))
+            .env("JULY_WORKSPACE_DB", self.database())
+            .env("TEST_METADATA", self.root.join("metadata"))
+            .output()
+            .unwrap()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn already_latest_still_migrates_and_reconciles() {
+    let sandbox = Sandbox::new("cli-update-latest");
+    let output = sandbox
+        .publishes(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        .update();
+    let out = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{out}\n{}", stderr(&output));
+    assert!(out.contains("is already up to date"), "{out}");
+    // Binary không đổi nhưng spec của nó vẫn được áp lên hệ thống.
+    assert!(out.contains("Workspace schema"), "{out}");
+    assert!(out.contains("System is up to date."), "{out}");
+    assert!(sandbox.database().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_newer_local_july_reconciles_without_downgrading() {
+    let sandbox = Sandbox::new("cli-update-newer");
+    let output = sandbox.publishes("v0.0.1").update();
+    let out = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{out}\n{}", stderr(&output));
+    assert!(out.contains("No downgrade was performed."), "{out}");
+    assert!(out.contains("Workspace schema"), "{out}");
+    assert!(out.contains("System is up to date."), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_runtime_is_reported_instead_of_reported_as_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new("cli-update-runtime");
+    // Trình cài duy nhất July tìm thấy luôn hỏng, nên adapter thiếu không thể
+    // được đưa về trạng thái tương thích.
+    std::fs::write(sandbox.tools.join("npm"), "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(
+        sandbox.tools.join("npm"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let missing = sandbox
+        .root
+        .join("home/adapters/node_modules/.bin/codex-acp");
+    let output = sandbox
+        .publishes(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        .records_adapter("codex", &missing)
+        .update();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = stderr(&output);
+
+    assert!(!output.status.success(), "{out}");
+    assert!(out.contains("✗ codex"), "{out}");
+    assert!(err.contains("1 runtime requires attention"), "{err}");
+    assert!(err.contains("- codex:"), "{err}");
+    // Partial failure không bao giờ được in ra như một lần update trọn vẹn.
+    assert!(!out.contains("System is up to date."), "{out}");
+    assert!(!out.contains("is ready."), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reconciliation_keeps_a_compatible_runtime_and_every_user_owned_record() {
+    use july_workspace::domain::{Agent, AgentId};
+    use july_workspace::storage::SqliteStore;
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new("cli-update-preserve");
+    let adapter = sandbox.tools.join("codex-acp");
+    std::fs::write(
+        &adapter,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '1.10.0'; exit; fi\nexec /usr/bin/python3 '{}/tests/fixtures/acp_agent.py'\n",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let agent = Agent {
+        id: AgentId::new(),
+        name: "cashpoint".into(),
+        project_root: "/tmp/cashpoint".into(),
+        transport_type: "acp".into(),
+        transport_config: serde_json::json!({"model": "user-chosen"}),
+        status: "active".into(),
+        metadata: serde_json::json!({"instructions": "user-owned"}),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    };
+    let store = SqliteStore::open(sandbox.database()).unwrap();
+    store.insert_agent(&agent).unwrap();
+    let schema_before = store.schema_version().unwrap();
+    drop(store);
+
+    let output = sandbox
+        .publishes(&format!("v{}", env!("CARGO_PKG_VERSION")))
+        .records_adapter("codex", &adapter)
+        .update();
+    let out = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{out}\n{}", stderr(&output));
+    assert!(out.contains("✓ codex 1.10.0"), "{out}");
+    assert!(out.contains("System is up to date."), "{out}");
+
+    let store = SqliteStore::open(sandbox.database()).unwrap();
+    assert_eq!(store.schema_version().unwrap(), schema_before);
+    let preserved = store.get_agent(agent.id).unwrap().expect("agent survives");
+    assert_eq!(preserved.name, agent.name);
+    assert_eq!(preserved.project_root, agent.project_root);
+    assert_eq!(preserved.transport_config, agent.transport_config);
+    assert_eq!(preserved.metadata, agent.metadata);
 }

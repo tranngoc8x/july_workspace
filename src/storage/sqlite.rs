@@ -165,6 +165,7 @@ pub(crate) struct RoomActivationClaim {
 /// ```
 pub struct SqliteStore {
     connection: Connection,
+    migrated_from: i64,
 }
 
 impl SqliteStore {
@@ -181,12 +182,21 @@ impl SqliteStore {
                 "pre-Phase9 Work schema; use a fresh workspace database",
             ));
         }
-        apply_migrations(&mut connection, &MIGRATIONS)?;
-        Ok(Self { connection })
+        let migrated_from = apply_migrations(&mut connection, &MIGRATIONS)?;
+        Ok(Self {
+            connection,
+            migrated_from,
+        })
     }
 
     pub fn schema_version(&self) -> Result<i64, StoreError> {
         current_schema_version(&self.connection)
+    }
+
+    /// Schema version ngay trước khi `open` áp dụng migration. `july update` báo
+    /// đúng bước đã chạy thay vì chỉ in version cuối cùng.
+    pub fn migrated_from(&self) -> i64 {
+        self.migrated_from
     }
 
     pub fn insert_agent(&self, agent: &Agent) -> Result<(), StoreError> {
@@ -4561,10 +4571,11 @@ struct Migration {
     sql: &'static str,
 }
 
+/// Trả về schema version trước khi chạy, để caller báo được khoảng đã migrate.
 fn apply_migrations(
     connection: &mut Connection,
     migrations: &[Migration],
-) -> Result<(), StoreError> {
+) -> Result<i64, StoreError> {
     let current = current_schema_version(connection)?;
     let supported = migrations.last().map_or(0, |migration| migration.version);
     if current > supported {
@@ -4587,7 +4598,7 @@ fn apply_migrations(
         transaction.commit()?;
     }
 
-    Ok(())
+    Ok(current)
 }
 
 fn current_schema_version(connection: &Connection) -> Result<i64, StoreError> {
@@ -5633,7 +5644,10 @@ mod tests {
                 params![work_id.to_string(), conversation_id.to_string()],
             )
             .unwrap();
-        let store = SqliteStore { connection };
+        let store = SqliteStore {
+            connection,
+            migrated_from: 0,
+        };
 
         assert!(matches!(
             store.get_work_item(work_id),
@@ -6282,7 +6296,10 @@ mod tests {
                  );"
             ))
             .unwrap();
-        let store = SqliteStore { connection };
+        let store = SqliteStore {
+            connection,
+            migrated_from: 0,
+        };
 
         assert!(matches!(
             store.get_work_result(invalid_result_id),
@@ -6348,7 +6365,10 @@ mod tests {
                 params![upstream_id.to_string(), downstream_id.to_string()],
             )
             .unwrap();
-        let store = SqliteStore { connection };
+        let store = SqliteStore {
+            connection,
+            migrated_from: 0,
+        };
 
         assert!(matches!(
             store.get_work_dependency(upstream_id, downstream_id),
