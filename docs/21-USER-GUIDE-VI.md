@@ -395,6 +395,16 @@ Updating July
 ✓ Installed July 0.9.0 at /Users/tony/.local/bin/july
 
 July 0.1.0 → 0.9.0 is installed.
+✓ Continuing update with July 0.9.0
+
+Migrating
+✓ Workspace schema 20 → 21
+
+Runtimes
+✓ codex 1.10.0
+↑ claude 0.6.1 → 0.70.0
+
+July 0.9.0 is ready.
 ```
 
 Bản tải về nằm trong `~/.july/updates` (hoặc `$JULY_HOME/updates`), tách hẳn
@@ -427,14 +437,53 @@ bị kill không để lại khoá kẹt.
 
 Sau khi thay binary, July chuyển điều khiển sang chính binary mới và giữ khoá
 update xuyên bước chuyển này. Binary mới kiểm tra phiên bản và khoá được bàn
-giao. Hiện tại migration và reconciliation runtime chưa được triển khai, nên
-binary mới vẫn báo cập nhật chưa hoàn tất và thoát khác 0. Nếu bước chuyển
-điều khiển lỗi, thông báo nêu rõ binary đã được thay. Các trường hợp còn lại:
+giao, rồi chạy nốt nửa sau của update. Nếu bước chuyển điều khiển lỗi, thông
+báo nêu rõ binary đã được thay.
 
-- July đã là bản mới nhất: in `already up to date`, thoát 0;
-- bản cục bộ mới hơn bản phát hành: in `No downgrade was performed.`, thoát 0;
+Nửa sau gồm hai việc, và chúng chạy bằng spec của bản July mới:
+
+1. **Migrating** - mở workspace database và áp các migration schema còn thiếu.
+   Dòng in ra cho biết schema đi từ đâu tới đâu.
+2. **Runtimes** - đối chiếu từng adapter đã cài với `version_req` của bản July
+   đang chạy: `✓` là giữ nguyên, `↑` là nâng lên `install_version`, `✗` là
+   adapter chưa dùng được. Phiên bản luôn được đo lại sau khi cài, không tin
+   trình cài báo gì.
+
+Cấu hình do người dùng sở hữu - agent, project path, model, custom
+instructions, Room membership, dữ liệu workspace - không bị bước nào ở đây ghi
+đè. July chỉ ghi lại danh tính adapter mà chính nó quản lý.
+
+Nửa sau này chạy cả khi binary không đổi, vì `AdapterSpec` nằm trong binary và
+có thể đã khác so với lần cài adapter gần nhất:
+
+```text
+July 0.9.0 is already up to date.
+
+Migrating
+✓ Workspace schema 21
+
+Runtimes
+✓ codex 1.10.0
+
+System is up to date.
+```
+
+Một adapter hỏng không làm hỏng cả lần update, nhưng cũng không bị im lặng bỏ
+qua: July giữ những phần đã chạy được, liệt kê phần cần xử lý và thoát khác 0.
+
+```text
+July 0.9.0 was installed.
+1 runtime requires attention:
+- claude: Incompatible, executable /Users/tony/.july/adapters/node_modules/.bin/claude-agent-acp; cần xử lý thủ công, chưa thay đổi cài đặt
+```
+
+Các trường hợp còn lại:
+
+- bản cục bộ mới hơn bản phát hành: in `No downgrade was performed.` rồi vẫn
+  chạy migration và reconciliation, thoát 0 nếu không có gì hỏng;
 - không đọc được GitHub: in `Unable to check for July updates`, thoát khác 0 và
-  không đụng tới bản cài đặt hiện tại.
+  không đụng tới bản cài đặt hiện tại;
+- hai lần `july update` không chạy chồng nhau kể cả ở đường không thay binary.
 
 Bản prerelease, draft và asset không thuộc repository phát hành của July đều bị
 từ chối.

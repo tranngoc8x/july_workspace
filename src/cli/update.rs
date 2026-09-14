@@ -1,7 +1,14 @@
 //! `july update`: đối chiếu bản cài đặt hiện tại với bản phát hành ổn định mới nhất.
+//!
+//! Sau khi binary đã đúng phiên bản, July chạy migration schema rồi đưa các
+//! runtime về đúng `AdapterSpec` mà chính bản đang chạy mang theo. Bước này
+//! chạy cả khi July đã là bản mới nhất, vì spec có thể đã đổi mà binary thì
+//! không.
 
 use super::CliError;
-use crate::adapter::AdapterStore;
+use super::reconcile::reconcile_adapter;
+use crate::adapter::{AdapterStore, SystemInstaller};
+use crate::storage::SqliteStore;
 use crate::update::{
     InstallOwnership, JulyUpdate, ReleaseAsset, UpdateLock, classify_install,
     download_verified_asset, fetch_latest_stable, install_release, plan_july_update, staging_root,
@@ -29,12 +36,13 @@ pub(crate) async fn run_update() -> Result<(), CliError> {
     match plan_july_update(&current, &release, target) {
         JulyUpdate::UpToDate { version } => {
             println!("\nJuly {version} is already up to date.");
-            Ok(())
+            // Binary không đổi nhưng spec của nó vẫn phải được áp lên runtime.
+            reconcile_held(&version, false).await
         }
         JulyUpdate::LocalNewer { local, latest } => {
             println!("\nJuly {local} is newer than the latest stable release {latest}.");
             println!("No downgrade was performed.");
-            Ok(())
+            reconcile_held(&local, false).await
         }
         JulyUpdate::AssetMissing { latest, target } => Err(CliError::Update(format!(
             "release {latest} publishes no asset for {target}"
@@ -83,15 +91,16 @@ async fn upgrade(from: &Version, to: &Version, asset: &ReleaseAsset) -> Result<(
         })?;
     println!("✓ Installed July {to} at {}", executable.display());
     println!("\nJuly {from} → {to} is installed.");
-    // Binary đã đổi nhưng migration và reconciliation runtime chưa chạy, nên
-    // lệnh chưa hoàn thành hợp đồng của `july update`.
+    // Migration và reconciliation phải chạy bằng spec của bản mới, nên tiến
+    // trình này tự thay chính nó bằng binary vừa cài thay vì chạy tiếp.
     Err(CliError::Update(format!(
         "July {to} was installed, but handoff failed: {}",
         crate::update::handoff::exec(&executable, to, &lock)
     )))
 }
 
-pub(crate) fn finalize_update(version: &str, fd: i32) -> Result<(), CliError> {
+/// Nửa sau của update, chạy bằng binary mới ngay sau `handoff::exec`.
+pub(crate) async fn finalize_update(version: &str, fd: i32) -> Result<(), CliError> {
     if version != env!("CARGO_PKG_VERSION") {
         return Err(CliError::Update(
             "invalid update handoff: binary version mismatch".into(),
@@ -101,7 +110,103 @@ pub(crate) fn finalize_update(version: &str, fd: i32) -> Result<(), CliError> {
     let _lock = crate::update::handoff::validate(fd, &staging_root(store.home()))
         .map_err(|error| CliError::Update(format!("invalid update handoff: {error}")))?;
     println!("✓ Continuing update with July {version}");
-    Err(CliError::UpdateIncomplete)
+    let installed = Version::parse(version)
+        .map_err(|error| CliError::Update(format!("build version is not SemVer: {error}")))?;
+    // Khoá vẫn do fd thừa kế giữ, nên phần này không tự lấy khoá lần nữa.
+    reconcile_system(&installed, true).await
+}
+
+/// Giữ khoá update trong suốt migration/reconciliation của đường không thay binary.
+async fn reconcile_held(installed: &Version, updated: bool) -> Result<(), CliError> {
+    let store = AdapterStore::open_default()?;
+    let _lock = UpdateLock::acquire(&staging_root(store.home()))
+        .map_err(|error| CliError::Update(error.to_string()))?;
+    reconcile_system(installed, updated).await
+}
+
+/// Áp schema migration và spec runtime của bản July đang chạy.
+///
+/// Partial failure không được biến thành thành công: adapter hỏng vẫn được báo
+/// tên kèm lý do và lệnh thoát khác 0, trong khi phần đã chạy được vẫn giữ.
+async fn reconcile_system(installed: &Version, updated: bool) -> Result<(), CliError> {
+    let state = if updated {
+        format!("July {installed} was installed")
+    } else {
+        format!("July {installed} is unchanged")
+    };
+
+    // Mọi lỗi từ đây trở đi đều phải nói rõ binary đã bị thay hay chưa: sau
+    // handoff, người dùng không còn nhìn thấy tiến trình cũ để suy ra điều đó.
+    let framed = |reason: String| CliError::Update(format!("{state}, but {reason}"));
+
+    println!("\nMigrating");
+    let database = super::database_path()
+        .map_err(|error| framed(format!("the workspace database is unreachable: {error}")))?;
+    let store = SqliteStore::open(&database)
+        .map_err(|error| framed(format!("the workspace database was not migrated: {error}")))?;
+    let to = store
+        .schema_version()
+        .map_err(|error| framed(format!("schema version is unreadable: {error}")))?;
+    match store.migrated_from() {
+        from if from == to => println!("✓ Workspace schema {to}"),
+        from => println!("✓ Workspace schema {from} → {to}"),
+    }
+    drop(store);
+    // Cấu hình do người dùng sở hữu không bị đụng tới ở đây; reconciliation chỉ
+    // ghi lại danh tính adapter mà July tự quản.
+
+    println!("\nRuntimes");
+    let adapters = AdapterStore::open_default()
+        .map_err(|error| framed(format!("the adapter store is unreachable: {error}")))?;
+    let identities = adapters
+        .identities()
+        .map_err(|error| framed(format!("recorded adapters are unreadable: {error}")))?;
+    if identities.is_empty() {
+        println!("(no runtimes are set up; run july setup)");
+    }
+    let installer = SystemInstaller;
+    let search = std::env::var_os("PATH");
+    let mut failures = Vec::new();
+    for id in identities.keys() {
+        let Some(spec) = crate::adapter::find(id) else {
+            println!("✗ {id}");
+            failures.push(format!("{id}: not supported by July {installed}"));
+            continue;
+        };
+        match reconcile_adapter(spec, &adapters, &installer, search.as_deref(), false).await {
+            Ok(report) => match report.from {
+                Some(from) if report.changed => println!("↑ {id} {from} → {}", report.to),
+                _ => println!("✓ {id} {}", report.to),
+            },
+            Err(error) => {
+                println!("✗ {id}");
+                failures.push(format!("{id}: {error}"));
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        if updated {
+            println!("\nJuly {installed} is ready.");
+        } else {
+            println!("\nSystem is up to date.");
+        }
+        return Ok(());
+    }
+    let plural = if failures.len() == 1 {
+        "runtime requires"
+    } else {
+        "runtimes require"
+    };
+    Err(CliError::Update(format!(
+        "{state}.\n{} {plural} attention:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .map(|failure| format!("- {failure}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )))
 }
 
 fn current_executable() -> Result<PathBuf, CliError> {
