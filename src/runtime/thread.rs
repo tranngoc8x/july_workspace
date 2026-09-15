@@ -180,11 +180,15 @@ impl<T: AgentTransport + Send + 'static> AgentThreadRuntime<T> {
                         }
                     }
                 }
-                TransportEvent::TurnFailed { session, failure } => {
+                TransportEvent::TurnFailed {
+                    session,
+                    failure,
+                    reason,
+                } => {
                     require_session(&expected, &session)?;
                     return Err(capsule_error.unwrap_or_else(|| {
                         CollaborationError::Runtime(format!(
-                            "Thread mention capsule turn failed: {failure:?}"
+                            "Thread mention capsule turn failed: {failure:?}: {reason}"
                         ))
                     }));
                 }
@@ -622,7 +626,9 @@ impl<T: AgentTransport + Send + 'static> ThreadChatRuntime for AgentThreadRuntim
                     require_session(&expected, &session)?;
                     return Ok(Some(ChatRuntimeEvent::TurnCompleted));
                 }
-                TransportEvent::TurnFailed { session, failure } => {
+                TransportEvent::TurnFailed {
+                    session, failure, ..
+                } => {
                     require_session(&expected, &session)?;
                     return Ok(Some(ChatRuntimeEvent::TurnFailed(match failure {
                         TransportFailureKind::AuthenticationRequired => {
