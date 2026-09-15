@@ -528,6 +528,9 @@ fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
     assert!(listed.contains("NAME"));
     assert!(listed.contains("PROJECT"));
     assert!(listed.contains("TRANSPORT"));
+    assert!(listed.contains("RUNTIME"));
+    // No `runtime` metadata: the column falls back to the pinned adapter name.
+    assert!(listed.contains("test-acp-agent"));
     assert!(listed.contains("STATUS\n"));
     assert!(listed.contains(&codex.id.to_string()));
     assert!(!listed.contains('\t'));

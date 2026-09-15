@@ -1503,15 +1503,24 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
                 Ok(agents) => {
                     let output = render_table(
-                        ["AGENT ID", "NAME", "PROJECT", "TRANSPORT", "STATUS"],
+                        [
+                            "AGENT ID",
+                            "NAME",
+                            "PROJECT",
+                            "TRANSPORT",
+                            "RUNTIME",
+                            "STATUS",
+                        ],
                         agents
                             .into_iter()
                             .map(|agent| {
+                                let runtime = agent_runtime_display(&agent);
                                 [
                                     agent.id.to_string(),
                                     agent.name,
                                     agent.project_root,
                                     agent.transport_type,
+                                    runtime,
                                     agent.status,
                                 ]
                             })
@@ -3860,7 +3869,7 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                                     agent.name.clone(),
                                     agent.project_root.clone(),
                                     agent.transport_type.clone(),
-                                    agent_runtime(agent),
+                                    agent_runtime_display(agent),
                                     agent.status.clone(),
                                 ]
                             })
@@ -3939,6 +3948,22 @@ fn agent_runtime(agent: &crate::domain::Agent) -> String {
         .to_owned()
 }
 
+/// Runtime for human output. `--runtime` is optional, so agents onboarded
+/// without it fall back to the ACP adapter their transport is pinned to
+/// instead of showing an empty cell. JSON keeps the raw metadata.
+fn agent_runtime_display(agent: &crate::domain::Agent) -> String {
+    let runtime = agent_runtime(agent);
+    if !runtime.is_empty() {
+        return runtime;
+    }
+    agent
+        .transport_config
+        .get("expected_agent_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn agent_json(agent: &crate::domain::Agent) -> serde_json::Value {
     json!({
         "agent_id": agent.id.to_string(),
@@ -3962,7 +3987,7 @@ fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
         agent.name,
         agent.project_root,
         agent.transport_type,
-        agent_runtime(agent),
+        agent_runtime_display(agent),
         agent.status,
     )
 }
