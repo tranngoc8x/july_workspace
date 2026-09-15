@@ -11,7 +11,11 @@ pub enum RoomRuntimeEvent {
     PermissionRequested(PermissionRequest),
     Completed,
     Cancelled,
-    Failed(TransportFailureKind),
+    Failed {
+        failure: TransportFailureKind,
+        /// Lý do đã lọc từ transport; không có nó thì `Protocol` không chẩn đoán được gì.
+        reason: String,
+    },
 }
 
 /// A single claimed Room activation. Drop cancels and quarantines an unfinished
@@ -139,9 +143,9 @@ impl RoomActivation {
                 } else {
                     RoomRuntimeEvent::Completed
                 }),
-                Some(TransportEvent::TurnFailed { failure, .. }) => {
-                    Ok(RoomRuntimeEvent::Failed(failure))
-                }
+                Some(TransportEvent::TurnFailed {
+                    failure, reason, ..
+                }) => Ok(RoomRuntimeEvent::Failed { failure, reason }),
                 Some(
                     TransportEvent::SessionLost { .. }
                     | TransportEvent::TransportDisconnected { .. },

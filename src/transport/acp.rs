@@ -764,6 +764,7 @@ fn start_turn(
                         .send(TransportEvent::TurnFailed {
                             session,
                             failure: sdk_failure_kind(&error),
+                            reason: sanitized_sdk_reason(&error),
                         })
                         .await;
                 }

@@ -169,6 +169,8 @@ pub enum TransportEvent {
     TurnFailed {
         session: SessionRef,
         failure: TransportFailureKind,
+        /// Lý do đã được lọc, đủ để chẩn đoán mà không mang nội dung của agent ra.
+        reason: String,
     },
     UsageReported {
         session: SessionRef,

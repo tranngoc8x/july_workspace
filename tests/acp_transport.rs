@@ -615,12 +615,20 @@ async fn prompt_auth_failure_stays_typed() {
         events.recv().await,
         Some(TransportEvent::TurnStarted { .. })
     ));
-    assert_eq!(
-        events.recv().await,
-        Some(TransportEvent::TurnFailed {
-            session,
-            failure: TransportFailureKind::AuthenticationRequired,
-        })
+    let Some(TransportEvent::TurnFailed {
+        session: failed,
+        failure,
+        reason,
+    }) = events.recv().await
+    else {
+        panic!("expected a failed turn");
+    };
+    assert_eq!(failed, session);
+    assert_eq!(failure, TransportFailureKind::AuthenticationRequired);
+    // Lý do đi kèm mọi lần hỏng, kể cả lần hỏng đã có kind riêng.
+    assert!(
+        reason.starts_with("ACP request failed ("),
+        "reason: {reason}"
     );
     transport.shutdown().await.unwrap();
 }

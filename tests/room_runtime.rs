@@ -976,6 +976,7 @@ async fn room_terminal_failures_and_disconnects_close_activation_without_shared_
             "failure" => TransportEvent::TurnFailed {
                 session: active.session().clone(),
                 failure: july_workspace::transport::TransportFailureKind::Protocol,
+                reason: "ACP request failed (internal error)".into(),
             },
             "lost" => TransportEvent::SessionLost {
                 session: active.session().clone(),
@@ -988,7 +989,11 @@ async fn room_terminal_failures_and_disconnects_close_activation_without_shared_
         events.send(event).await.unwrap();
         let result = active.next_event(NOW.into()).await;
         if mode == "failure" {
-            assert!(matches!(result, Ok(Some(RoomRuntimeEvent::Failed(_)))));
+            // Lý do phải đi kèm tới nơi hiển thị, nếu không `Protocol` là vô nghĩa.
+            let Ok(Some(RoomRuntimeEvent::Failed { reason, .. })) = result else {
+                panic!("expected a failed room turn");
+            };
+            assert_eq!(reason, "ACP request failed (internal error)");
         } else {
             assert!(result.is_err());
         }
