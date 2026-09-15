@@ -652,7 +652,9 @@ impl<T: AgentTransport + Send + 'static> DirectMessageRuntime for AgentDirectMes
                     self.require_session(&session)?;
                     return Ok(Some(DirectMessageRuntimeEvent::TurnCompleted));
                 }
-                TransportEvent::TurnFailed { session, failure } => {
+                TransportEvent::TurnFailed {
+                    session, failure, ..
+                } => {
                     self.require_session(&session)?;
                     return Ok(Some(DirectMessageRuntimeEvent::TurnFailed(match failure {
                         TransportFailureKind::AuthenticationRequired => {
