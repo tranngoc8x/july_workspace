@@ -148,6 +148,7 @@ Hai biến môi trường hữu ích:
 |---|---|
 | `JULY_HOME` | Đổi thư mục chứa adapter, identity và runtime state |
 | `JULY_WORKSPACE_DB` | Đổi chính xác đường dẫn SQLite database |
+| `JULY_ACP_LOG` | Bật chẩn đoán ACP: ghi stderr của adapter vào `<state_directory>/acp-stderr.log` và in kèm `message`/`data` của lỗi ACP. Mặc định tắt vì các chuỗi này do agent sinh ra |
 
 Ví dụ tạo một môi trường thử nghiệm tách khỏi dữ liệu thật:
 
