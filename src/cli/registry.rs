@@ -96,8 +96,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         kind: Navigation,
         scopes: CommandScope::ALL,
         summary: "open a direct message with an agent",
-        usage: "/dm <agent>",
-        examples: &["/dm cashpoint"],
+        usage: "/dm <agent> [message]",
+        examples: &["/dm cashpoint", "/dm @cashpoint what is still open?"],
     },
     CommandSpec {
         name: "/room",
