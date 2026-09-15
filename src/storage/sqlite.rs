@@ -4763,14 +4763,14 @@ mod tests {
         assert_eq!(snapshot(&connection), before);
         assert_eq!(super::current_schema_version(&connection).unwrap(), 20);
         assert!(
-            !connection
+            connection
                 .prepare("PRAGMA foreign_key_check")
                 .unwrap()
                 .query([])
                 .unwrap()
                 .next()
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         connection.execute("INSERT INTO room_message_publications VALUES ('trigger', 'agent-1', 'key', 'trigger')", []).unwrap();
         assert!(
@@ -6692,14 +6692,14 @@ mod tests {
             "cancelled"
         );
         assert!(
-            !connection
+            connection
                 .prepare("PRAGMA foreign_key_check")
                 .unwrap()
                 .query([])
                 .unwrap()
                 .next()
                 .unwrap()
-                .is_some()
+                .is_none()
         );
         for sql in [
             "UPDATE permission_decisions SET outcome = 'selected'",
@@ -6745,14 +6745,14 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !connection
+            connection
                 .prepare("PRAGMA foreign_key_check")
                 .unwrap()
                 .query([])
                 .unwrap()
                 .next()
                 .unwrap()
-                .is_some()
+                .is_none()
         );
     }
 
