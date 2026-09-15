@@ -999,23 +999,34 @@ fn acp_debug_enabled() -> bool {
     std::env::var_os("JULY_ACP_LOG").is_some_and(|value| !value.is_empty())
 }
 
+/// Lý do một request ACP hỏng, đủ để người dùng biết phải làm gì.
+///
+/// Adapter đặt câu dành cho người dùng vào `data.message` (hết hạn mức, chưa
+/// đăng nhập, ...) còn `message` chỉ lặp lại tên mã lỗi. Giấu `data.message` đi
+/// là biến mọi sự cố thành một chữ `Internal error` không hành động được, nên nó
+/// trở thành toàn bộ lý do; phần `data` còn lại chỉ hiện khi bật chẩn đoán.
 fn sanitized_sdk_reason(error: &agent_client_protocol::Error) -> String {
-    if !acp_debug_enabled() {
-        return format!("ACP request failed ({})", error.code);
-    }
-    let mut reason = format!("ACP request failed ({}): {}", error.code, error.message);
-    if let Some(data) = &error.data {
+    let code = error.code.to_string();
+    let detail = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(error.message.as_str())
+        .trim();
+    // Có câu của adapter thì in thẳng câu đó: thêm mã lỗi vào trước chỉ đẩy phần
+    // người dùng cần ra xa. Không có thì mã lỗi là tất cả những gì còn lại.
+    let mut reason = if detail.is_empty() || detail == code {
+        format!("ACP request failed ({code})")
+    } else {
+        detail.to_owned()
+    };
+    if acp_debug_enabled()
+        && let Some(data) = &error.data
+    {
         reason.push_str(&format!(" {data}"));
     }
     reason
-}
-
-fn sdk_failure_kind(error: &agent_client_protocol::Error) -> TransportFailureKind {
-    if error.code == agent_client_protocol::schema::v1::ErrorCode::AuthRequired {
-        TransportFailureKind::AuthenticationRequired
-    } else {
-        TransportFailureKind::Protocol
-    }
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1133,4 +1144,36 @@ fn room_mcp_servers(
         })
         .into_iter()
         .collect()
+}
+
+fn sdk_failure_kind(error: &agent_client_protocol::Error) -> TransportFailureKind {
+    if error.code == agent_client_protocol::schema::v1::ErrorCode::AuthRequired {
+        TransportFailureKind::AuthenticationRequired
+    } else {
+        TransportFailureKind::Protocol
+    }
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::sanitized_sdk_reason;
+    use agent_client_protocol::Error;
+
+    #[test]
+    fn a_user_facing_detail_survives_and_a_bare_code_is_not_repeated() {
+        let bare = Error::new(-32603, "Internal error");
+        assert_eq!(
+            sanitized_sdk_reason(&bare),
+            "ACP request failed (Internal error)"
+        );
+
+        let limited = Error::new(-32603, "Internal error").data(serde_json::json!({
+            "message": "You've hit your usage limit.",
+            "codexErrorInfo": "usageLimitExceeded",
+        }));
+        assert_eq!(
+            sanitized_sdk_reason(&limited),
+            "You've hit your usage limit."
+        );
+    }
 }
