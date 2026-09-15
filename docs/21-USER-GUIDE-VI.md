@@ -707,7 +707,7 @@ Quy tắc bổ sung:
 | `/work` | Room | Liệt kê Work của Room |
 | `/work <work-id> [--agent <agent>]` | Room, Work | Vào một Work |
 | `/work` | Work | Liệt kê work item bên trong Work hiện tại |
-| `/dm <agent>` | mọi context | Mở việc trực tiếp (tương đương `@agent` không prompt) |
+| `/dm <agent> [câu hỏi]` | mọi context | Mở việc trực tiếp; có câu hỏi thì gửi luôn (tương đương `@agent [câu hỏi]`). Tên agent nhận cả dạng `@agent` |
 | `/back` | mọi context | Quay lại context trước |
 | `/rooms` | mọi context | Liệt kê Room |
 | `/agents` | mọi context | Liệt kê Agent |
