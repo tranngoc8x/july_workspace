@@ -12,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     ResumeSessionRequest, SelectedPermissionOutcome, SessionModeState, SessionNotification,
     SessionUpdate, SetSessionModeRequest, TextContent, ToolCallStatus,
 };
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo};
+use agent_client_protocol::{AcpAgent, Agent, ConnectionTo, LineDirection};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -137,7 +137,28 @@ impl AgentTransport for AcpTransport {
         let sdk_config = agent_client_protocol::AcpAgentConfig::new(&self.config.executable)
             .args(self.config.arguments.clone())
             .envs(self.config.environment.clone());
-        let acp_agent = AcpAgent::new(sdk_config);
+        let mut acp_agent = AcpAgent::new(sdk_config);
+        if acp_debug_enabled() {
+            // Khi adapter trả về Internal error, stderr của chính nó là nguồn
+            // chẩn đoán duy nhất. Chỉ stderr được ghi: stdout là JSON-RPC mang
+            // nội dung hội thoại.
+            let log = self.config.state_directory.join(ACP_STDERR_LOG);
+            acp_agent = acp_agent.with_debug(move |line, direction| {
+                if direction != LineDirection::Stderr {
+                    return;
+                }
+                // ponytail: mở file mỗi dòng; chỉ chạy khi bật debug nên chưa
+                // đáng giữ handle, đổi sang Mutex<File> nếu thấy chậm.
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{line}");
+                }
+            });
+        }
         let (commands, command_receiver) = mpsc::channel(COMMAND_CAPACITY);
         let (ready, connected) = oneshot::channel();
         let config = self.config.clone();
@@ -970,8 +991,23 @@ fn map_sdk_error(error: agent_client_protocol::Error) -> TransportError {
     }
 }
 
+/// Tên file stderr của adapter, nằm trong `state_directory` của chính agent đó.
+const ACP_STDERR_LOG: &str = "acp-stderr.log";
+
+/// Chẩn đoán chi tiết chỉ bật khi được yêu cầu, vì nó mang chuỗi do agent sinh ra.
+fn acp_debug_enabled() -> bool {
+    std::env::var_os("JULY_ACP_LOG").is_some_and(|value| !value.is_empty())
+}
+
 fn sanitized_sdk_reason(error: &agent_client_protocol::Error) -> String {
-    format!("ACP request failed ({})", error.code)
+    if !acp_debug_enabled() {
+        return format!("ACP request failed ({})", error.code);
+    }
+    let mut reason = format!("ACP request failed ({}): {}", error.code, error.message);
+    if let Some(data) = &error.data {
+        reason.push_str(&format!(" {data}"));
+    }
+    reason
 }
 
 fn sdk_failure_kind(error: &agent_client_protocol::Error) -> TransportFailureKind {
