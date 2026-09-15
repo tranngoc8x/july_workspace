@@ -625,11 +625,8 @@ async fn prompt_auth_failure_stays_typed() {
     };
     assert_eq!(failed, session);
     assert_eq!(failure, TransportFailureKind::AuthenticationRequired);
-    // Lý do đi kèm mọi lần hỏng, kể cả lần hỏng đã có kind riêng.
-    assert!(
-        reason.starts_with("ACP request failed ("),
-        "reason: {reason}"
-    );
+    // Lý do đi kèm mọi lần hỏng, và là câu của chính adapter chứ không phải tên mã lỗi.
+    assert_eq!(reason, "Login required");
     transport.shutdown().await.unwrap();
 }
 

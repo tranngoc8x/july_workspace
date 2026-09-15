@@ -2886,7 +2886,7 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                         let (name, _) = activations[index].take().unwrap();
                         match terminal {
                             Err(error) => room_status(format!("{name}: failed: {error}"), stderr, tui_events)?,
-                            Ok(Some(RoomRuntimeEvent::Failed { failure, reason })) => room_status(format!("{name}: failed: {failure:?}: {reason}"), stderr, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Failed { reason, .. })) => room_status(format!("{name}: failed: {reason}"), stderr, tui_events)?,
                             Ok(Some(RoomRuntimeEvent::Cancelled)) => room_status(format!("{name}: cancelled"), stdout, tui_events)?,
                             Ok(Some(RoomRuntimeEvent::Completed)) => room_status(format!("{name}: completed"), stdout, tui_events)?,
                             _ => {},
