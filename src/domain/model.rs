@@ -829,7 +829,8 @@ impl Handoff {
         require_text(&self.created_at, "handoff.created_at")?;
         require_text(&self.updated_at, "handoff.updated_at")?;
         let scoped = self.status == HandoffStatus::Partial;
-        if !scoped && !(self.owned_scope.is_empty() && self.rejected_scope.is_empty()) {
+        let has_scope = !self.owned_scope.is_empty() || !self.rejected_scope.is_empty();
+        if !scoped && has_scope {
             return Err(DomainError::HandoffScopeNotAllowed);
         }
         match self.status {
