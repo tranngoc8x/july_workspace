@@ -2122,7 +2122,24 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 }
             }
             "/dm" if !arguments.is_empty() => {
-                let agent = match agent_ref(arguments) {
+                // `@agent` là cách gọi agent ở mọi chỗ khác trong REPL, nên nó
+                // được chấp nhận ở đây thay vì trở thành một cái tên không có.
+                let (target, prompt) = match arguments.split_once(char::is_whitespace) {
+                    Some((target, rest)) => (target.trim_start_matches('@'), rest.trim()),
+                    None => (arguments.trim_start_matches('@'), ""),
+                };
+                if !prompt.is_empty() {
+                    // Gửi kèm câu hỏi đã có đường riêng; đừng để phần thừa lặng
+                    // lẽ biến thành một phần của tên agent.
+                    repl_write(
+                        stderr,
+                        format_args!(
+                            "/dm takes an agent name only; to send a message, type: @{target} {prompt}\n"
+                        ),
+                    )?;
+                    continue;
+                }
+                let agent = match agent_ref(target) {
                     Ok(reference) => match service.resolve_agent(reference).await {
                         Ok(agent) => agent,
                         Err(error) => {

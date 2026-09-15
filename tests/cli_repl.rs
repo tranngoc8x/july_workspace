@@ -905,6 +905,23 @@ fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
 }
 
 #[test]
+fn repl_dm_accepts_an_at_prefix_and_refuses_to_swallow_a_trailing_message() {
+    let workspace = TestWorkspace::new();
+    workspace.seed_acp_agent("codex", &[]);
+
+    let output = workspace.repl("/dm @codex\nhello\n1\n/dm @codex con task nao mo khong\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    // `@codex` mo dung agent thay vi tro thanh mot cai ten khong ton tai.
+    assert!(stdout(&output).contains("dm\t"));
+    assert!(stdout(&output).contains("\tcodex"));
+    assert!(!stderr(&output).contains("does not exist"));
+    assert!(stderr(&output).contains(
+        "/dm takes an agent name only; to send a message, type: @codex con task nao mo khong\n"
+    ));
+}
+
+#[test]
 fn repl_dm_rejects_malformed_known_commands_but_sends_unknown_slashes_exactly() {
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &[]);
