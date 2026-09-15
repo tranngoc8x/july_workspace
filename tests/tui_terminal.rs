@@ -461,7 +461,9 @@ fn spawn_pty_command(mut command: Command) -> PtyChild {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // Raw pointer, not `&mut`: libc spells this argument `*mut` on some
+            // targets and `*const` on others, and `*mut` coerces to either.
+            &raw mut size,
         )
     };
     assert_eq!(result, 0, "openpty failed: {}", io::Error::last_os_error());
@@ -486,7 +488,7 @@ fn spawn_pty_command(mut command: Command) -> PtyChild {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY.into(), 0) == -1 {
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
