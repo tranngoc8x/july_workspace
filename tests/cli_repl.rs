@@ -905,20 +905,31 @@ fn repl_dm_status_and_failed_switch_preserve_the_active_context() {
 }
 
 #[test]
-fn repl_dm_accepts_an_at_prefix_and_refuses_to_swallow_a_trailing_message() {
+fn repl_dm_accepts_an_at_prefix_and_sends_a_trailing_message_in_the_same_turn() {
     let workspace = TestWorkspace::new();
     workspace.seed_acp_agent("codex", &[]);
 
-    let output = workspace.repl("/dm @codex\nhello\n1\n/dm @codex con task nao mo khong\n/quit\n");
+    let output = workspace.repl("/dm @codex con task nao mo khong\n1\n/quit\n");
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     // `@codex` mo dung agent thay vi tro thanh mot cai ten khong ton tai.
     assert!(stdout(&output).contains("dm\t"));
     assert!(stdout(&output).contains("\tcodex"));
     assert!(!stderr(&output).contains("does not exist"));
-    assert!(stderr(&output).contains(
-        "/dm takes an agent name only; to send a message, type: @codex con task nao mo khong\n"
-    ));
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let messages: Vec<String> = connection
+        .prepare("SELECT body FROM messages ORDER BY created_at, id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // Phan sau ten agent duoc gui nguyen van, khong bi nhet vao ten.
+    assert!(
+        messages.iter().any(|body| body == "con task nao mo khong"),
+        "messages: {messages:?}"
+    );
 }
 
 #[test]

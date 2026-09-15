@@ -2128,17 +2128,6 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Some((target, rest)) => (target.trim_start_matches('@'), rest.trim()),
                     None => (arguments.trim_start_matches('@'), ""),
                 };
-                if !prompt.is_empty() {
-                    // Gửi kèm câu hỏi đã có đường riêng; đừng để phần thừa lặng
-                    // lẽ biến thành một phần của tên agent.
-                    repl_write(
-                        stderr,
-                        format_args!(
-                            "/dm takes an agent name only; to send a message, type: @{target} {prompt}\n"
-                        ),
-                    )?;
-                    continue;
-                }
                 let agent = match agent_ref(target) {
                     Ok(reference) => match service.resolve_agent(reference).await {
                         Ok(agent) => agent,
@@ -2168,6 +2157,37 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         contexts.push(context);
                         *live = Some(dm);
                         repl_write(stdout, format_args!("dm\t{}\t{}\n", agent.id, agent.name))?;
+                        if !prompt.is_empty() {
+                            // Cùng một lượt gõ: vào DM rồi gửi luôn, giống hệt
+                            // `@agent <câu hỏi>`.
+                            let chat = live.as_mut().expect("entered context has a live service");
+                            if let Err(error) = chat.send(prompt.to_owned(), timestamp()).await {
+                                repl_write(stderr, format_args!("{error}\n"))?;
+                                continue;
+                            }
+                            if let (Some(events), Some(origin)) =
+                                (tui_events, pending_origin.take())
+                            {
+                                use crate::tui::app::{CommandResult, HistoryAuthor, HistoryEntry};
+
+                                let snapshot = project_context_snapshot(
+                                    service,
+                                    workspace,
+                                    contexts,
+                                    Some(HistoryEntry {
+                                        author: HistoryAuthor::User,
+                                        body: prompt.to_owned(),
+                                    }),
+                                )
+                                .await?;
+                                let _ = events.send(crate::tui::app::AppEvent::CommandFinished {
+                                    context: origin,
+                                    result: CommandResult::SubmittedWithContext(snapshot),
+                                });
+                            }
+                            let chat = live.as_mut().expect("entered context has a live service");
+                            drain_repl_turn(chat, input, stdout, stderr, tui_events).await?;
+                        }
                     }
                     Err(error) => {
                         if let Err(restore) =
