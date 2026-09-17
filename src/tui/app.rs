@@ -1,21 +1,23 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
-use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
+use super::bottom_pane::events::{NoticeLevel, PaneEvent};
+use super::bottom_pane::slash_commands::commands_from_names;
+use super::bottom_pane::{BottomPane, BottomPaneParams, CancellationEvent, InputResult};
 use super::markdown::MarkdownStream;
-use super::{CODE_COLOR, COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
+use super::support::render::renderable::Renderable;
+use super::{AGENT_COLOR, CODE_COLOR, COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
 use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
-use crate::domain::{PermissionOption, PermissionOutcome};
+use crate::domain::{AgentId, PermissionOutcome, RoomMessageId};
 
 pub const CHAT_BATCH_LIMIT: usize = 32;
-const NON_INPUT_ROWS: u16 = 3;
-pub(crate) const INPUT_HORIZONTAL_MARGIN: u16 = 1;
-pub(crate) const INPUT_VERTICAL_MARGIN: u16 = 1;
+/// Rows the composer may not take: the header, and one row of transcript.
+const NON_INPUT_ROWS: u16 = 2;
 
 /// Braille frames for the "agent is working" indicator.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -153,6 +155,8 @@ pub struct ContextSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppEvent {
     Key(KeyEvent),
+    /// A bracketed paste delivered whole by the terminal.
+    Paste(String),
     Resize {
         width: u16,
         height: u16,
@@ -167,6 +171,27 @@ pub enum AppEvent {
     Agents(Vec<String>),
     /// July Room activation status, never a private runtime transcript.
     RoomStatus(String),
+    /// An agent in the current Room began producing output; opens its live cell.
+    AgentStreamStarted {
+        agent: AgentId,
+        /// Agent name, used as the cell header.
+        label: String,
+    },
+    /// More output for one agent. A delta for an agent with no open cell is dropped, so one agent
+    /// can never write into another's.
+    AgentStreamDelta {
+        agent: AgentId,
+        delta: String,
+    },
+    /// An agent finished; its cell is committed to the transcript and closed.
+    AgentStreamFinished {
+        agent: AgentId,
+    },
+    /// An agent failed or was cancelled; whatever streamed is kept and the reason is appended.
+    AgentStreamFailed {
+        agent: AgentId,
+        reason: String,
+    },
     /// An explicitly published canonical shared Room message.
     RoomMessage(String),
     Chat(ChatEvent),
@@ -189,121 +214,120 @@ pub enum TurnState {
     CancelAcknowledged,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct PermissionModal {
-    request_id: ChatPermissionRequestId,
-    prompt: String,
-    options: Vec<PermissionOption>,
-    selected: usize,
-    scroll: u16,
-    follow_selection: bool,
+/// The hint the composer's footer carries when nothing has gone wrong.
+const COMPOSER_FOOTER_HINT: (&str, &str) = ("/exit", "to leave");
+
+/// What the composer shows before anything is typed.
+const COMPOSER_PLACEHOLDER: &str = "Ask anything, / for commands, @ for agents and files";
+
+/// How many file-search results the `@` popup is offered.
+const FILE_SEARCH_LIMIT: usize = 24;
+
+/// The part of the composer worth carrying across a scope switch.
+///
+/// Only the visible draft: attachments and mention bindings belong to the submission being written,
+/// and July's mentions round-trip as plain `@name` text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComposerDraft {
+    pub text: String,
+    /// Byte offset of the caret within `text`.
+    pub cursor: usize,
 }
 
-impl PermissionModal {
-    pub fn prompt(&self) -> &str {
-        &self.prompt
-    }
+/// One conversation scope's transient view state.
+///
+/// Kept in memory only. Nothing here belongs in SQLite: it is where the user had scrolled to and
+/// what they had half-typed, which is meaningless once the process exits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoomUiState {
+    /// Rows scrolled back from the newest transcript row.
+    pub scroll_offset: usize,
+    /// Whether the transcript was pinned to the newest row, which is what makes `scroll_offset`
+    /// mean "where the user was" rather than "where the transcript happened to end".
+    pub follow_tail: bool,
+    pub draft: ComposerDraft,
+    /// ponytail: always `None`. July's transcript has no per-message selection or reply UI yet, so
+    /// there is nothing to capture; the fields are here so that when those land, the save/restore
+    /// path already carries them.
+    pub reply_to: Option<RoomMessageId>,
+    pub selected_message: Option<RoomMessageId>,
+}
 
-    pub fn options(&self) -> &[PermissionOption] {
-        &self.options
-    }
-
-    pub fn selected(&self) -> usize {
-        self.selected
-    }
-
-    pub fn scroll(&self) -> u16 {
-        self.scroll
-    }
-
-    pub fn follows_selection(&self) -> bool {
-        self.follow_selection
-    }
-
-    pub(crate) fn max_scroll_page(&self, viewport: Viewport) -> u16 {
-        let width = viewport
-            .width
-            .saturating_sub(4)
-            .min(60)
-            .saturating_sub(2)
-            .max(1);
-        let height = viewport
-            .height
-            .saturating_sub(2)
-            .min((self.options.len() as u16).saturating_add(7))
-            .max(5)
-            .saturating_sub(2)
-            .max(1);
-        let mut lines = vec![Line::from(self.prompt.clone()), Line::default()];
-        lines.extend(
-            self.options
-                .iter()
-                .map(|option| Line::from(format!("  {}", option.label))),
-        );
-        lines.push(Line::default());
-        lines.push(Line::from("Enter choose · Esc reject · Ctrl-C cancel"));
-        let rows = Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .line_count(width);
-        rows.saturating_sub(usize::from(height))
-            .div_ceil(usize::from(height))
-            .min(usize::from(u16::MAX)) as u16
+impl Default for RoomUiState {
+    /// A scope opened for the first time starts pinned to the newest row with an empty draft.
+    fn default() -> Self {
+        Self {
+            scroll_offset: 0,
+            follow_tail: true,
+            draft: ComposerDraft::default(),
+            reply_to: None,
+            selected_message: None,
+        }
     }
 }
 
-/// `TextArea` underlines the cursor line by default, which reads as the typed
-/// text being underlined; the input keeps a plain line style instead.
-fn new_input() -> TextArea<'static> {
-    input_with("")
-}
-
-fn input_with(text: &str) -> TextArea<'static> {
-    let mut input = TextArea::from(text.split('\n'));
-    input.set_cursor_line_style(Style::default());
-    input.set_wrap_mode(WrapMode::WordOrGlyph);
-    input.move_cursor(CursorMove::Bottom);
-    input.move_cursor(CursorMove::End);
-    input
+/// One agent's in-progress output, shown under the committed transcript until the agent finishes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveCell {
+    /// Agent name, as the header above the streaming body.
+    pub label: String,
+    /// What has streamed so far.
+    pub body: String,
 }
 
 pub struct App {
     context: Context,
-    input: TextArea<'static>,
+    /// The composer, and whatever modal view is covering it.
+    bottom_pane: BottomPane,
     viewport: Viewport,
     markdown: MarkdownStream,
     scroll_offset: usize,
     follow_tail: bool,
     pending: Option<ContextId>,
     turn: TurnState,
-    permission: Option<PermissionModal>,
+    /// The permission request whose prompt is open in the pane, so a resolved request can close it.
+    pending_permission: Option<ChatPermissionRequestId>,
     error: Option<String>,
-    agents: Vec<String>,
-    completion_selected: usize,
-    prompt_history: Vec<String>,
-    history_index: Option<usize>,
-    history_draft: Option<String>,
+    /// Per-scope view state, so leaving a room and coming back lands where the user left off.
+    room_ui: HashMap<ContextId, RoomUiState>,
+    /// Agents streaming right now, one cell each. Ordered by agent id so the list does not reshuffle
+    /// between frames.
+    live_cells: BTreeMap<AgentId, LiveCell>,
+    /// Set when the bottom pane changed outside a key press, so the frame loop redraws.
+    pane_redraw: bool,
     tick: usize,
     exit_requested: bool,
 }
 
 impl App {
     pub fn new(context: Context) -> Self {
+        let mut bottom_pane = BottomPane::new(BottomPaneParams {
+            has_input_focus: true,
+            // July's terminal guard asks for key disambiguation, so modified Enter is reported.
+            enhanced_keys_supported: cfg!(not(windows)),
+            placeholder_text: COMPOSER_PLACEHOLDER.to_string(),
+            // The terminal guard turns on bracketed paste, so a paste arrives whole as
+            // `AppEvent::Paste` and the composer never has to guess a paste from keystroke timing.
+            disable_paste_burst: true,
+        });
+        bottom_pane.set_slash_commands(commands_from_names(context.commands()));
+        // The v2 `@` popup is the one that offers agents alongside files; without it `@` searches
+        // files only.
+        bottom_pane.set_mentions_v2_enabled(true);
         Self {
             context,
-            input: new_input(),
+            bottom_pane,
             viewport: Viewport::new(0, 0),
             markdown: MarkdownStream::default(),
             scroll_offset: 0,
             follow_tail: true,
             pending: None,
             turn: TurnState::Idle,
-            permission: None,
+            pending_permission: None,
             error: None,
-            agents: Vec::new(),
-            completion_selected: 0,
-            prompt_history: Vec::new(),
-            history_index: None,
-            history_draft: None,
+            room_ui: HashMap::new(),
+            live_cells: BTreeMap::new(),
+            pane_redraw: false,
             tick: 0,
             exit_requested: false,
         }
@@ -314,28 +338,91 @@ impl App {
     }
 
     pub fn input(&self) -> String {
-        self.input.lines().join("\n")
+        self.bottom_pane.composer_text()
     }
 
-    pub(crate) fn input_widget(&self) -> &TextArea<'static> {
-        &self.input
+    pub(crate) fn bottom_pane(&self) -> &BottomPane {
+        &self.bottom_pane
     }
 
+    /// Rows the bottom pane gets, capped so the transcript keeps at least one row.
     pub(crate) fn input_height(&self) -> u16 {
-        let width = self
-            .viewport
-            .width
-            .saturating_sub(INPUT_HORIZONTAL_MARGIN.saturating_mul(2))
-            .max(1);
-        let visual_rows = Paragraph::new(self.input())
-            .wrap(Wrap { trim: false })
-            .line_count(width);
-        let content_rows = u16::try_from(visual_rows.max(self.input.lines().len()))
-            .unwrap_or(u16::MAX)
-            .max(1);
-        content_rows
-            .saturating_add(INPUT_VERTICAL_MARGIN.saturating_mul(2))
+        self.bottom_pane
+            .desired_height(self.viewport.width.max(1))
+            .max(1)
             .min(self.viewport.height.saturating_sub(NON_INPUT_ROWS).max(1))
+    }
+
+    /// Switches to `context`, saving the outgoing scope's view state and returning the incoming
+    /// scope's.
+    ///
+    /// The caller applies the returned state, because a switch that also reloads the transcript has
+    /// to rebuild it first - restoring a scroll offset over the old transcript would land nowhere.
+    #[must_use]
+    fn set_context(&mut self, context: Context) -> Option<RoomUiState> {
+        self.bottom_pane
+            .set_slash_commands(commands_from_names(context.commands()));
+        // Results that refresh the same scope - a new label, a changed command list - must still
+        // land, but they are not a switch: the view on screen is already the right one.
+        if context.id == self.context.id {
+            self.context = context;
+            return None;
+        }
+        let outgoing = self.capture_room_ui();
+        self.room_ui.insert(self.context.id.clone(), outgoing);
+        let incoming = self.room_ui.get(&context.id).cloned().unwrap_or_default();
+        self.context = context;
+        Some(incoming)
+    }
+
+    /// The current scope's view state.
+    ///
+    /// The draft comes from what was last remembered rather than from the composer, because
+    /// switching scope is itself a typed command: by the time the switch lands the composer holds
+    /// that command, or nothing.
+    fn capture_room_ui(&self) -> RoomUiState {
+        RoomUiState {
+            scroll_offset: self.scroll_offset,
+            follow_tail: self.follow_tail,
+            draft: self
+                .room_ui
+                .get(&self.context.id)
+                .map(|state| state.draft.clone())
+                .unwrap_or_default(),
+            reply_to: None,
+            selected_message: None,
+        }
+    }
+
+    /// Remembers the draft the user is writing in this scope.
+    ///
+    /// A slash command is not a draft - it is how the user leaves - so typing one must not erase
+    /// the half-written message they want to come back to.
+    fn remember_draft(&mut self) {
+        let draft = self.bottom_pane.composer_draft();
+        if draft.text.trim_start().starts_with('/') {
+            return;
+        }
+        self.room_ui
+            .entry(self.context.id.clone())
+            .or_default()
+            .draft = draft;
+    }
+
+    /// Puts the user back where they were in this scope.
+    fn restore_room_ui(&mut self, state: RoomUiState) {
+        let RoomUiState {
+            scroll_offset,
+            follow_tail,
+            draft,
+            reply_to: _,
+            selected_message: _,
+        } = state;
+        self.bottom_pane.restore_composer_draft(draft);
+        self.follow_tail = follow_tail;
+        self.scroll_offset = scroll_offset;
+        let max_scroll = self.max_scroll_offset();
+        self.clamp_scroll(max_scroll);
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -378,6 +465,15 @@ impl App {
             if spaced {
                 lines.push(Line::default());
             }
+        }
+        let live = self.live_cell_lines();
+        if !live.is_empty() {
+            // One blank row separates the live block from the committed transcript; inside the
+            // block the header, its body and its cursor stay together.
+            if lines.last().is_some_and(|last| last.width() > 0) {
+                lines.push(Line::default());
+            }
+            lines.extend(live);
         }
         if let Some(frame) = self.spinner_frame() {
             let label = match self.turn {
@@ -422,8 +518,9 @@ impl App {
         self.turn
     }
 
-    pub fn permission(&self) -> Option<&PermissionModal> {
-        self.permission.as_ref()
+    /// The permission request currently being asked about, if any.
+    pub fn permission(&self) -> Option<&ChatPermissionRequestId> {
+        self.pending_permission.as_ref()
     }
 
     /// Last command failure or interruption, cleared on the next submit.
@@ -441,7 +538,33 @@ impl App {
         self.exit_requested
     }
 
+    /// Puts July's own footer line into the composer's footer, which is now the only one.
+    fn sync_footer_hint(&mut self) {
+        let items = match self.error() {
+            Some(error) => vec![("!".to_string(), error.to_string())],
+            None => vec![(
+                COMPOSER_FOOTER_HINT.0.to_string(),
+                COMPOSER_FOOTER_HINT.1.to_string(),
+            )],
+        };
+        self.bottom_pane.set_footer_hint(items);
+    }
+
+    /// Whether the bottom pane changed since the last draw, and clears the flag.
+    pub fn take_pane_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.pane_redraw)
+    }
+
     pub fn reduce(&mut self, event: AppEvent) -> Vec<AppCommand> {
+        let commands = self.reduce_inner(event);
+        // One place to keep the composer's footer in step with the app, rather than a call beside
+        // each of the dozen assignments to `turn` and `error`.
+        self.bottom_pane.set_task_running(self.turn_active());
+        self.sync_footer_hint();
+        commands
+    }
+
+    fn reduce_inner(&mut self, event: AppEvent) -> Vec<AppCommand> {
         match event {
             AppEvent::Key(key) => {
                 let old_input_height = self.input_height();
@@ -467,14 +590,6 @@ impl App {
                 self.viewport = Viewport::new(width, height);
                 let max_scroll = self.max_scroll_offset();
                 self.clamp_scroll(max_scroll);
-                if let Some(max_page) = self
-                    .permission
-                    .as_ref()
-                    .map(|permission| permission.max_scroll_page(self.viewport))
-                {
-                    let permission = self.permission.as_mut().unwrap();
-                    permission.scroll = permission.scroll.min(max_page);
-                }
                 Vec::new()
             }
             AppEvent::Scroll { up, rows } => {
@@ -482,8 +597,7 @@ impl App {
                 Vec::new()
             }
             AppEvent::Agents(agents) => {
-                self.agents = agents;
-                self.completion_selected = 0;
+                self.bottom_pane.set_agents(agents);
                 Vec::new()
             }
             AppEvent::RoomMessage(body) => {
@@ -492,6 +606,30 @@ impl App {
                     author: HistoryAuthor::Agent,
                     body,
                 });
+                Vec::new()
+            }
+            AppEvent::AgentStreamStarted { agent, label } => {
+                self.live_cells.insert(
+                    agent,
+                    LiveCell {
+                        label,
+                        body: String::new(),
+                    },
+                );
+                Vec::new()
+            }
+            AppEvent::AgentStreamDelta { agent, delta } => {
+                if let Some(cell) = self.live_cells.get_mut(&agent) {
+                    cell.body.push_str(&delta);
+                }
+                Vec::new()
+            }
+            AppEvent::AgentStreamFinished { agent } => {
+                self.commit_live_cell(&agent, None);
+                Vec::new()
+            }
+            AppEvent::AgentStreamFailed { agent, reason } => {
+                self.commit_live_cell(&agent, Some(reason));
                 Vec::new()
             }
             AppEvent::RoomStatus(status) => {
@@ -523,12 +661,10 @@ impl App {
                 Vec::new()
             }
             AppEvent::RoomPermissionDismissed(request_id) => {
-                if self
-                    .permission
-                    .as_ref()
-                    .is_some_and(|modal| modal.request_id == request_id)
-                {
-                    self.permission = None;
+                if self.pending_permission.as_ref() == Some(&request_id) {
+                    self.pending_permission = None;
+                    self.bottom_pane
+                        .dismiss_view_by_id(BottomPane::PERMISSION_VIEW_ID);
                 }
                 Vec::new()
             }
@@ -538,145 +674,172 @@ impl App {
                 }
                 Vec::new()
             }
+            AppEvent::Paste(pasted) => {
+                self.bottom_pane.handle_paste(pasted);
+                self.drain_pane_events()
+            }
             AppEvent::Tick => {
                 self.tick = self.tick.wrapping_add(1);
-                Vec::new()
+                // The composer has no frame scheduler; it rides this tick to sync popups and to
+                // release keystrokes it was holding as a suspected paste.
+                let ticked = self.bottom_pane.pre_draw_tick();
+                let flushed = self.bottom_pane.flush_paste_burst_if_due();
+                self.pane_redraw |= ticked || flushed;
+                self.drain_pane_events()
             }
         }
     }
 
+    /// Routes one key press.
+    ///
+    /// Order matters: the permission modal is exclusive, then Ctrl+C and transcript scrolling stay
+    /// with the app, and everything else belongs to the bottom pane - including Up/Down, which the
+    /// composer uses for popup selection and prompt recall.
     fn reduce_key(&mut self, key: KeyEvent) -> Vec<AppCommand> {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
 
-        if self.permission.is_some() {
-            return self.reduce_permission_key(key);
-        }
-
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return self.cancel_or_exit();
+            // Once a cancel is under way, Ctrl+C means quit and nothing may swallow it - otherwise
+            // a prompt arriving late would trap the user behind an extra keypress.
+            if matches!(
+                self.turn,
+                TurnState::Cancelling | TurnState::CancelAcknowledged
+            ) {
+                return self.cancel_or_exit();
+            }
+            // Otherwise the pane gets first refusal, so Ctrl+C can dismiss a view or clear the
+            // draft; only a pane with nothing left to cancel lets it mean interrupt-or-quit.
+            return match self.bottom_pane.on_ctrl_c() {
+                CancellationEvent::Handled => self.drain_pane_events(),
+                CancellationEvent::NotHandled => self.cancel_or_exit(),
+            };
         }
 
         match key.code {
-            KeyCode::PageUp => self.scroll_by(self.transcript_rows(), true),
-            KeyCode::PageDown => self.scroll_by(self.transcript_rows(), false),
+            KeyCode::PageUp => {
+                self.scroll_by(self.transcript_rows(), true);
+                return Vec::new();
+            }
+            KeyCode::PageDown => {
+                self.scroll_by(self.transcript_rows(), false);
+                return Vec::new();
+            }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_by(1, true);
+                return Vec::new();
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.scroll_by(1, false);
+                return Vec::new();
             }
-            KeyCode::Up if key.modifiers == KeyModifiers::NONE => {
-                if !self.move_completion(false) {
-                    let cursor = self.input.cursor();
-                    self.input.input(key);
-                    if self.input.cursor() == cursor {
-                        self.history_up();
-                    }
-                }
-            }
-            KeyCode::Down if key.modifiers == KeyModifiers::NONE => {
-                if !self.move_completion(true) {
-                    let cursor = self.input.cursor();
-                    self.input.input(key);
-                    if self.input.cursor() == cursor {
-                        self.history_down();
-                    }
-                }
-            }
-            KeyCode::Home => self.scroll_by(usize::MAX, true),
-            KeyCode::End => {
-                self.scroll_offset = 0;
-                self.follow_tail = true;
-            }
-            KeyCode::Tab if key.modifiers == KeyModifiers::NONE => {
-                self.complete();
-            }
-            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                if !self.complete() {
-                    return self.submit();
-                }
-            }
-            KeyCode::Enter => {
-                self.input.insert_newline();
-                self.completion_selected = 0;
-                self.history_index = None;
-                self.history_draft = None;
-            }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.insert_newline();
-                self.completion_selected = 0;
-                self.history_index = None;
-                self.history_draft = None;
-            }
-            KeyCode::Esc => {}
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.turn == TurnState::Idle && self.input().is_empty() {
+                if self.turn == TurnState::Idle && self.bottom_pane.composer_is_empty() {
                     self.exit_requested = true;
                 }
-            }
-            _ => {
-                let before = self.input();
-                self.input.input(key);
-                if self.input() != before {
-                    self.completion_selected = 0;
-                    self.history_index = None;
-                    self.history_draft = None;
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    fn reduce_permission_key(&mut self, key: KeyEvent) -> Vec<AppCommand> {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return self.cancel_or_exit();
-        }
-
-        let max_scroll_page = self
-            .permission
-            .as_ref()
-            .unwrap()
-            .max_scroll_page(self.viewport);
-        let permission = self.permission.as_mut().unwrap();
-        match key.code {
-            KeyCode::Up => {
-                permission.selected = permission.selected.saturating_sub(1);
-                permission.follow_selection = true;
-            }
-            KeyCode::Down => {
-                permission.selected =
-                    (permission.selected + 1).min(permission.options.len().saturating_sub(1));
-                permission.follow_selection = true;
-            }
-            KeyCode::PageUp => {
-                permission.scroll = permission.scroll.saturating_sub(1);
-                permission.follow_selection = false;
-            }
-            KeyCode::PageDown => {
-                permission.scroll = permission.scroll.saturating_add(1).min(max_scroll_page);
-                permission.follow_selection = false;
-            }
-            KeyCode::Enter if key.modifiers == KeyModifiers::NONE => {
-                let permission = self.permission.take().unwrap();
-                return vec![AppCommand::RespondPermission {
-                    request_id: permission.request_id,
-                    outcome: PermissionOutcome::Selected(
-                        permission.options[permission.selected].id.clone(),
-                    ),
-                }];
-            }
-            KeyCode::Esc => {
-                let permission = self.permission.take().unwrap();
-                return vec![AppCommand::RespondPermission {
-                    request_id: permission.request_id,
-                    outcome: PermissionOutcome::Cancelled,
-                }];
+                return Vec::new();
             }
             _ => {}
         }
-        Vec::new()
+
+        let result = self.bottom_pane.handle_key_event(key);
+        // A submission empties the composer, and that emptiness is not a draft edit: `submit`
+        // decides what this scope should remember afterwards.
+        let submitted = !matches!(result, InputResult::None);
+        let mut commands = self.apply_input_result(result);
+        commands.extend(self.drain_pane_events());
+        if !submitted {
+            self.remember_draft();
+        }
+        commands
+    }
+
+    /// Turns what the composer produced into work for the runtime.
+    fn apply_input_result(&mut self, result: InputResult) -> Vec<AppCommand> {
+        match result {
+            InputResult::Submitted {
+                text,
+                text_elements,
+            } => {
+                let commands = self.submit(text.clone());
+                // The composer clears the draft as it submits, so a submission July refuses - a
+                // turn is already in flight - has to be handed back or the text is lost.
+                if commands.is_empty() {
+                    self.bottom_pane.set_composer_text(text, text_elements);
+                }
+                commands
+            }
+            InputResult::Command(command) => {
+                let commands = self.submit(format!("/{}", command.command()));
+                self.finish_command_submission(&commands);
+                commands
+            }
+            InputResult::CommandWithArgs(command, args, _) => {
+                let commands = self.submit(format!("/{} {args}", command.command()));
+                self.finish_command_submission(&commands);
+                commands
+            }
+            // ponytail: the composer only queues when `set_queue_submissions` is on, and July never
+            // turns it on - a second submission is refused by `submit` instead. Map it to a
+            // submission if July ever wants a queue.
+            InputResult::Queued { .. } | InputResult::None => Vec::new(),
+        }
+    }
+
+    /// Clears a dispatched command out of the draft, leaving it alone if July refused it.
+    ///
+    /// The composer keeps the text of an inline command such as `/dm codex` after handing it over,
+    /// so without this the next command is typed onto the end of the last one.
+    fn finish_command_submission(&mut self, commands: &[AppCommand]) {
+        if !commands.is_empty() {
+            self.bottom_pane.finish_command_submission();
+        }
+    }
+
+    /// Carries out the side effects the pane queued while handling input.
+    fn drain_pane_events(&mut self) -> Vec<AppCommand> {
+        let mut commands = Vec::new();
+        for event in self.bottom_pane.drain_events() {
+            match event {
+                PaneEvent::Interrupt => commands.extend(self.cancel_or_exit()),
+                PaneEvent::Notice { level, message } => match level {
+                    NoticeLevel::Error => self.error = Some(message),
+                    NoticeLevel::Info => {
+                        self.freeze_stream();
+                        self.markdown.push_plain(message, SYSTEM_COLOR);
+                    }
+                },
+                PaneEvent::StartFileSearch(query) => {
+                    let matches = if query.is_empty() {
+                        Vec::new()
+                    } else {
+                        crate::tui::file_search::search(
+                            std::path::Path::new("."),
+                            &query,
+                            FILE_SEARCH_LIMIT,
+                        )
+                    };
+                    self.bottom_pane.on_file_search_result(query, matches);
+                }
+                PaneEvent::PermissionResponse {
+                    request_id,
+                    outcome,
+                } => {
+                    self.pending_permission = None;
+                    commands.push(AppCommand::RespondPermission {
+                        request_id,
+                        outcome,
+                    });
+                }
+                // July has no persistent prompt log and no agent question flow wired yet, so the
+                // composer never asks for these.
+                PaneEvent::LookupHistoryEntry { .. }
+                | PaneEvent::LookupHistoryBatch { .. }
+                | PaneEvent::UserInputAnswer { .. } => {}
+            }
+        }
+        commands
     }
 
     fn cancel_or_exit(&mut self) -> Vec<AppCommand> {
@@ -689,176 +852,17 @@ impl App {
                 self.exit_requested = true;
                 Vec::new()
             }
-            TurnState::Idle if !self.input().is_empty() => {
-                self.input = new_input();
-                self.history_index = None;
-                self.history_draft = None;
-                Vec::new()
-            }
             TurnState::Idle => {
                 self.exit_requested = true;
                 Vec::new()
             }
         }
     }
-
-    /// The `@` prefix being typed at the end of the input, if any.
-    /// ponytail: completion follows the caret only at the end of the input,
-    /// which is where mentions are typed; mid-line editing skips it.
-    fn mention_prefix(&self) -> Option<String> {
-        if !self.cursor_is_at_input_end() {
-            return None;
-        }
-        let input = self.input();
-        let word = input.split_whitespace().next_back()?;
-        if !input.ends_with(word) {
-            return None;
-        }
-        word.strip_prefix('@').map(str::to_owned)
-    }
-
-    fn command_prefix(&self) -> Option<String> {
-        if !self.cursor_is_at_input_end() {
-            return None;
-        }
-        let input = self.input();
-        if input.contains('\n') {
-            return None;
-        }
-        let prefix = input.trim_start();
-        if !prefix.starts_with('/')
-            || (prefix.chars().next_back().is_some_and(char::is_whitespace)
-                && self
-                    .context
-                    .commands()
-                    .iter()
-                    .any(|name| name == prefix.trim_end()))
-        {
-            return None;
-        }
-        Some(prefix.to_owned())
-    }
-
-    fn cursor_is_at_input_end(&self) -> bool {
-        let lines = self.input.lines();
-        let Some(last) = lines.last() else {
-            return false;
-        };
-        self.input.cursor() == (lines.len() - 1, last.chars().count())
-    }
-
-    fn active_completion(&self) -> Option<(String, Vec<&str>)> {
-        if self.error.is_some() || self.permission.is_some() {
-            return None;
-        }
-        if let Some(prefix) = self.command_prefix() {
-            let mut matches: Vec<_> = self
-                .context
-                .commands()
-                .iter()
-                .map(String::as_str)
-                .filter(|name| name.starts_with(&prefix))
-                .collect();
-            if let Some(exact) = matches.iter().position(|name| *name == prefix) {
-                matches.swap(0, exact);
-            }
-            if !matches.is_empty() {
-                return Some((prefix, matches));
-            }
-        }
-
-        let prefix = self.mention_prefix()?;
-        let matches: Vec<_> = self
-            .agents
-            .iter()
-            .filter(|agent| agent.starts_with(&prefix) && agent.len() > prefix.len())
-            .map(String::as_str)
-            .collect();
-        (!matches.is_empty()).then_some((prefix, matches))
-    }
-
-    /// Candidate names for the completion list.
-    pub fn completions(&self) -> Vec<&str> {
-        self.active_completion()
-            .map(|(_, matches)| matches)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn completion_selected(&self) -> usize {
-        self.completion_selected
-            .min(self.completions().len().saturating_sub(1))
-    }
-
-    pub(crate) fn completion_is_mention(&self) -> bool {
-        self.mention_prefix().is_some()
-    }
-
-    fn move_completion(&mut self, down: bool) -> bool {
-        let count = self.completions().len();
-        if count == 0 {
-            return false;
-        }
-        let selected = self.completion_selected();
-        self.completion_selected = if down {
-            (selected + 1).min(count - 1)
-        } else {
-            selected.saturating_sub(1)
-        };
-        true
-    }
-
-    /// Complete the selected slash command or `@` mention candidate.
-    /// Returns whether candidates were active.
-    fn complete(&mut self) -> bool {
-        let Some((prefix, matches)) = self.active_completion() else {
-            return false;
-        };
-        let selected = matches[self.completion_selected.min(matches.len() - 1)];
-        let suffix = selected[prefix.len()..].to_owned();
-        if !suffix.is_empty() {
-            self.input.insert_str(suffix);
-        }
-        self.input.insert_str(" ");
-        self.completion_selected = 0;
-        true
-    }
-
-    fn history_up(&mut self) {
-        let Some(last) = self.prompt_history.len().checked_sub(1) else {
-            return;
-        };
-        let index = match self.history_index {
-            Some(index) => index.saturating_sub(1),
-            None => {
-                self.history_draft = Some(self.input());
-                last
-            }
-        };
-        self.history_index = Some(index);
-        self.input = input_with(&self.prompt_history[index]);
-        self.completion_selected = 0;
-    }
-
-    fn history_down(&mut self) {
-        let Some(index) = self.history_index else {
-            return;
-        };
-        if index + 1 < self.prompt_history.len() {
-            self.history_index = Some(index + 1);
-            self.input = input_with(&self.prompt_history[index + 1]);
-        } else {
-            self.history_index = None;
-            self.input = input_with(self.history_draft.take().as_deref().unwrap_or(""));
-        }
-        self.completion_selected = 0;
-    }
-
-    fn submit(&mut self) -> Vec<AppCommand> {
+    /// Sends `text` as a prompt or a command, if a turn is not already in flight.
+    fn submit(&mut self, text: String) -> Vec<AppCommand> {
         if self.pending.is_some() || self.turn != TurnState::Idle {
             return Vec::new();
         }
-
-        let text = self.input();
         if text.trim().is_empty() {
             return Vec::new();
         }
@@ -866,10 +870,15 @@ impl App {
         // Leading blanks must not turn a command into chat.
         let command = text.trim_start().starts_with('/');
 
-        self.prompt_history.push(text.clone());
-        self.history_index = None;
-        self.history_draft = None;
-        self.input = new_input();
+        if !command {
+            // A prompt consumes the draft; a command does not, so only a prompt clears what this
+            // scope remembers.
+            self.room_ui
+                .entry(self.context.id.clone())
+                .or_default()
+                .draft = ComposerDraft::default();
+        }
+        self.bottom_pane.record_submission_history(text.clone());
         self.freeze_stream();
         self.push_user_entry(&text);
         self.turn = TurnState::Active;
@@ -898,7 +907,9 @@ impl App {
                 self.error = self.apply_snapshot(snapshot);
             }
             CommandResult::Context(context) => {
-                self.context = context;
+                if let Some(restored) = self.set_context(context) {
+                    self.restore_room_ui(restored);
+                }
                 self.turn = TurnState::Idle;
             }
             CommandResult::ContextWithHistory(snapshot) => {
@@ -906,7 +917,9 @@ impl App {
                 self.turn = TurnState::Idle;
             }
             CommandResult::Output { context, output } => {
-                self.context = context;
+                if let Some(restored) = self.set_context(context) {
+                    self.restore_room_ui(restored);
+                }
                 // Command output belongs in the transcript: it can be long,
                 // and the footer is one line.
                 self.freeze_stream();
@@ -926,12 +939,13 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: ContextSnapshot) -> Option<String> {
-        self.context = snapshot.context;
+        let restored = self.set_context(snapshot.context);
         self.markdown = MarkdownStream::default();
+        self.live_cells.clear();
         self.scroll_offset = 0;
         self.follow_tail = true;
 
-        match snapshot.history {
+        let error = match snapshot.history {
             Ok(history) => {
                 if history.truncated {
                     self.markdown
@@ -948,7 +962,87 @@ impl App {
                 }
                 Some(error.trim_end().to_owned())
             }
+        };
+        // Only now is the transcript the one the restored scroll offset was measured against.
+        if let Some(restored) = restored {
+            self.restore_room_ui(restored);
         }
+        error
+    }
+
+    /// Closes one agent's live cell and commits what it streamed to the transcript.
+    ///
+    /// Partial output is kept even when the agent failed, so a cancelled turn does not silently
+    /// discard what the user already read. Other agents' cells are untouched.
+    fn commit_live_cell(&mut self, agent: &AgentId, reason: Option<String>) {
+        let Some(cell) = self.live_cells.remove(agent) else {
+            // A finish for an agent with no open cell: its output already arrived as a committed
+            // Room message, which is the ordinary path.
+            if let Some(reason) = reason {
+                self.freeze_stream();
+                self.markdown.push_plain(reason, ERROR_COLOR);
+            }
+            return;
+        };
+        self.freeze_stream();
+        let body = cell.body.trim_end();
+        if !body.is_empty() {
+            self.push_history_entry(&HistoryEntry {
+                author: HistoryAuthor::Agent,
+                body: format!("{}: {body}", cell.label),
+            });
+        }
+        if let Some(reason) = reason {
+            self.markdown
+                .push_plain(format!("{}: {reason}", cell.label), ERROR_COLOR);
+        }
+    }
+
+    /// What one agent has streamed so far, or `None` when it has no open cell.
+    #[cfg(test)]
+    pub(crate) fn live_cell_body(&self, agent: &AgentId) -> Option<&str> {
+        self.live_cells.get(agent).map(|cell| cell.body.as_str())
+    }
+
+    /// The rendered transcript as plain text, including live cells.
+    #[cfg(test)]
+    pub(crate) fn transcript_text_for_tests(&self) -> String {
+        self.transcript_text()
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The live cells as transcript rows: a header per agent, its streamed body, and a cursor.
+    fn live_cell_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for cell in self.live_cells.values() {
+            if !lines.is_empty() {
+                lines.push(Line::default());
+            }
+            lines.push(Line::from(Span::styled(
+                cell.label.clone(),
+                Style::default().fg(AGENT_COLOR),
+            )));
+            for body_line in cell.body.lines() {
+                lines.push(Line::from(Span::styled(
+                    body_line.to_owned(),
+                    Style::default().fg(AGENT_COLOR),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "▌",
+                Style::default().fg(SYSTEM_COLOR),
+            )));
+        }
+        lines
     }
 
     fn push_history_entry(&mut self, entry: &HistoryEntry) {
@@ -1035,14 +1129,9 @@ impl App {
                 if self.turn == TurnState::Idle {
                     self.turn = TurnState::Active;
                 }
-                self.permission = Some(PermissionModal {
-                    request_id,
-                    prompt,
-                    options,
-                    selected: 0,
-                    scroll: 0,
-                    follow_selection: false,
-                });
+                self.pending_permission = Some(request_id.clone());
+                self.bottom_pane
+                    .push_permission_request(request_id, prompt, options);
             }
         }
         Vec::new()
@@ -1050,7 +1139,9 @@ impl App {
 
     fn finish_turn(&mut self) {
         self.turn = TurnState::Idle;
-        self.permission = None;
+        self.pending_permission = None;
+        self.bottom_pane
+            .dismiss_view_by_id(BottomPane::PERMISSION_VIEW_ID);
     }
 
     fn freeze_stream(&mut self) {
@@ -1130,12 +1221,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::ALT)
     }
 
-    fn app_with_commands(commands: &[&str]) -> App {
-        App::new(
-            Context::root().with_commands(commands.iter().map(|name| (*name).into()).collect()),
-        )
-    }
-
     fn shift_key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::SHIFT)
     }
@@ -1157,6 +1242,385 @@ mod tests {
                     .flatten()
             })
         })
+    }
+
+
+
+    /// Commands dispatched one after another must not pile up in the draft.
+    ///
+    /// The composer hands out an inline command such as `/dm codex` but leaves its text in place,
+    /// so without clearing it the next command is typed onto the end of the last one.
+    #[test]
+    fn a_dispatched_command_leaves_the_draft_empty_for_the_next_one() {
+        let mut app = App::new(
+            Context::root().with_commands(vec!["/room".into(), "/dm".into(), "/back".into()]),
+        );
+
+        for character in "/room vna".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        let first = app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        assert_eq!(
+            first,
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/room vna".into(),
+            }]
+        );
+        assert!(app.input().is_empty(), "draft was {:?}", app.input());
+
+        app.reduce(AppEvent::CommandFinished {
+            context: ContextId::root(),
+            result: CommandResult::Submitted,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+
+        for character in "/back".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        let second = app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+
+        assert_eq!(
+            second,
+            vec![AppCommand::Execute {
+                context: ContextId::root(),
+                input: "/back".into(),
+            }]
+        );
+        assert!(app.input().is_empty(), "draft was {:?}", app.input());
+    }
+
+    /// A command July refuses keeps its text, so the user can resend it.
+    #[test]
+    fn a_refused_command_stays_in_the_draft() {
+        let mut app = App::new(Context::root().with_commands(vec!["/room".into()]));
+        for character in "/room vna".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
+
+        // A turn is now in flight, so the next command cannot be sent.
+        for character in "/room other".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        let refused = app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+
+        assert!(refused.is_empty());
+        assert_eq!(app.input(), "/room other");
+    }
+
+
+    /// Ctrl+C must still quit once a cancel is under way, even with a prompt open.
+    ///
+    /// The permission prompt is a pane view and views consume Ctrl+C, so without an explicit rule a
+    /// prompt arriving after the cancel would trap the user behind an extra keypress.
+    #[test]
+    fn ctrl_c_still_quits_while_cancelling_even_with_a_permission_prompt_open() {
+        let mut app = App::new(Context::root());
+        app.turn = TurnState::CancelAcknowledged;
+        app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
+            request_id: "late".to_owned().into(),
+            prompt: "Allow?".into(),
+            options: vec![PermissionOption {
+                id: "once".into(),
+                label: "Allow once".into(),
+            }],
+        }));
+        assert!(app.bottom_pane.has_active_view());
+
+        let commands = app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
+
+        assert!(commands.is_empty(), "{commands:?}");
+        assert!(app.exit_requested());
+    }
+
+    // ---- per-scope UI state -------------------------------------------------
+
+    fn room(name: &str) -> Context {
+        Context::new(ContextId::new(format!("room:{name}")), name)
+    }
+
+    /// Switches the app to `context` the way the REPL does: a command is submitted, and its result
+    /// carries the new scope back. A result with nothing pending is rejected as stale, so the
+    /// submission is what makes the switch land.
+    fn switch_to(app: &mut App, context: Context) {
+        let from = app.context().id().clone();
+        app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('/'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: from,
+            result: CommandResult::Context(context),
+        });
+    }
+
+    /// Switches scope through a history reload, the path a Room switch takes when it repopulates
+    /// the transcript.
+    fn switch_to_with_history(app: &mut App, context: Context, entries: Vec<HistoryEntry>) {
+        let from = app.context().id().clone();
+        app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('/'))));
+        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
+        app.reduce(AppEvent::CommandFinished {
+            context: from,
+            result: CommandResult::ContextWithHistory(snapshot(
+                context,
+                Ok(History {
+                    entries,
+                    truncated: false,
+                }),
+                None,
+            )),
+        });
+    }
+
+    fn fill_transcript(app: &mut App, lines: usize) {
+        for index in 0..lines {
+            app.reduce(AppEvent::RoomStatus(format!("line {index}")));
+        }
+    }
+
+    #[test]
+    fn leaving_a_room_and_coming_back_restores_its_draft_and_scroll() {
+        let mut app = App::new(room("alpha"));
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 12,
+        });
+        fill_transcript(&mut app, 40);
+        for character in "half typed".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Scroll {
+            up: true,
+            rows: 5,
+        });
+        let alpha_scroll = app.scroll_offset();
+        assert!(alpha_scroll > 0, "the test needs a scrolled transcript");
+
+        switch_to(&mut app, room("beta"));
+        assert_eq!(app.input(), "", "a fresh room starts with an empty draft");
+        assert_eq!(app.scroll_offset(), 0);
+        for character in "beta draft".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        switch_to(&mut app, room("alpha"));
+        assert_eq!(app.input(), "half typed");
+        assert_eq!(app.scroll_offset(), alpha_scroll);
+        assert!(!app.follow_tail(), "the scrolled-back position is restored too");
+
+        switch_to(&mut app, room("beta"));
+        assert_eq!(app.input(), "beta draft");
+    }
+
+    #[test]
+    fn a_room_visited_for_the_first_time_gets_default_ui_state() {
+        let mut app = App::new(room("alpha"));
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 12,
+        });
+        fill_transcript(&mut app, 40);
+        for character in "draft".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Scroll {
+            up: true,
+            rows: 4,
+        });
+
+        switch_to(&mut app, room("never-seen"));
+
+        assert_eq!(app.input(), "");
+        assert_eq!(app.scroll_offset(), 0);
+        assert!(app.follow_tail());
+    }
+
+    #[test]
+    fn a_reloaded_transcript_restores_the_draft_without_a_stale_scroll_offset() {
+        let mut app = App::new(room("alpha"));
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 12,
+        });
+        fill_transcript(&mut app, 40);
+        for character in "kept".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+        app.reduce(AppEvent::Scroll {
+            up: true,
+            rows: 6,
+        });
+
+        switch_to(&mut app, room("beta"));
+        // Coming back through a history reload: the transcript is rebuilt before the saved offset
+        // is applied, and an offset past the shorter transcript is clamped rather than kept.
+        switch_to_with_history(
+            &mut app,
+            room("alpha"),
+            vec![HistoryEntry {
+                author: HistoryAuthor::Agent,
+                body: "one line".into(),
+            }],
+        );
+
+        assert_eq!(app.input(), "kept");
+        assert!(app.scroll_offset() <= app.max_scroll_offset());
+    }
+
+    // ---- live agent cells ---------------------------------------------------
+
+    fn agent(seed: u128) -> AgentId {
+        AgentId::from(ulid::Ulid::from(seed))
+    }
+
+    fn start(app: &mut App, id: AgentId, label: &str) {
+        app.reduce(AppEvent::AgentStreamStarted {
+            agent: id,
+            label: label.to_owned(),
+        });
+    }
+
+    fn delta(app: &mut App, id: AgentId, text: &str) {
+        app.reduce(AppEvent::AgentStreamDelta {
+            agent: id,
+            delta: text.to_owned(),
+        });
+    }
+
+    #[test]
+    fn two_agents_stream_side_by_side() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        let pay = agent(2);
+
+        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, pay, "pay");
+        delta(&mut app, cashpoint, "Checking callback handler...");
+        delta(&mut app, pay, "Inspecting refund state...");
+
+        let transcript = app.transcript_text_for_tests();
+        assert!(transcript.contains("cashpoint"), "{transcript}");
+        assert!(
+            transcript.contains("Checking callback handler..."),
+            "{transcript}"
+        );
+        assert!(transcript.contains("pay"), "{transcript}");
+        assert!(
+            transcript.contains("Inspecting refund state..."),
+            "{transcript}"
+        );
+    }
+
+    #[test]
+    fn a_delta_only_reaches_the_agent_it_names() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        let pay = agent(2);
+        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, pay, "pay");
+
+        delta(&mut app, cashpoint, "only mine");
+
+        assert_eq!(app.live_cell_body(&cashpoint), Some("only mine"));
+        assert_eq!(app.live_cell_body(&pay), Some(""));
+    }
+
+    #[test]
+    fn a_delta_for_an_agent_with_no_open_cell_is_dropped() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        start(&mut app, cashpoint, "cashpoint");
+
+        delta(&mut app, agent(99), "from nowhere");
+
+        assert_eq!(app.live_cell_body(&cashpoint), Some(""));
+        assert_eq!(app.live_cell_body(&agent(99)), None);
+        assert!(!app.transcript_text_for_tests().contains("from nowhere"));
+    }
+
+    #[test]
+    fn finishing_one_agent_commits_its_output_and_leaves_the_other_streaming() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        let pay = agent(2);
+        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, pay, "pay");
+        delta(&mut app, cashpoint, "done looking");
+        delta(&mut app, pay, "still looking");
+
+        app.reduce(AppEvent::AgentStreamFinished { agent: cashpoint });
+
+        assert_eq!(app.live_cell_body(&cashpoint), None, "its cell is closed");
+        assert_eq!(
+            app.live_cell_body(&pay),
+            Some("still looking"),
+            "the other agent is untouched"
+        );
+        let transcript = app.transcript();
+        assert!(
+            transcript.contains("cashpoint: done looking"),
+            "committed:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn a_failing_agent_keeps_what_it_streamed_and_reports_why() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        let pay = agent(2);
+        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, pay, "pay");
+        delta(&mut app, cashpoint, "partial answer");
+
+        app.reduce(AppEvent::AgentStreamFailed {
+            agent: cashpoint,
+            reason: "cashpoint: failed: transport closed".into(),
+        });
+
+        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert_eq!(app.live_cell_body(&pay), Some(""));
+        let transcript = app.transcript();
+        assert!(
+            transcript.contains("cashpoint: partial answer"),
+            "partial output survives:\n{transcript}"
+        );
+        assert!(
+            transcript.contains("failed: transport closed"),
+            "the reason is reported:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_streamed_nothing_closes_without_leaving_a_row() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        start(&mut app, cashpoint, "cashpoint");
+
+        app.reduce(AppEvent::AgentStreamFinished { agent: cashpoint });
+
+        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert!(app.transcript().trim().is_empty(), "{:?}", app.transcript());
+    }
+
+    #[test]
+    fn switching_rooms_drops_live_cells_from_the_room_being_left() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        start(&mut app, cashpoint, "cashpoint");
+        delta(&mut app, cashpoint, "mid flight");
+
+        switch_to_with_history(&mut app, room("beta"), Vec::new());
+
+        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert!(!app.transcript_text_for_tests().contains("mid flight"));
     }
 
     fn snapshot(
@@ -1195,11 +1659,13 @@ mod tests {
         app.reduce(AppEvent::RoomPermissionDismissed(
             "binding:old".to_owned().into(),
         ));
-        assert!(app.permission.is_some());
+        assert!(app.permission().is_some());
+        assert!(app.bottom_pane.has_active_view());
         app.reduce(AppEvent::RoomPermissionDismissed(
             "binding:new".to_owned().into(),
         ));
-        assert!(app.permission.is_none());
+        assert!(app.permission().is_none());
+        assert!(!app.bottom_pane.has_active_view(), "its prompt closed too");
     }
 
     #[test]
@@ -1485,7 +1951,7 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
-    fn arrow_keys_recall_submitted_prompts_and_restore_the_draft() {
+    fn arrow_keys_recall_submitted_prompts_only_from_an_untouched_draft() {
         let mut app = App::new(Context::root());
         for prompt in ["first", "second"] {
             for character in prompt.chars() {
@@ -1498,73 +1964,22 @@ curl --request POST 'https://example.com/v1/orders' \
             });
             app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
         }
-        for character in "draft".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
 
+        // An empty composer recalls newest-first, and walks back down again.
         app.reduce(AppEvent::Key(key(KeyCode::Up)));
         assert_eq!(app.input(), "second");
         app.reduce(AppEvent::Key(key(KeyCode::Up)));
         assert_eq!(app.input(), "first");
         app.reduce(AppEvent::Key(key(KeyCode::Down)));
         assert_eq!(app.input(), "second");
-        app.reduce(AppEvent::Key(key(KeyCode::Down)));
-        assert_eq!(app.input(), "draft");
+
+        // Editing a recalled entry takes the composer out of recall: Up is then ordinary cursor
+        // movement inside the draft, which is what shells do and what the composer expects.
         app.reduce(AppEvent::Key(key(KeyCode::Char('!'))));
-        assert_eq!(app.input(), "draft!");
+        assert_eq!(app.input(), "second!");
         app.reduce(AppEvent::Key(key(KeyCode::Up)));
-        app.reduce(AppEvent::Key(key(KeyCode::Char('?'))));
-        assert_eq!(app.input(), "second?");
+        assert_eq!(app.input(), "second!");
     }
-
-    #[test]
-    fn recalled_prompt_resets_completion_selection() {
-        let mut app = app_with_commands(&["/start", "/status"]);
-        app.prompt_history.push("/st".into());
-        for character in "/st".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::Down)));
-        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
-
-        app.reduce(AppEvent::Key(key(KeyCode::Up)));
-
-        assert_eq!(app.input(), "/st");
-        assert_eq!(app.completion_selected(), 0);
-    }
-
-    #[test]
-    fn arrow_keys_move_the_multiline_cursor_before_opening_history() {
-        let mut app = App::new(Context::root());
-        for character in "saved".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::Enter)));
-        app.reduce(AppEvent::CommandFinished {
-            context: ContextId::root(),
-            result: CommandResult::Submitted,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        for character in "top".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
-        for character in "bottom".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-
-        app.reduce(AppEvent::Key(key(KeyCode::Up)));
-        assert_eq!(app.input(), "top\nbottom");
-        assert_eq!(app.input.cursor().0, 0);
-        app.reduce(AppEvent::Key(key(KeyCode::Down)));
-        assert_eq!(app.input.cursor().0, 1);
-        app.reduce(AppEvent::Key(key(KeyCode::Up)));
-        app.reduce(AppEvent::Key(key(KeyCode::Up)));
-        assert_eq!(app.input(), "saved");
-        app.reduce(AppEvent::Key(key(KeyCode::Down)));
-        assert_eq!(app.input(), "top\nbottom");
-    }
-
     #[test]
     fn viewport_scroll_disables_follow_tail_until_end_and_resize_clamps_it() {
         let mut app = App::new(Context::root());
@@ -1606,11 +2021,17 @@ curl --request POST 'https://example.com/v1/orders' \
         for _ in 0..4 {
             app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
         }
-        app.reduce(AppEvent::Key(key(KeyCode::Home)));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
+        let scrolled_back = app.scroll_offset();
+        assert!(scrolled_back > 0, "the test needs a scrolled transcript");
 
+        // Clearing the draft shrinks the composer, which lengthens the transcript viewport and can
+        // leave the old offset past the end.
         app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
 
-        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
+        assert!(app.input().is_empty());
+        assert!(app.scroll_offset() <= app.max_scroll_offset());
     }
 
     #[test]
@@ -1785,223 +2206,6 @@ curl --request POST 'https://example.com/v1/orders' \
         );
         assert_eq!(app.stream(), "");
     }
-
-    #[test]
-    fn tab_completes_the_selected_agent_mention() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Agents(vec![
-            "cashpoint".into(),
-            "cashflow".into(),
-            "pay".into(),
-        ]));
-
-        // Nothing to complete until an `@` is being typed.
-        for character in "hello ".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert!(app.completions().is_empty());
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "hello ");
-
-        // Several matches: the first candidate is selected by default.
-        for character in "@cash".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert_eq!(app.completions(), ["cashpoint", "cashflow"]);
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "hello @cashpoint ");
-        assert!(app.completions().is_empty());
-    }
-
-    #[test]
-    fn unique_command_uses_first_enter_to_complete_and_second_to_submit() {
-        let mut app = app_with_commands(&["/status", "/start"]);
-        for character in "/stat".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-
-        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(app.input(), "/status ");
-        assert!(app.completions().is_empty());
-        assert_eq!(
-            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
-            vec![AppCommand::Execute {
-                context: ContextId::root(),
-                input: "/status ".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn enter_completes_the_default_command_candidate() {
-        let mut app = app_with_commands(&["/status", "/start"]);
-        for character in "/sta".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-
-        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(app.input(), "/status ");
-        assert!(app.completions().is_empty());
-        assert!(!app.turn_active());
-    }
-
-    #[test]
-    fn down_selects_the_next_completion_for_enter() {
-        let mut app = app_with_commands(&["/start", "/status"]);
-        for character in "/st".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-
-        app.reduce(AppEvent::Key(key(KeyCode::Down)));
-        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-
-        assert_eq!(app.input(), "/status ");
-    }
-
-    #[test]
-    fn error_hides_completion_and_enter_submits_the_typed_input() {
-        let mut app = app_with_commands(&["/dm"]);
-        app.reduce(AppEvent::Key(key(KeyCode::Char('x'))));
-        assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
-        app.reduce(AppEvent::CommandFinished {
-            context: ContextId::root(),
-            result: CommandResult::Failed("boom".into()),
-        });
-        for character in "/d".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-
-        assert!(app.completions().is_empty());
-        assert_eq!(
-            app.reduce(AppEvent::Key(key(KeyCode::Enter))),
-            vec![AppCommand::Execute {
-                context: ContextId::root(),
-                input: "/d".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn tab_completes_the_default_command_candidate() {
-        let mut app = app_with_commands(&["/status", "/start"]);
-        for character in "/st".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "/status ");
-    }
-
-    #[test]
-    fn slash_completion_preserves_leading_blanks_and_supports_multiword_names() {
-        let mut leading = app_with_commands(&["/status"]);
-        for character in "  /stat".chars() {
-            leading.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        leading.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(leading.input(), "  /status ");
-
-        let mut multiword = app_with_commands(&["/work new"]);
-        for character in "/work n".chars() {
-            multiword.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        multiword.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(multiword.input(), "/work new ");
-    }
-
-    #[test]
-    fn slash_completion_ignores_arguments_and_multiline_input() {
-        let mut argument = app_with_commands(&["/status"]);
-        for character in "/status argument".chars() {
-            argument.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert!(argument.completions().is_empty());
-
-        let mut multiline = app_with_commands(&["/status"]);
-        for character in "/stat".chars() {
-            multiline.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        multiline.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
-        assert!(multiline.completions().is_empty());
-    }
-
-    #[test]
-    fn exact_command_enter_appends_space_before_submit() {
-        let mut app = app_with_commands(&["/status"]);
-        for character in "/status".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(app.input(), "/status ");
-        assert_eq!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).len(), 1);
-    }
-
-    #[test]
-    fn exact_command_beats_a_longer_command_for_tab_and_enter() {
-        let commands = ["/thread", "/thread new"];
-        let mut tab = app_with_commands(&commands);
-        for character in "/thread".chars() {
-            tab.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        tab.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(tab.input(), "/thread ");
-        assert!(tab.completions().is_empty());
-
-        let mut enter = app_with_commands(&commands);
-        for character in "/thread".chars() {
-            enter.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert!(enter.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(enter.input(), "/thread ");
-        assert_eq!(
-            enter.reduce(AppEvent::Key(key(KeyCode::Enter))),
-            vec![AppCommand::Execute {
-                context: ContextId::root(),
-                input: "/thread ".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn slash_completion_is_inactive_away_from_the_input_end() {
-        let mut app = app_with_commands(&["/status"]);
-        for character in "/stat".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::Left)));
-
-        assert!(app.completions().is_empty());
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "/stat");
-    }
-
-    #[test]
-    fn mention_completion_is_inactive_away_from_the_input_end() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Agents(vec!["cashflow".into()]));
-        for character in "@cashf".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::Left)));
-
-        assert!(app.completions().is_empty());
-        app.reduce(AppEvent::Key(key(KeyCode::Tab)));
-        assert_eq!(app.input(), "@cashf");
-    }
-
-    #[test]
-    fn enter_completes_agent_mention() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Agents(vec![
-            "cashpoint".into(),
-            "cashflow".into(),
-        ]));
-        for character in "@cashf".chars() {
-            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
-        }
-        assert!(app.reduce(AppEvent::Key(key(KeyCode::Enter))).is_empty());
-        assert_eq!(app.input(), "@cashflow ");
-    }
-
     #[test]
     fn completion_and_disconnect_freeze_each_received_stream() {
         let mut app = App::new(Context::root());
@@ -2131,22 +2335,58 @@ curl --request POST 'https://example.com/v1/orders' \
         )));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
 
+        // A page is the transcript viewport, which shrinks as the composer grows.
+        let page = app.transcript_rows();
+
         app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        assert_eq!(app.scroll_offset(), 5);
+        assert_eq!(app.scroll_offset(), page);
         assert!(!app.follow_tail());
 
         app.reduce(AppEvent::Scroll { up: true, rows: 3 });
-        assert_eq!(app.scroll_offset(), 8);
+        assert_eq!(app.scroll_offset(), page + 3);
 
         app.reduce(AppEvent::Key(key(KeyCode::PageDown)));
         assert_eq!(app.scroll_offset(), 3);
 
-        app.reduce(AppEvent::Key(key(KeyCode::Home)));
-        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
-
-        app.reduce(AppEvent::Key(key(KeyCode::End)));
+        app.reduce(AppEvent::Scroll {
+            up: false,
+            rows: 3,
+        });
         assert_eq!(app.scroll_offset(), 0);
         assert!(app.follow_tail());
+    }
+
+    /// Home and End edit the draft; the transcript is paged with PageUp/PageDown and Ctrl+Up/Down.
+    ///
+    /// July used Home/End for the transcript before the composer owned multi-line editing, where
+    /// they have to mean start- and end-of-line.
+    #[test]
+    fn home_and_end_move_the_caret_rather_than_the_transcript() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 20,
+            height: 10,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            (0..40).map(|row| format!("{row}  \n")).collect::<String>(),
+        )));
+        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        for character in "abc".chars() {
+            app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
+        }
+
+        app.reduce(AppEvent::Key(key(KeyCode::Home)));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('X'))));
+
+        assert_eq!(app.input(), "Xabc");
+        assert_eq!(app.scroll_offset(), 0);
+        assert!(app.follow_tail());
+
+        app.reduce(AppEvent::Key(key(KeyCode::End)));
+        app.reduce(AppEvent::Key(key(KeyCode::Char('Y'))));
+
+        assert_eq!(app.input(), "XabcY");
+        assert_eq!(app.scroll_offset(), 0);
     }
 
     #[test]
@@ -2218,11 +2458,11 @@ curl --request POST 'https://example.com/v1/orders' \
             ],
         }));
 
+        // The prompt is a pane view, so it takes every key: nothing reaches the draft.
         app.reduce(AppEvent::Key(key(KeyCode::Char('x'))));
         app.reduce(AppEvent::Key(key(KeyCode::Down)));
 
         assert_eq!(app.input(), "");
-        assert_eq!(app.permission().unwrap().selected(), 1);
         assert_eq!(
             app.reduce(AppEvent::Key(key(KeyCode::Enter))),
             vec![AppCommand::RespondPermission {
@@ -2231,6 +2471,7 @@ curl --request POST 'https://example.com/v1/orders' \
             }]
         );
         assert!(app.permission().is_none());
+        assert!(!app.bottom_pane.has_active_view(), "the prompt closed");
     }
 
     #[test]

@@ -1,13 +1,12 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Wrap};
 
-use super::app::{App, INPUT_HORIZONTAL_MARGIN, INPUT_VERTICAL_MARGIN, PermissionModal, TurnState};
-use super::{ERROR_COLOR, SYSTEM_COLOR};
-
-const INPUT_BACKGROUND_COLOR: Color = Color::Rgb(48, 54, 61);
+use super::app::{App, TurnState};
+use super::support::render::renderable::Renderable;
+use super::SYSTEM_COLOR;
 
 pub fn render(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -16,11 +15,12 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
+    // Header, transcript, composer. The composer draws its own footer hints, so July no longer
+    // keeps a row of its own below it.
     let areas = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(app.input_height()),
-        Constraint::Length(1),
     ])
     .split(area);
     let (dot_color, turn_label) = match app.turn_state() {
@@ -45,135 +45,27 @@ pub fn render(frame: &mut Frame, app: &App) {
         areas[1],
     );
 
-    let input_area = areas[2].inner(Margin {
-        horizontal: INPUT_HORIZONTAL_MARGIN,
-        vertical: INPUT_VERTICAL_MARGIN,
-    });
-    frame.render_widget(
-        Block::default().style(Style::default().bg(INPUT_BACKGROUND_COLOR)),
-        areas[2],
-    );
-    frame.render_widget(app.input_widget(), input_area);
-    let completions = app.completions();
-    let completion_visible = !completions.is_empty();
-    if completion_visible {
-        let height = u16::try_from(completions.len())
-            .unwrap_or(u16::MAX)
-            .min(areas[1].height);
-        let popup = Rect::new(
-            areas[1].x,
-            areas[1].bottom().saturating_sub(height),
-            areas[1].width,
-            height,
-        );
-        let mention = app.completion_is_mention();
-        let items = completions.iter().copied().map(|candidate| {
-            ListItem::new(if mention {
-                format!("@{candidate}")
-            } else {
-                candidate.to_owned()
-            })
-        });
-        let list = List::new(items)
-            .highlight_symbol("❯ ")
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        let mut state = ListState::default();
-        state.select(Some(app.completion_selected()));
-        frame.render_widget(Clear, popup);
-        frame.render_stateful_widget(list, popup, &mut state);
+    // The composer insets its own draft, paints its own background and draws popups above it, so it
+    // gets the whole band untouched.
+    let input_area = areas[2];
+    app.bottom_pane().render(input_area, frame.buffer_mut());
+    // Ratatui shows the terminal cursor only for frames that place it, so an open modal - which
+    // reports no cursor - leaves it hidden.
+    if app.permission().is_none()
+        && let Some((x, y)) = app.bottom_pane().cursor_pos(input_area)
+    {
+        frame.set_cursor_position((x, y));
     }
-    let footer = match app.error() {
-        Some(error) => Line::from(Span::styled(
-            format!("! {error}"),
-            Style::default().fg(ERROR_COLOR),
-        )),
-        // While a `/` command or `@` mention is being typed, the footer explains selection.
-        None if completion_visible => Line::from(Span::styled(
-            "↑↓ select · Enter/Tab complete",
-            Style::default().fg(Color::Cyan),
-        )),
-        None => Line::from("July workspace · /exit to leave"),
-    };
-    frame.render_widget(Paragraph::new(footer), areas[3]);
 
-    if let Some(permission) = app.permission() {
-        let width = area.width.saturating_sub(4).min(60);
-        let height = area
-            .height
-            .saturating_sub(2)
-            .min((permission.options().len() as u16).saturating_add(7))
-            .max(5)
-            .min(area.height);
-        let popup = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
-        let mut lines = vec![Line::from(permission.prompt().to_owned()), Line::default()];
-        lines.extend(
-            permission
-                .options()
-                .iter()
-                .enumerate()
-                .map(|(index, option)| {
-                    let marker = if index == permission.selected() {
-                        "❯ "
-                    } else {
-                        "  "
-                    };
-                    let style = if index == permission.selected() {
-                        Style::default().add_modifier(Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                    };
-                    Line::from(Span::styled(format!("{marker}{}", option.label), style))
-                }),
-        );
-        lines.push(Line::default());
-        lines.push(Line::from("Enter choose · Esc reject · Ctrl-C cancel"));
-        let block = Block::bordered().title("Permission requested");
-        let inner = block.inner(popup);
-        let scroll = permission_scroll(permission, &lines, inner);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(block, popup);
-        frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0)),
-            inner,
-        );
-    }
-}
-
-fn permission_scroll(permission: &PermissionModal, lines: &[Line<'_>], area: Rect) -> u16 {
-    let width = area.width.max(1);
-    let viewport = usize::from(area.height.max(1));
-    let total = Paragraph::new(Text::from(lines.to_vec()))
-        .wrap(Wrap { trim: false })
-        .line_count(width);
-    let max_scroll = total.saturating_sub(viewport);
-    let requested = if permission.follows_selection() {
-        let selected_line = permission.selected().saturating_add(2);
-        Paragraph::new(Text::from(lines[..=selected_line].to_vec()))
-            .wrap(Wrap { trim: false })
-            .line_count(width)
-            .saturating_sub(viewport)
-    } else {
-        usize::from(permission.scroll()).saturating_mul(viewport)
-    };
-    requested.min(max_scroll).min(usize::from(u16::MAX)) as u16
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
 
     use crate::application::ChatEvent;
     use crate::domain::PermissionOption;
-    use crate::tui::ERROR_COLOR;
     use crate::tui::app::{App, AppEvent, CommandResult, Context, ContextId};
 
     use super::render;
@@ -188,87 +80,205 @@ mod tests {
             .to_owned()
     }
 
+    /// First row of the transcript viewport.
+    ///
+    /// The layout is header, transcript, composer, footer; only the header is above the transcript.
+    const TRANSCRIPT_TOP: u16 = 1;
+
+    /// The row the composer's draft sits on, for a terminal `height` rows tall.
+    ///
+    /// Derived rather than hard-coded: the composer decides how tall it needs to be, and a test
+    /// that pins that number breaks every time its footer hints change.
+    fn draft_row(app: &App, height: u16) -> u16 {
+        // The band ends at the bottom of the screen, and the composer insets its draft by one row.
+        height - app.input_height() + 1
+    }
+
+    /// The rows the composer's band covers.
+    fn composer_rows(app: &App, height: u16) -> std::ops::Range<u16> {
+        (height - app.input_height())..height
+    }
+
+    /// The transcript rows currently on screen, blank rows dropped.
+    ///
+    /// The transcript viewport shrinks and grows with the composer, so tests say which rows are
+    /// visible rather than pinning one to a fixed y.
+    fn visible_transcript(terminal: &Terminal<TestBackend>, app: &App, height: u16) -> Vec<String> {
+        (TRANSCRIPT_TOP..composer_rows(app, height).start)
+            .map(|y| row(terminal, y))
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
     #[test]
-    fn completion_list_renders_commands_mentions_and_error_priority() {
+    fn the_composer_footer_shows_an_error_over_the_default_hint() {
+        fn footer(terminal: &Terminal<TestBackend>, app: &App, height: u16) -> String {
+            composer_rows(app, height)
+                .map(|y| row(terminal, y))
+                .find(|line| line.contains("exit") || line.contains('!'))
+                .unwrap_or_default()
+        }
+
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let mut app = App::new(Context::root().with_commands(vec!["/dm".into()]));
+        app.reduce(AppEvent::Resize {
+            width: 80,
+            height: 12,
+        });
 
-        let app = App::new(Context::root());
         terminal.draw(|frame| render(frame, &app)).unwrap();
-        assert_eq!(row(&terminal, 11), "July workspace · /exit to leave");
+        assert!(
+            footer(&terminal, &app, 12).contains("/exit to leave"),
+            "the default hint sits on the composer's own footer row"
+        );
 
-        let mut commands =
-            App::new(Context::root().with_commands(vec!["/dm".into(), "/debug".into()]));
-        commands.reduce(AppEvent::Resize {
-            width: 80,
-            height: 12,
-        });
-        for character in "/d".chars() {
-            commands.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(character),
-                crossterm::event::KeyModifiers::NONE,
-            )));
-        }
-        terminal.draw(|frame| render(frame, &commands)).unwrap();
-        assert_eq!(row(&terminal, 6), "❯ /dm");
-        assert_eq!(row(&terminal, 7), "  /debug");
-        assert_eq!(row(&terminal, 11), "↑↓ select · Enter/Tab complete");
-
-        commands.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
-            request_id: "completion-permission".to_owned().into(),
-            prompt: "Allow?".into(),
-            options: vec![PermissionOption {
-                id: "once".into(),
-                label: "Allow once".into(),
-            }],
-        }));
-        terminal.draw(|frame| render(frame, &commands)).unwrap();
-        assert_eq!(row(&terminal, 11), "July workspace · /exit to leave");
-
-        let mut mentions = App::new(Context::root());
-        mentions.reduce(AppEvent::Agents(vec![
-            "cashpoint".into(),
-            "cashflow".into(),
-        ]));
-        mentions.reduce(AppEvent::Resize {
-            width: 80,
-            height: 12,
-        });
-        for character in "@cash".chars() {
-            mentions.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(character),
-                crossterm::event::KeyModifiers::NONE,
-            )));
-        }
-        terminal.draw(|frame| render(frame, &mentions)).unwrap();
-        assert_eq!(row(&terminal, 6), "❯ @cashpoint");
-        assert_eq!(row(&terminal, 7), "  @cashflow");
-
-        let mut error =
-            App::new(Context::root().with_commands(vec!["/dm".into(), "/status".into()]));
-        error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         )));
-        error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
             crossterm::event::KeyModifiers::NONE,
         )));
-        error.reduce(AppEvent::CommandFinished {
+        app.reduce(AppEvent::CommandFinished {
             context: ContextId::root(),
             result: CommandResult::Failed("boom".into()),
         });
-        for character in "/d".chars() {
-            error.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char(character),
-                crossterm::event::KeyModifiers::NONE,
-            )));
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let line = footer(&terminal, &app, 12);
+        assert!(line.contains("! boom"), "an error replaces the hint: {line:?}");
+        assert!(!line.contains("/exit"), "{line:?}");
+    }
+
+    /// Renders the whole composer surface end to end: draft, slash popup, mention popup.
+    ///
+    /// The composer is ported code with a lot of moving parts, so this checks what actually lands
+    /// on screen rather than any one of its internals.
+    #[test]
+    fn composer_renders_draft_slash_popup_and_mention_popup() {
+        fn screen(terminal: &Terminal<TestBackend>) -> String {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
-        terminal.draw(|frame| render(frame, &error)).unwrap();
-        assert_eq!(row(&terminal, 11), "! boom");
-        assert!(!(1..11).any(|y| row(&terminal, y).contains("/dm")));
+        fn type_text(app: &mut App, text: &str) {
+            for character in text.chars() {
+                app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )));
+            }
+            app.reduce(AppEvent::Tick);
+        }
+        fn clear(app: &mut App) {
+            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )));
+            app.reduce(AppEvent::Tick);
+        }
+
+        let mut app = App::new(
+            Context::root().with_commands(vec!["/status".into(), "/start".into()]),
+        );
+        app.reduce(AppEvent::Resize {
+            width: 72,
+            height: 16,
+        });
+        app.reduce(AppEvent::Agents(vec![
+            "cashpoint".into(),
+            "cashflow".into(),
+        ]));
+        let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let empty = screen(&terminal);
+        assert!(empty.contains("Ask anything"), "placeholder:\n{empty}");
+        assert!(
+            !empty.contains("context left"),
+            "July reports no token budget:\n{empty}"
+        );
+
+        type_text(&mut app, "hello world");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let typed = screen(&terminal);
+        assert!(typed.contains("› hello world"), "draft:\n{typed}");
+
+        clear(&mut app);
+        type_text(&mut app, "/st");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let slash = screen(&terminal);
+        assert!(slash.contains("/status"), "slash popup:\n{slash}");
+        assert!(slash.contains("/start"), "slash popup:\n{slash}");
+
+        clear(&mut app);
+        type_text(&mut app, "@cash");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let mention = screen(&terminal);
+        assert!(mention.contains("cashpoint"), "mention popup:\n{mention}");
+        assert!(mention.contains("cashflow"), "mention popup:\n{mention}");
+        assert!(
+            mention.contains("Agent"),
+            "agents are labelled:\n{mention}"
+        );
+    }
+
+
+    /// Two agents streaming at once each get their own labelled block with a cursor.
+    #[test]
+    fn concurrent_agents_render_one_live_cell_each() {
+        use crate::domain::AgentId;
+
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 16,
+        });
+        let cashpoint = AgentId::from(ulid::Ulid::from(1u128));
+        let pay = AgentId::from(ulid::Ulid::from(2u128));
+        for (agent, label) in [(cashpoint, "cashpoint"), (pay, "pay")] {
+            app.reduce(AppEvent::AgentStreamStarted {
+                agent,
+                label: label.to_owned(),
+            });
+        }
+        app.reduce(AppEvent::AgentStreamDelta {
+            agent: cashpoint,
+            delta: "Checking callback handler...".into(),
+        });
+        app.reduce(AppEvent::AgentStreamDelta {
+            agent: pay,
+            delta: "Inspecting refund state...".into(),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered: Vec<String> = (0..16)
+            .map(|y| row(&terminal, y))
+            .filter(|line| !line.is_empty())
+            .collect();
+        let screen = rendered.join("\n");
+        for expected in [
+            "cashpoint",
+            "Checking callback handler...",
+            "pay",
+            "Inspecting refund state...",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
         assert_eq!(
-            terminal.backend().buffer().cell((0, 11)).unwrap().fg,
-            ERROR_COLOR
+            screen.matches('▌').count(),
+            2,
+            "one cursor per streaming agent:\n{screen}"
         );
     }
 
@@ -284,35 +294,35 @@ mod tests {
     }
 
     #[test]
-    fn completion_list_scrolls_inside_the_minimum_editor_layout() {
+    fn the_command_popup_fits_inside_the_smallest_usable_layout() {
         let mut app = App::new(Context::root().with_commands(vec![
             "/alpha".into(),
             "/beta".into(),
             "/charlie".into(),
         ]));
         app.reduce(AppEvent::Resize {
-            width: 12,
-            height: 6,
+            width: 16,
+            height: 8,
         });
         app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('/'),
             crossterm::event::KeyModifiers::NONE,
         )));
-        for _ in 0..2 {
-            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Down,
-                crossterm::event::KeyModifiers::NONE,
-            )));
-        }
-        let mut terminal = Terminal::new(TestBackend::new(12, 6)).unwrap();
+        app.reduce(AppEvent::Tick);
+        let mut terminal = Terminal::new(TestBackend::new(16, 8)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(row(&terminal, 0), "● july (idle");
-        assert_eq!(row(&terminal, 1), "❯ /charlie");
-        assert_eq!(
-            terminal.backend().buffer().cell((1, 3)).unwrap().symbol(),
-            "/"
+        let screen: Vec<String> = (0..8).map(|y| row(&terminal, y)).collect();
+        let joined = screen.join("\n");
+        assert_eq!(screen[0], "● july (idle)");
+        assert!(
+            joined.contains("/alpha"),
+            "the popup still lists commands at this size:\n{joined}"
+        );
+        assert!(
+            screen[draft_row(&app, 8) as usize].starts_with('›'),
+            "the draft is still visible:\n{joined}"
         );
     }
 
@@ -332,17 +342,24 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(app.input_height(), 3);
-        assert_eq!(buffer.cell((0, 9)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((1, 9)).unwrap().symbol(), "a");
-        for y in 8..=10 {
-            assert_eq!(buffer.cell((0, y)).unwrap().bg, Color::Rgb(48, 54, 61));
-            assert_eq!(buffer.cell((1, y)).unwrap().bg, Color::Rgb(48, 54, 61));
+        let draft = draft_row(&app, 12);
+        // The draft sits one row inside the band, behind the composer's own `› ` prompt.
+        assert_eq!(buffer.cell((0, draft)).unwrap().symbol(), "›");
+        assert_eq!(buffer.cell((2, draft)).unwrap().symbol(), "a");
+        // The composer paints its own surface, so the whole band reads as one block rather than
+        // the draft row sitting on bare terminal background.
+        let surface = buffer.cell((0, draft)).unwrap().bg;
+        for y in composer_rows(&app, 12) {
+            assert_eq!(buffer.cell((0, y)).unwrap().bg, surface, "row {y}");
+            assert_eq!(buffer.cell((1, y)).unwrap().bg, surface, "row {y}");
         }
+        // The band is padded above and below the draft.
+        assert!(draft > composer_rows(&app, 12).start);
+        assert!(draft + 1 < composer_rows(&app, 12).end);
     }
 
     #[test]
-    fn input_grows_past_five_rows_until_terminal_space_is_full() {
+    fn the_composer_grows_until_it_would_crowd_out_the_transcript() {
         let mut app = App::new(Context::root());
         let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
         app.reduce(AppEvent::Resize {
@@ -350,32 +367,29 @@ mod tests {
             height: 12,
         });
 
-        for _ in 0..7 {
-            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::ALT,
-            )));
+        fn add_lines(app: &mut App, count: usize) {
+            for _ in 0..count {
+                app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Enter,
+                    crossterm::event::KeyModifiers::ALT,
+                )));
+            }
         }
+
+        add_lines(&mut app, 7);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let capped = app.input_height();
+        // The header and at least one transcript row always survive.
+        assert!(capped <= 12 - 2, "composer took {capped} of 12 rows");
+        assert!(composer_rows(&app, 12).start > TRANSCRIPT_TOP);
+
+        add_lines(&mut app, 4);
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(app.input_height(), 9);
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 2)).unwrap().bg,
-            Color::Rgb(48, 54, 61)
-        );
-
-        for _ in 0..4 {
-            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Enter,
-                crossterm::event::KeyModifiers::ALT,
-            )));
-        }
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        assert_eq!(app.input_height(), 9);
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 2)).unwrap().bg,
-            Color::Rgb(48, 54, 61)
+        assert_eq!(app.input_height(), capped, "it stops at the cap");
+        assert!(
+            row(&terminal, 0).starts_with('●'),
+            "the header is never covered"
         );
     }
 
@@ -393,7 +407,8 @@ mod tests {
             )));
         }
 
-        assert_eq!(app.input_height(), 4);
+        // Two visual rows of text, plus the band's own padding and footer hint.
+        assert_eq!(app.input_height(), 5);
     }
 
     #[test]
@@ -421,7 +436,9 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         )));
 
-        assert_eq!(app.input(), "abXcdefghijkl");
+        // The composer prints a two-column `› ` prompt, so the column the caret keeps when it moves
+        // up maps two characters further into the text than the raw column would suggest.
+        assert_eq!(app.input(), "abcXdefghijkl");
     }
 
     #[test]
@@ -439,10 +456,10 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(
-            terminal.backend().buffer().cell((1, 3)).unwrap().symbol(),
-            "a"
-        );
+        let draft = draft_row(&app, 6);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, draft)).unwrap().symbol(), "›");
+        assert_eq!(buffer.cell((2, draft)).unwrap().symbol(), "a");
     }
 
     #[test]
@@ -474,11 +491,10 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        // The five-row viewport starts at "7" and keeps the latest row visible.
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "7"
-        );
+        // The viewport is pinned to the tail: the newest row is on screen and the oldest is not.
+        let visible = visible_transcript(&terminal, &app, 10);
+        assert_eq!(visible.last().map(String::as_str), Some("9"), "{visible:?}");
+        assert!(!visible.iter().any(|line| line == "0"), "{visible:?}");
     }
 
     #[test]
@@ -497,10 +513,10 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "6"
-        );
+        // Two rows back from the tail: the newest row has scrolled off and an earlier one is in.
+        let visible = visible_transcript(&terminal, &app, 10);
+        assert_eq!(visible.last().map(String::as_str), Some("8"), "{visible:?}");
+        assert!(visible.iter().any(|line| line == "7"), "{visible:?}");
     }
 
     #[test]
@@ -515,15 +531,20 @@ mod tests {
         for _ in 0..2 {
             app.reduce(AppEvent::Scroll { up: true, rows: 1 });
         }
+        let before = {
+            let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            visible_transcript(&terminal, &app, 10)
+        };
         app.reduce(AppEvent::Chat(ChatEvent::TextDelta("  \n10  \n11".into())));
         let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 1)).unwrap().symbol(),
-            "6"
-        );
+        // New content arriving must not drag the viewport away from where the user scrolled to.
+        let after = visible_transcript(&terminal, &app, 10);
+        assert_eq!(after, before, "the scrolled-to rows stayed put");
+        assert!(!after.iter().any(|line| line == "11"), "{after:?}");
     }
 
     #[test]
@@ -541,20 +562,34 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        let buffer = terminal.backend().buffer();
-        for x in 0..5 {
-            assert_eq!(buffer.cell((x, 1)).unwrap().symbol(), "b");
-        }
-        assert_eq!(buffer.cell((5, 1)).unwrap().symbol(), " ");
-        assert_eq!(buffer.cell((6, 1)).unwrap().symbol(), "4");
+        // Wrapping follows paragraph geometry: a row breaks between words, so each one reads as a
+        // whole "word digit" pair rather than being cut mid-word at column 12.
+        let content = [
+            "aaaaa 0", "aaaaa 1", "aaaaa 2", "bbbbb 3", "bbbbb 4", "bbbbb 5", "ccccc 6",
+            "ccccc 7", "ccccc 8",
+        ];
+        let visible = visible_transcript(&terminal, &app, 10);
+        assert!(
+            visible.iter().all(|line| content.contains(&line.as_str())),
+            "rows break between words: {visible:?}"
+        );
+        assert_eq!(visible.last().map(String::as_str), Some("ccccc 8"), "{visible:?}");
+        let top_before = content
+            .iter()
+            .position(|line| Some(*line) == visible.first().map(String::as_str))
+            .expect("the top row is one of the wrapped rows");
 
         app.reduce(AppEvent::Scroll { up: true, rows: 1 });
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        assert_eq!(
-            terminal.backend().buffer().cell((6, 1)).unwrap().symbol(),
-            "3"
-        );
+        // Scrolling reveals the row before the one that was on top. The transcript puts a blank
+        // spacer between rows, so a one-row scroll can uncover a row without hiding the tail.
+        let scrolled = visible_transcript(&terminal, &app, 10);
+        let top_after = content
+            .iter()
+            .position(|line| Some(*line) == scrolled.first().map(String::as_str))
+            .expect("the top row is one of the wrapped rows");
+        assert_eq!(top_after + 1, top_before, "{scrolled:?} vs {visible:?}");
     }
 
     #[test]
@@ -606,8 +641,12 @@ mod tests {
     }
 
     #[test]
-    fn permission_choices_render_in_an_exclusive_centered_modal() {
+    fn a_permission_request_takes_over_the_pane_with_its_choices() {
         let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 44,
+            height: 14,
+        });
         app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
             request_id: "permission-1".to_owned().into(),
             prompt: "Write file in src/main.rs?".into(),
@@ -622,31 +661,34 @@ mod tests {
                 },
             ],
         }));
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(44, 14)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(rendered.contains("Permission requested"));
-        assert!(rendered.contains("Write file in src/main.rs?"));
-        assert!(rendered.contains("❯ Allow once"));
-        assert!(rendered.contains("  Reject"));
-        assert!(rendered.contains("Enter choose · Esc reject · Ctrl-C"));
-        assert!(rendered.contains("cancel"));
+        let screen: String = (0..14)
+            .map(|y| row(&terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Permission requested",
+            "Write file in src/main.rs?",
+            "Allow once",
+            "Reject",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}:\n{screen}");
+        }
+        assert!(
+            !screen.contains("Ask anything"),
+            "the prompt covers the composer:\n{screen}"
+        );
     }
 
     #[test]
-    fn permission_page_scroll_uses_wrapped_rows_and_clamps_at_the_end() {
+    fn a_long_permission_prompt_still_shows_its_choice() {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
             width: 32,
-            height: 10,
+            height: 12,
         });
         app.reduce(AppEvent::Chat(ChatEvent::PermissionRequested {
             request_id: "permission-1".to_owned().into(),
@@ -656,35 +698,17 @@ mod tests {
                 label: "Allow once".into(),
             }],
         }));
-        for _ in 0..20 {
-            app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::PageDown,
-                crossterm::event::KeyModifiers::NONE,
-            )));
-        }
-        let bottom_page = app.permission().unwrap().scroll();
-        assert!(bottom_page > 0);
-        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageUp,
-            crossterm::event::KeyModifiers::NONE,
-        )));
-        assert_eq!(app.permission().unwrap().scroll(), bottom_page - 1);
-        app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::PageDown,
-            crossterm::event::KeyModifiers::NONE,
-        )));
-        let mut terminal = Terminal::new(TestBackend::new(32, 10)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(32, 12)).unwrap();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(rendered.contains("❯ Allow once"));
-        assert!(rendered.contains("Ctrl-C cancel"));
+        let screen: String = (0..12)
+            .map(|y| row(&terminal, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            screen.contains("Allow once"),
+            "a prompt long enough to wrap must not push its own choice off screen:\n{screen}"
+        );
     }
 }

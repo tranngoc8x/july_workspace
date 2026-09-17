@@ -1,0 +1,106 @@
+use crate::tui::support::keymap::KeymapContextSet;
+use crate::tui::support::render::renderable::Renderable;
+use crossterm::event::KeyEvent;
+use std::time::Instant;
+
+use super::CancellationEvent;
+
+/// Reason an active bottom-pane view finished.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ViewCompletion {
+    Accepted,
+    Cancelled,
+}
+
+/// Trait implemented by every view that can be shown in the bottom pane.
+pub(crate) trait BottomPaneView: Renderable {
+    /// Handle a key event while the view is active. A redraw is always
+    /// scheduled after this call.
+    fn handle_key_event(&mut self, _key_event: KeyEvent) {}
+
+    /// Return the keymap contexts whose handlers are active in this view.
+    fn keymap_contexts(&self) -> KeymapContextSet {
+        KeymapContextSet::default()
+    }
+
+    /// Return `true` if the view has finished and should be removed.
+    fn is_complete(&self) -> bool {
+        false
+    }
+
+    /// Return the completion reason once the view has finished.
+    fn completion(&self) -> Option<ViewCompletion> {
+        None
+    }
+
+    /// Return true when this view should be removed after a child view is accepted.
+    fn dismiss_after_child_accept(&self) -> bool {
+        false
+    }
+
+    /// Clear any pending child-flow cleanup marker after a child view is cancelled.
+    fn clear_dismiss_after_child_accept(&mut self) {}
+
+    /// Stable identifier for views that need external refreshes while open.
+    fn view_id(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Actual item index for list-based views that want to preserve selection
+    /// across external refreshes.
+    fn selected_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// Active tab id for tabbed list-based views.
+    #[allow(dead_code)]
+    fn active_tab_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Handle Ctrl-C while this view is active.
+    fn on_ctrl_c(&mut self) -> CancellationEvent {
+        CancellationEvent::NotHandled
+    }
+
+    /// Return true if Esc should be routed through `handle_key_event` instead
+    /// of the `on_ctrl_c` cancellation path.
+    fn prefer_esc_to_handle_key_event(&self) -> bool {
+        false
+    }
+
+    /// Optional paste handler. Return true if the view modified its state and
+    /// needs a redraw.
+    fn handle_paste(&mut self, _pasted: String) -> bool {
+        false
+    }
+
+    /// Flush any pending paste-burst state. Return true if state changed.
+    ///
+    /// This lets a modal that reuses `ChatComposer` participate in the same
+    /// time-based paste burst flushing as the primary composer.
+    fn flush_paste_burst_if_due(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the view is currently holding paste-burst transient state.
+    ///
+    /// When `true`, the bottom pane will schedule a short delayed redraw to
+    /// give the burst time window a chance to flush.
+    fn is_in_paste_burst(&self) -> bool {
+        false
+    }
+
+    /// Process time-based state immediately before rendering.
+    ///
+    /// Return true when state changed and the bottom pane should redraw or
+    /// complete the active view.
+    fn pre_draw_tick(&mut self, _now: Instant) -> bool {
+        false
+    }
+
+    /// Return the next time-based redraw this view needs while it is active.
+    fn next_frame_delay(&self) -> Option<std::time::Duration> {
+        None
+    }
+}

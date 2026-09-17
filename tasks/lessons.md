@@ -18,3 +18,6 @@
 - Khi Sếp yêu cầu bỏ `Esc` để chỉ thoát bằng lệnh nhưng sau đó giữ các compatibility exit (`/quit`, `Ctrl-D`, `Ctrl-C`, EOF), phải giới hạn thay đổi vào global `Esc`; không diễn giải thành xóa mọi đường thoát không phải `/exit`.
 - Khi bổ sung onboarding command trong CLI đã có `init`, phải chốt rõ command mapping trước khi thiết kế: command cũ có thể được đổi tên và `init` được tái sử dụng cho project-local setup, không tự mặc định nhét wizard vào `agent add`.
 - Khi sinh agent name từ tên thư mục Unicode, “remove Unicode” không đồng nghĩa xóa cả chữ: phải chuyển chữ Latin có dấu về ASCII không dấu (ví dụ `Dự án` → `Du_an`), chỉ loại ký tự không có dạng Latin tương đương.
+
+- Không dùng script tự động xoá code theo vị trí lỗi compile. Test và production nằm chung file nên việc "lùi về `fn` gần nhất phía trên dòng lỗi rồi xoá" sẽ ăn cả hàm production; phải giới hạn trong phạm vi `#[cfg(test)]`, in ra danh sách sẽ xoá để duyệt trước, và chạy từng vòng có kiểm chứng thay vì lặp tới khi hết lỗi.
+- Trước khi chạy bất kỳ thao tác xoá hàng loạt nào trên thư mục chưa commit, phải có bản sao đối chiếu (bản gốc hoặc snapshot) để so bộ tên hàm và xác định thiệt hại; không có nó thì không khôi phục được.
