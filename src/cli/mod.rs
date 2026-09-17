@@ -1361,7 +1361,9 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     };
                     match result {
                         Ok((name, Some(activation))) => {
-                            room_status(format!("{name}: working"), stdout, tui_events)?;
+                            // Opens this agent's live cell, exactly as a mid-turn activation does:
+                            // the agents a message starts with are the ones the user watches most.
+                            agent_stream_start(activation.agent_id(), &name, stdout, tui_events)?;
                             activations.push((name, activation));
                         }
                         Ok((_, None)) => {}
