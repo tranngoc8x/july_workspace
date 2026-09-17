@@ -9,6 +9,11 @@ use crate::transport::{
 pub enum RoomRuntimeEvent {
     SharedMessage(RoomMessage),
     PermissionRequested(PermissionRequest),
+    /// One chunk of what this agent is writing, for a live view of the turn.
+    ///
+    /// The chunks are a preview, not the record: what the agent finally says still arrives as a
+    /// [`RoomRuntimeEvent::SharedMessage`], which is what gets stored and replayed.
+    TextDelta(String),
     Completed,
     Cancelled,
     Failed {
@@ -137,6 +142,9 @@ impl RoomActivation {
             let terminal = match event {
                 Some(TransportEvent::PermissionRequested(request)) => {
                     return Ok(Some(RoomRuntimeEvent::PermissionRequested(request)));
+                }
+                Some(TransportEvent::AgentTextDelta { text, .. }) => {
+                    return Ok(Some(RoomRuntimeEvent::TextDelta(text)));
                 }
                 Some(TransportEvent::TurnCompleted { .. }) => Ok(if self.cancelled {
                     RoomRuntimeEvent::Cancelled
