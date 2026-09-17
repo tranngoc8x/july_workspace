@@ -2929,6 +2929,14 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                             }
                         }
                     }
+                    Ok(Some(RoomRuntimeEvent::TextDelta(text))) => {
+                        // A preview of the turn, so only the TUI's live cell wants it: the CLI
+                        // prints the finished message and nothing before it.
+                        if let Some(events) = tui_events {
+                            let agent = activations[index].as_ref().unwrap().1.agent_id();
+                            let _ = events.send(AppEvent::AgentStreamDelta { agent, delta: text });
+                        }
+                    }
                     Ok(Some(RoomRuntimeEvent::PermissionRequested(request))) => {
                         if cancelled_agents.contains(&index) {
                             // Events may already be audited by cancel_turn, or arrive after it.

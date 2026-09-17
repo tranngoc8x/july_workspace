@@ -964,32 +964,26 @@ impl App {
         error
     }
 
-    /// Closes one agent's live cell and commits what it streamed to the transcript.
+    /// Closes one agent's live cell, leaving the transcript to the Room's own record.
     ///
-    /// Partial output is kept even when the agent failed, so a cancelled turn does not silently
-    /// discard what the user already read. Other agents' cells are untouched.
+    /// What the cell streamed is a preview, not a record: only what the agent published reaches
+    /// storage, and the transcript is rebuilt from storage on every scope switch. Committing the
+    /// streamed text here would put a line on screen that vanishes the next time the room is
+    /// opened. A failure reason is not the agent's output and does get said out loud.
+    /// Other agents' cells are untouched.
     fn commit_live_cell(&mut self, agent: &AgentId, reason: Option<String>) {
-        let Some(cell) = self.live_cells.remove(agent) else {
-            // A finish for an agent with no open cell: its output already arrived as a committed
-            // Room message, which is the ordinary path.
-            if let Some(reason) = reason {
-                self.freeze_stream();
-                self.markdown.push_plain(reason, ERROR_COLOR);
-            }
+        let label = self.live_cells.remove(agent).map(|cell| cell.label);
+        let Some(reason) = reason else {
             return;
         };
         self.freeze_stream();
-        let body = cell.body.trim_end();
-        if !body.is_empty() {
-            self.push_history_entry(&HistoryEntry {
-                author: HistoryAuthor::Agent,
-                body: format!("{}: {body}", cell.label),
-            });
-        }
-        if let Some(reason) = reason {
-            self.markdown
-                .push_plain(format!("{}: {reason}", cell.label), ERROR_COLOR);
-        }
+        self.markdown.push_plain(
+            match label {
+                Some(label) => format!("{label}: {reason}"),
+                None => reason,
+            },
+            ERROR_COLOR,
+        );
     }
 
     /// What one agent has streamed so far, or `None` when it has no open cell.
@@ -1541,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_one_agent_commits_its_output_and_leaves_the_other_streaming() {
+    fn finishing_one_agent_closes_its_cell_and_leaves_the_other_streaming() {
         let mut app = App::new(room("alpha"));
         let cashpoint = agent(1);
         let pay = agent(2);
@@ -1558,15 +1552,19 @@ mod tests {
             Some("still looking"),
             "the other agent is untouched"
         );
-        let transcript = app.transcript();
+        let transcript = app.transcript_text_for_tests();
         assert!(
-            transcript.contains("cashpoint: done looking"),
-            "committed:\n{transcript}"
+            !transcript.contains("done looking"),
+            "the preview goes with the cell; what the agent published is what stays:\n{transcript}"
+        );
+        assert!(
+            transcript.contains("still looking"),
+            "the other agent's preview is still on screen:\n{transcript}"
         );
     }
 
     #[test]
-    fn a_failing_agent_keeps_what_it_streamed_and_reports_why() {
+    fn a_failing_agent_reports_why_and_drops_its_preview() {
         let mut app = App::new(room("alpha"));
         let cashpoint = agent(1);
         let pay = agent(2);
@@ -1576,19 +1574,34 @@ mod tests {
 
         app.reduce(AppEvent::AgentStreamFailed {
             agent: cashpoint,
-            reason: "cashpoint: failed: transport closed".into(),
+            reason: "failed: transport closed".into(),
         });
 
         assert_eq!(app.live_cell_body(&cashpoint), None);
         assert_eq!(app.live_cell_body(&pay), Some(""));
-        let transcript = app.transcript();
+        let transcript = app.transcript_text_for_tests();
         assert!(
-            transcript.contains("cashpoint: partial answer"),
-            "partial output survives:\n{transcript}"
+            !transcript.contains("partial answer"),
+            "the preview goes with the cell:\n{transcript}"
         );
         assert!(
-            transcript.contains("failed: transport closed"),
-            "the reason is reported:\n{transcript}"
+            transcript.contains("cashpoint: failed: transport closed"),
+            "the reason is reported against the agent that failed:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn a_failure_for_an_agent_with_no_open_cell_still_reports_the_reason() {
+        let mut app = App::new(room("alpha"));
+
+        app.reduce(AppEvent::AgentStreamFailed {
+            agent: agent(1),
+            reason: "cashpoint: failed: transport closed".into(),
+        });
+
+        assert!(
+            app.transcript_text_for_tests()
+                .contains("cashpoint: failed: transport closed")
         );
     }
 

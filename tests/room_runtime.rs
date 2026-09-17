@@ -280,7 +280,7 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
     for event in [
         TransportEvent::AgentTextDelta {
             session: session.clone(),
-            text: "PRIVATE reasoning".into(),
+            text: "streamed answer".into(),
         },
         TransportEvent::ToolCallStarted {
             session: session.clone(),
@@ -291,6 +291,12 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
     ] {
         events.send(event).await.unwrap();
     }
+    // What the agent writes surfaces as a preview of the turn; its tool traces stay in the owner
+    // and neither is what gets stored - only an explicitly published message is.
+    assert_eq!(
+        active.next_event(NOW.into()).await.unwrap(),
+        Some(RoomRuntimeEvent::TextDelta("streamed answer".into()))
+    );
     assert_eq!(
         active.next_event(NOW.into()).await.unwrap(),
         Some(RoomRuntimeEvent::Completed)
@@ -809,10 +815,15 @@ async fn two_rooms_share_one_owner_but_private_traffic_cannot_block_or_cross_ses
         })
         .await
         .unwrap();
-    assert_eq!(
-        a.next_event(NOW.into()).await.unwrap(),
-        Some(RoomRuntimeEvent::Completed)
-    );
+    // The previews nobody drained are still queued on a's own channel - offered, never forced,
+    // which is why they could not hold up b above. Its terminal event is behind whatever fit.
+    let terminal = loop {
+        match a.next_event(NOW.into()).await.unwrap() {
+            Some(RoomRuntimeEvent::TextDelta(text)) => assert_eq!(text, "private"),
+            other => break other,
+        }
+    };
+    assert_eq!(terminal, Some(RoomRuntimeEvent::Completed));
     assert_eq!(observed.lock().unwrap().connects, 1);
     assert_eq!(observed.lock().unwrap().subscribes, 1);
     assert_eq!(observed.lock().unwrap().creates.len(), 2);
@@ -1084,6 +1095,9 @@ async fn real_acp_room_activation_handles_permission_and_keeps_reply_private() {
                     )
                     .await
                     .unwrap(),
+                // A preview of what the agent is writing; the assertion below is that none of it
+                // reaches storage.
+                RoomRuntimeEvent::TextDelta(_) => {}
                 RoomRuntimeEvent::Completed => break,
                 event => panic!("unexpected Room event: {event:?}"),
             }
