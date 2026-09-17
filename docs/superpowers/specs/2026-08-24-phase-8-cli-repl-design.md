@@ -156,7 +156,7 @@ interactive operations Phase 8 needs: open, send exact user Message, receive
 the next July-owned event, respond to permission, cancel the active turn, and
 detach/shutdown.
 
-`ThreadChatService` uses `local-user` as the local sender, persists the exact
+`ThreadChatService` uses `july` as the local sender, persists the exact
 outbound Message before transport submission, and persists the completed
 inbound Agent Message. Thread metadata uses the same July-owned
 channel/direction convention as DM with `channel = thread`. Persistence failure
@@ -209,25 +209,31 @@ the application/storage contract.
 Representative success shapes are:
 
 ```json
-{"room_id":"..."}
+{ "room_id": "..." }
 ```
 
 ```json
-{"state":"active","changed":true}
+{ "state": "active", "changed": true }
 ```
 
 ```json
-{"thread_id":"...","primary_work_id":"..."}
+{ "thread_id": "...", "primary_work_id": "..." }
 ```
 
 ```json
-{"publish_id":"...","result_id":"...","source_conversation_id":"...","target_conversation_id":"...","published_at":"..."}
+{
+  "publish_id": "...",
+  "result_id": "...",
+  "source_conversation_id": "...",
+  "target_conversation_id": "...",
+  "published_at": "..."
+}
 ```
 
 On `--json` failure, stdout remains empty and stderr contains one JSON object:
 
 ```json
-{"error":{"code":"room_not_found","message":"room vna does not exist"}}
+{ "error": { "code": "room_not_found", "message": "room vna does not exist" } }
 ```
 
 Error codes are stable lowercase snake-case presentation identifiers mapped
@@ -250,16 +256,16 @@ remain human-readable.
 
 ## Delivery slices
 
-| Slice | Bead | Independently verified output | Dependencies |
-|---|---|---|---|
-| 8.0 Contract | `JULY_WORKSPACE-4ec.1` | This reconciled design and Beads DAG | none |
-| 8.1 Room shell | `JULY_WORKSPACE-4ec.2` | Room commands, human/JSON integration tests | 8.0 |
-| 8.2 Thread management | `JULY_WORKSPACE-4ec.3` | Non-interactive Thread commands and tests | 8.0 |
-| 8.3 Publish shell | `JULY_WORKSPACE-4ec.4` | Explicit Publish command and tests | 8.0 |
-| 8.4 REPL navigation | `JULY_WORKSPACE-4ec.5` | Root/Room stack, members/status tests | 8.0 |
-| 8.5 DM switching | `JULY_WORKSPACE-4ec.6` | Multi-Agent DM switching/isolation tests | 8.4 |
-| 8.6 Thread context | `JULY_WORKSPACE-4ec.7` | Thread chat, contextual publish/isolation tests | 8.2, 8.3, 8.5 |
-| 8.7 Closure | `JULY_WORKSPACE-4ec.8` | Docs, review, full gates and roadmap evidence | 8.1-8.6 |
+| Slice                 | Bead                   | Independently verified output                   | Dependencies  |
+| --------------------- | ---------------------- | ----------------------------------------------- | ------------- |
+| 8.0 Contract          | `JULY_WORKSPACE-4ec.1` | This reconciled design and Beads DAG            | none          |
+| 8.1 Room shell        | `JULY_WORKSPACE-4ec.2` | Room commands, human/JSON integration tests     | 8.0           |
+| 8.2 Thread management | `JULY_WORKSPACE-4ec.3` | Non-interactive Thread commands and tests       | 8.0           |
+| 8.3 Publish shell     | `JULY_WORKSPACE-4ec.4` | Explicit Publish command and tests              | 8.0           |
+| 8.4 REPL navigation   | `JULY_WORKSPACE-4ec.5` | Root/Room stack, members/status tests           | 8.0           |
+| 8.5 DM switching      | `JULY_WORKSPACE-4ec.6` | Multi-Agent DM switching/isolation tests        | 8.4           |
+| 8.6 Thread context    | `JULY_WORKSPACE-4ec.7` | Thread chat, contextual publish/isolation tests | 8.2, 8.3, 8.5 |
+| 8.7 Closure           | `JULY_WORKSPACE-4ec.8` | Docs, review, full gates and roadmap evidence   | 8.1-8.6       |
 
 Each green slice is committed separately. Phase 8.1, 8.2, 8.3, and 8.4 are
 independent after 8.0 and may be implemented in any order without claiming

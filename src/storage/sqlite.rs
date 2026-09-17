@@ -4724,7 +4724,7 @@ mod tests {
         apply_migrations(&mut connection, &MIGRATIONS[..18]).unwrap();
         seed_session_parent_rows(&connection);
         connection.execute_batch("INSERT INTO rooms VALUES ('room', 'room', NULL, 'active', 'now', 'now');
-            INSERT INTO room_messages(id, room_id, sender_type, sender_id, body, mentions_json, created_at) VALUES ('trigger', 'room', 'user', 'local-user', 'body', '[]', 'now');
+            INSERT INTO room_messages(id, room_id, sender_type, sender_id, body, mentions_json, created_at) VALUES ('trigger', 'room', 'user', 'july', 'body', '[]', 'now');
             INSERT INTO session_bindings(id, room_id, agent_id, transport_type, remote_session_id, generation, status, created_at, last_used_at) VALUES ('room-binding', 'room', 'agent-1', 'acp', 'remote', 1, 'active', 'now', 'now');
             INSERT INTO room_message_activations VALUES ('trigger', 'agent-1', 'room-binding', 'completed', 'now');
             INSERT INTO agent_room_cursors VALUES ('agent-1', 'room', 'trigger');").unwrap();
@@ -4830,7 +4830,7 @@ mod tests {
             id: RoomMessageId::new(),
             room_id: room.id,
             sender_type: MemberType::User,
-            sender_id: "local-user".into(),
+            sender_id: "july".into(),
             body: "question".into(),
             mentions: vec![agents[0].id],
             reply_to: None,

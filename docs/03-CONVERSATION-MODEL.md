@@ -57,6 +57,7 @@ members: cashpoint, pay, infra, mobile
 ```
 
 `Thread payment` may include only:
+
 - cashpoint
 - pay
 
@@ -70,7 +71,7 @@ than cascading them silently.
 ## Dynamic thread membership
 
 Dynamic membership through mentions is a Phase 5 feature. Phase 4 membership
-changes are explicit local-user commands.
+changes are explicit july commands.
 
 If Cashpoint says:
 
