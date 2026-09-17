@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 
-pub const TRUSTED_LOCAL_USER_ID: &str = "local-user";
+pub const TRUSTED_LOCAL_USER_ID: &str = "july";
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {

@@ -35,12 +35,14 @@
 ### Task 1: Forward bounded recent-message reads through the storage worker
 
 **Files:**
+
 - Modify: `src/runtime/storage_worker.rs:25-190`
 - Modify: `src/runtime/storage_worker.rs:264-578`
 - Modify: `src/runtime/storage_worker.rs:1374-1376`
 - Test: `src/runtime/storage_worker.rs` crate-private test module
 
 **Interfaces:**
+
 - Consumes: `SqliteStore::list_recent_messages_after(ConversationId, Option<&Message>, usize) -> Result<(Vec<Message>, bool), StoreError>`.
 - Produces: `StorageHandle::list_recent_messages(ConversationId, usize) -> Result<(Vec<Message>, bool), RuntimeError>` for Task 3.
 
@@ -187,11 +189,13 @@ git commit -m "feat(JULY_WORKSPACE-sca.4): expose bounded message history"
 ### Task 2: Add typed snapshots and atomic transcript replacement
 
 **Files:**
+
 - Modify: `src/tui/app.rs:94-143`
 - Modify: `src/tui/app.rs:793-857`
 - Test: `src/tui/app.rs` existing unit-test module
 
 **Interfaces:**
+
 - Consumes: existing `Context`, `ContextId`, `MarkdownStream::{default, push, finish, push_plain}`, `USER_COLOR`, `SYSTEM_COLOR`, and stale `pending == origin` guard.
 - Produces: `HistoryAuthor`, `HistoryEntry`, `History`, `ContextSnapshot`, and snapshot-bearing `CommandResult` variants for Task 3.
 
@@ -528,6 +532,7 @@ git commit -m "feat(JULY_WORKSPACE-sca.4): replace TUI context history"
 ### Task 3: Hydrate only successful TUI context changes in the CLI bridge
 
 **Files:**
+
 - Modify: `src/cli/mod.rs:37-40`
 - Modify: `src/cli/mod.rs:1056-1185`
 - Modify: `src/cli/mod.rs:1363-1620`
@@ -535,6 +540,7 @@ git commit -m "feat(JULY_WORKSPACE-sca.4): replace TUI context history"
 - Test: `tests/cli_repl.rs:920-1120`
 
 **Interfaces:**
+
 - Consumes: `StorageHandle::list_recent_messages` from Task 1 and all presentation DTOs from Task 2.
 - Produces: TUI-only `ContextSnapshot` projection and snapshot-bearing bridge results; non-TTY flow remains unchanged.
 
@@ -587,12 +593,12 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
     let thread = workspace.seed_thread(&room, "work", &[&agent]);
     let dm = SqliteStore::open(&workspace.database)
         .unwrap()
-        .get_or_create_dm("local-user", agent.id, NOW)
+        .get_or_create_dm("july", agent.id, NOW)
         .unwrap();
     workspace.seed_message(
         dm.id,
         MemberType::User,
-        "local-user",
+        "july",
         "dm-user",
         "2026-09-01T10:00:01Z",
     );
@@ -606,7 +612,7 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
     workspace.seed_message(
         thread,
         MemberType::User,
-        "local-user",
+        "july",
         "thread-user",
         "2026-09-01T10:00:03Z",
     );
@@ -901,6 +907,7 @@ git commit -m "feat(JULY_WORKSPACE-sca.4): hydrate TUI conversation history"
 ### Task 4: Review the complete behavior and run closure gates
 
 **Files:**
+
 - Review: `src/runtime/storage_worker.rs`
 - Review: `src/tui/app.rs`
 - Review: `src/cli/mod.rs`
@@ -908,6 +915,7 @@ git commit -m "feat(JULY_WORKSPACE-sca.4): hydrate TUI conversation history"
 - Update after successful gates: Bead `JULY_WORKSPACE-sca.4`
 
 **Interfaces:**
+
 - Consumes: the complete bounded storage -> CLI projection -> stale-guarded reducer flow.
 - Produces: closure evidence and unblocks `JULY_WORKSPACE-sca.3` only after every gate passes.
 

@@ -119,7 +119,7 @@ impl TestWorkspace {
             .create_thread_with_primary_work(
                 &thread,
                 WorkItemId::new(),
-                "local-user",
+                "july",
                 &[source.id, target.id],
             )
             .unwrap();

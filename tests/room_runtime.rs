@@ -205,7 +205,7 @@ fn seed(database: &TestDatabase) -> (Agent, Agent, Room, RoomMessage) {
         id: RoomMessageId::new(),
         room_id: room.id,
         sender_type: MemberType::User,
-        sender_id: "local-user".into(),
+        sender_id: "july".into(),
         body: "@pay check refund".into(),
         mentions: vec![pay.id],
         reply_to: None,

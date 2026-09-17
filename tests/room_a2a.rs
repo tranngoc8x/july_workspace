@@ -51,7 +51,7 @@ impl Fixture {
             id: RoomMessageId::new(),
             room_id: room.id,
             sender_type: MemberType::User,
-            sender_id: "local-user".into(),
+            sender_id: "july".into(),
             body: "Review contract".into(),
             mentions: vec![agents[0].id],
             reply_to: None,

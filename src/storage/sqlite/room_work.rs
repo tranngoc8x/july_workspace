@@ -213,7 +213,7 @@ mod tests {
                     id: trigger,
                     room_id: room,
                     sender_type: MemberType::User,
-                    sender_id: "local-user".into(),
+                    sender_id: "july".into(),
                     body: "Implement contract".into(),
                     mentions: vec![agents[0]],
                     reply_to: None,

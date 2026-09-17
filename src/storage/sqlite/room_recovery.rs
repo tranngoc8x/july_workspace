@@ -167,7 +167,7 @@ mod tests {
                 id,
                 room_id: room,
                 sender_type: MemberType::User,
-                sender_id: "local-user".into(),
+                sender_id: "july".into(),
                 body: "Continue".into(),
                 mentions: vec![agent],
                 reply_to: None,

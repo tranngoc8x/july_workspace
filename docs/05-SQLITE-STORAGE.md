@@ -5,6 +5,7 @@
 SQLite is the canonical workspace store.
 
 Requirements:
+
 - local-first;
 - transactional;
 - crash-safe;
@@ -322,7 +323,7 @@ PRAGMA busy_timeout=5000;
 Phase 1 implements atomic Room/member and Conversation/member batch inserts.
 Phase 4 replaces Thread creation with one aggregate `BEGIN IMMEDIATE`
 transaction that validates the active Room and initial Agent memberships, then
-inserts the open Thread, local-user membership, initial Agent memberships and
+inserts the open Thread, july membership, initial Agent memberships and
 one open primary WorkItem. The Work title and goal mirror the Thread; its owner
 is null until Phase 6. Any failure rolls back the complete aggregate.
 
@@ -331,6 +332,7 @@ Dependencies never participate in the Thread creation transaction. Session
 startup is lazy after commit.
 
 The following operation groups are atomic:
+
 - work completion + result creation;
 - result publish;
 - dependency update;
@@ -341,6 +343,7 @@ The following operation groups are atomic:
 
 Phase 1 creates external-content FTS5 tables and insert/update/delete sync
 triggers only for:
+
 - messages;
 - results;
 - memories.

@@ -2229,7 +2229,7 @@ mod tests {
         let connection = rusqlite::Connection::open(&path).unwrap();
         connection.execute_batch("INSERT INTO agents(id,name,project_root,transport_type,transport_config_json,status,metadata_json,created_at,updated_at) VALUES('agent','agent','/tmp','acp','{}','active','{}','now','now');
             INSERT INTO rooms(id,name,status,created_at,updated_at) VALUES('room','room','active','now','now');
-            INSERT INTO room_messages(id,room_id,sender_type,sender_id,body,mentions_json,created_at) VALUES('message','room','user','local-user','request','[\"agent\"]','now');
+            INSERT INTO room_messages(id,room_id,sender_type,sender_id,body,mentions_json,created_at) VALUES('message','room','user','july','request','[\"agent\"]','now');
             INSERT INTO session_bindings(id,room_id,agent_id,transport_type,remote_session_id,status,created_at,last_used_at) VALUES('binding','room','agent','acp','remote','active','now','now');
             INSERT INTO room_message_activations VALUES('message','agent','binding','sent','now');").unwrap();
         let state = || {

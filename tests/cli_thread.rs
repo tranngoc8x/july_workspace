@@ -279,7 +279,7 @@ fn thread_membership_preserves_user_and_agent_history_with_idempotent_changes() 
         vec![
             (thread_id.as_str(), "agent", codex_id.as_str(), 1, "active"),
             (thread_id.as_str(), "agent", reviewer_id.as_str(), 1, "left"),
-            (thread_id.as_str(), "user", "local-user", 1, "active"),
+            (thread_id.as_str(), "user", "july", 1, "active"),
             (
                 thread_id.as_str(),
                 "agent",
