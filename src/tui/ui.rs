@@ -68,6 +68,10 @@ mod tests {
     use crate::domain::PermissionOption;
     use crate::tui::app::{App, AppEvent, CommandResult, Context, ContextId};
 
+    use crate::tui::support::style::user_message_bg;
+    use crate::tui::support::terminal_palette::DefaultColors;
+    use crate::tui::support::terminal_palette::with_test_default_colors;
+
     use super::render;
 
     const TALL_MARKDOWN: &str = "0  \n1  \n2  \n3  \n4  \n5  \n6  \n7  \n8  \n9";
@@ -115,7 +119,7 @@ mod tests {
         fn footer(terminal: &Terminal<TestBackend>, app: &App, height: u16) -> String {
             composer_rows(app, height)
                 .map(|y| row(terminal, y))
-                .find(|line| line.contains("exit") || line.contains('!'))
+                .find(|line| line.contains('!'))
                 .unwrap_or_default()
         }
 
@@ -128,8 +132,8 @@ mod tests {
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
         assert!(
-            footer(&terminal, &app, 12).contains("/exit to leave"),
-            "the default hint sits on the composer's own footer row"
+            footer(&terminal, &app, 12).is_empty(),
+            "with nothing wrong the composer keeps its own footer row"
         );
 
         app.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
@@ -149,7 +153,6 @@ mod tests {
 
         let line = footer(&terminal, &app, 12);
         assert!(line.contains("! boom"), "an error replaces the hint: {line:?}");
-        assert!(!line.contains("/exit"), "{line:?}");
     }
 
     /// Renders the whole composer surface end to end: draft, slash popup, mention popup.
@@ -339,7 +342,16 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         )));
 
-        terminal.draw(|frame| render(frame, &app)).unwrap();
+        // The surface the composer paints is derived from the terminal's own background, so the
+        // test pins one rather than depending on what the terminal running the test reports.
+        let terminal_bg = (0, 0, 0);
+        with_test_default_colors(
+            DefaultColors {
+                fg: (204, 204, 204),
+                bg: terminal_bg,
+            },
+            || terminal.draw(|frame| render(frame, &app)).unwrap(),
+        );
 
         let buffer = terminal.backend().buffer();
         let draft = draft_row(&app, 12);
@@ -349,13 +361,25 @@ mod tests {
         // The composer paints its own surface, so the whole band reads as one block rather than
         // the draft row sitting on bare terminal background.
         let surface = buffer.cell((0, draft)).unwrap().bg;
-        for y in composer_rows(&app, 12) {
+        assert_eq!(
+            surface,
+            user_message_bg(terminal_bg),
+            "the band lifts off the terminal background"
+        );
+        let band = composer_rows(&app, 12);
+        // The footer hint row is the last of the band and sits outside the painted surface.
+        for y in band.start..band.end - 1 {
             assert_eq!(buffer.cell((0, y)).unwrap().bg, surface, "row {y}");
             assert_eq!(buffer.cell((1, y)).unwrap().bg, surface, "row {y}");
         }
+        assert_ne!(
+            buffer.cell((0, band.end - 1)).unwrap().bg,
+            surface,
+            "the footer hint row stays on the terminal background"
+        );
         // The band is padded above and below the draft.
-        assert!(draft > composer_rows(&app, 12).start);
-        assert!(draft + 1 < composer_rows(&app, 12).end);
+        assert!(draft > band.start);
+        assert!(draft + 1 < band.end);
     }
 
     #[test]
