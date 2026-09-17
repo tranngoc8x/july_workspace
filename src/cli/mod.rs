@@ -2733,6 +2733,52 @@ fn room_status(
     }
 }
 
+/// Opens one agent's live cell in the TUI, or prints the same line on the CLI.
+fn agent_stream_start(
+    agent: crate::domain::AgentId,
+    name: &str,
+    output: &mut impl Write,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+) -> Result<(), CliError> {
+    match tui_events {
+        Some(events) => {
+            let _ = events.send(crate::tui::app::AppEvent::AgentStreamStarted {
+                agent,
+                label: name.to_owned(),
+            });
+            Ok(())
+        }
+        None => repl_write(output, format_args!("{name}: working\n")),
+    }
+}
+
+/// Closes one agent's live cell in the TUI, or prints the same line on the CLI.
+///
+/// The TUI drops the "completed" line: the cell closing already says so, and the agent's output
+/// arrived as an ordinary Room message. A failure keeps its reason, which the cell reports.
+fn agent_stream_end(
+    agent: crate::domain::AgentId,
+    status: String,
+    failed: bool,
+    output: &mut impl Write,
+    tui_events: Option<&mpsc::UnboundedSender<crate::tui::app::AppEvent>>,
+) -> Result<(), CliError> {
+    match tui_events {
+        Some(events) => {
+            let _ = events.send(if failed {
+                crate::tui::app::AppEvent::AgentStreamFailed {
+                    agent,
+                    reason: status,
+                }
+            } else {
+                crate::tui::app::AppEvent::AgentStreamFinished { agent }
+            });
+            Ok(())
+        }
+        None => repl_write(output, format_args!("{status}\n")),
+    }
+}
+
 // Room activations share one UI turn, but retain independent session and permission identity.
 #[allow(clippy::too_many_arguments)]
 async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
@@ -2859,7 +2905,7 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                 match result {
                     Ok((name, active)) => {
                         if let Some(active) = active {
-                            room_status(format!("{name}: working"), stdout, tui_events)?;
+                            agent_stream_start(active.agent_id(), &name, stdout, tui_events)?;
                             activations.push(Some((name, active)));
                         }
                     }
@@ -2892,13 +2938,14 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                         } else { permissions.push_back((index, request)); }
                     }
                     terminal => {
-                        let (name, _) = activations[index].take().unwrap();
+                        let (name, finished) = activations[index].take().unwrap();
+                        let agent = finished.agent_id();
                         match terminal {
-                            Err(error) => room_status(format!("{name}: failed: {error}"), stderr, tui_events)?,
-                            Ok(Some(RoomRuntimeEvent::Failed { reason, .. })) => room_status(format!("{name}: failed: {reason}"), stderr, tui_events)?,
-                            Ok(Some(RoomRuntimeEvent::Cancelled)) => room_status(format!("{name}: cancelled"), stdout, tui_events)?,
-                            Ok(Some(RoomRuntimeEvent::Completed)) => room_status(format!("{name}: completed"), stdout, tui_events)?,
-                            _ => {},
+                            Err(error) => agent_stream_end(agent, format!("{name}: failed: {error}"), /*failed*/ true, stderr, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Failed { reason, .. })) => agent_stream_end(agent, format!("{name}: failed: {reason}"), /*failed*/ true, stderr, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Cancelled)) => agent_stream_end(agent, format!("{name}: cancelled"), /*failed*/ true, stdout, tui_events)?,
+                            Ok(Some(RoomRuntimeEvent::Completed)) => agent_stream_end(agent, format!("{name}: completed"), /*failed*/ false, stdout, tui_events)?,
+                            _ => agent_stream_end(agent, format!("{name}: completed"), /*failed*/ false, stdout, tui_events)?,
                         }
                         if permissions.front().is_some_and(|(owner, _)| *owner == index) {
                             shown = false;

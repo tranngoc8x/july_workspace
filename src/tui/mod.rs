@@ -3,8 +3,8 @@ use std::io::{self, Write};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind,
 };
 #[cfg(not(windows))]
 use crossterm::event::{
@@ -27,7 +27,15 @@ const WHEEL_ROWS: u16 = 3;
 
 pub mod app;
 mod markdown;
+/// The composer and everything that can take the bottom of the screen from it.
+pub(crate) mod bottom_pane;
+/// Finding workspace files for the composer's `@` popup.
+pub mod file_search;
+/// Rendering, wrapping, and key-binding primitives the composer is built on.
+pub(crate) mod support;
 pub mod ui;
+/// Byte-range markers the composer overlays on its text buffer.
+pub mod user_input;
 
 use app::{App, Context};
 
@@ -99,9 +107,15 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             #[cfg(not(windows))]
             keyboard_enhanced: false,
         };
-        if let Err(operation) =
-            execute!(guard.writer, EnterAlternateScreen, EnableMouseCapture, Hide)
-        {
+        if let Err(operation) = execute!(
+            guard.writer,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            // Without this a paste arrives as individual key events, and the composer has to guess
+            // from timing which of them were typed.
+            EnableBracketedPaste,
+            Hide
+        ) {
             return match guard.restore() {
                 Ok(()) => Err(ShellError::Operation(operation)),
                 Err(restore) => Err(ShellError::OperationAndRestore { operation, restore }),
@@ -137,7 +151,12 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             Ok(())
         };
         let show = execute!(self.writer, Show);
-        let leave = execute!(self.writer, DisableMouseCapture, LeaveAlternateScreen);
+        let leave = execute!(
+            self.writer,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let raw = self.raw_mode.disable();
         let mut errors = Vec::new();
         #[cfg(not(windows))]
@@ -274,14 +293,19 @@ pub async fn run_app(
                         dispatch_all(app.reduce(app::AppEvent::Key(key)), &mut dispatch)?;
                         dirty = true;
                     }
+                    Some(Ok(Event::Paste(pasted))) => {
+                        dispatch_all(app.reduce(app::AppEvent::Paste(pasted)), &mut dispatch)?;
+                        dirty = true;
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error),
                     None => break,
                 },
                 _ = frames.tick() => {
-                    if app.turn_active() {
-                        // Advance the working spinner while the agent is busy.
-                        app.reduce(app::AppEvent::Tick);
+                    // Every frame, not only while a turn runs: the composer rides this tick to
+                    // sync popups and release keystrokes it was holding as a suspected paste.
+                    dispatch_all(app.reduce(app::AppEvent::Tick), &mut dispatch)?;
+                    if app.turn_active() || app.take_pane_redraw() {
                         dirty = true;
                     }
                     if dirty {
