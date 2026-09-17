@@ -314,8 +314,9 @@ impl BottomPane {
     }
 
     /// Replaces the composer's footer hints with July's own.
-    pub(crate) fn set_footer_hint(&mut self, items: Vec<(String, String)>) {
-        self.composer.set_footer_hint_override(Some(items));
+    /// Overrides the composer's footer row, or hands it back when given `None`.
+    pub(crate) fn set_footer_hint(&mut self, items: Option<Vec<(String, String)>>) {
+        self.composer.set_footer_hint_override(items);
     }
 
     /// Finishes a slash command the composer dispatched.

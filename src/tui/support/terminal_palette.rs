@@ -135,18 +135,51 @@ fn default_colors_cell() -> &'static std::sync::Mutex<Option<DefaultColors>> {
     DEFAULT_COLORS.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// Returns the terminal's reported default colors, or `None` when nothing has reported them.
+/// What a dark terminal is assumed to look like when it reports nothing at all.
+const DARK_DEFAULT_COLORS: DefaultColors = DefaultColors {
+    fg: (204, 204, 204),
+    bg: (0, 0, 0),
+};
+
+/// Returns the terminal's default colors: whatever [`set_default_colors`] recorded, else a guess.
 ///
 /// ponytail: no OSC 10/11 query. Codex probes the tty at startup; July already owns the raw-mode
-/// bracket and reading from the tty behind its own event stream would race it, so the palette just
-/// falls back to the fixed xterm table. Call [`set_default_colors`] if a probe is added later.
+/// bracket and reading from the tty behind its own event stream would race it. So the guess reads
+/// `COLORFGBG` when the terminal exports it and assumes a dark terminal otherwise - getting it
+/// wrong only costs contrast on the composer's surface, and a probe can override it later through
+/// [`set_default_colors`].
 pub fn default_colors() -> Option<DefaultColors> {
     #[cfg(test)]
     if let Some(colors) = TEST_DEFAULT_COLORS.with(std::cell::Cell::get) {
         return Some(colors);
     }
 
-    *default_colors_cell().lock().ok()?
+    let recorded = *default_colors_cell().lock().ok()?;
+    Some(recorded.unwrap_or_else(|| guessed_default_colors(|key| std::env::var(key).ok())))
+}
+
+fn guessed_default_colors(var: impl Fn(&str) -> Option<String>) -> DefaultColors {
+    var("COLORFGBG")
+        .as_deref()
+        .and_then(parse_colorfgbg)
+        .unwrap_or(DARK_DEFAULT_COLORS)
+}
+
+/// Reads the `fg;bg` pair terminals export as `COLORFGBG`, as ANSI palette indices.
+fn parse_colorfgbg(value: &str) -> Option<DefaultColors> {
+    let mut fields = value.split(';');
+    let fg = fields.next()?;
+    // Some terminals export `fg;default;bg`, so the background is the last field, not the second.
+    let bg = fields.next_back()?;
+    Some(DefaultColors {
+        fg: ansi_index_rgb(fg)?,
+        bg: ansi_index_rgb(bg)?,
+    })
+}
+
+fn ansi_index_rgb(field: &str) -> Option<(u8, u8, u8)> {
+    let index: usize = field.trim().parse().ok()?;
+    XTERM_COLORS.get(index).copied()
 }
 
 /// Records the terminal's default colors for every later palette lookup.
@@ -487,6 +520,37 @@ mod tests {
                 /*has_force_color_override*/ false,
             ),
             StdoutColorLevel::TrueColor
+        );
+    }
+
+    #[test]
+    fn colorfgbg_reports_the_terminals_own_background() {
+        assert_eq!(
+            guessed_default_colors(|key| (key == "COLORFGBG").then(|| "0;15".to_string())),
+            DefaultColors {
+                fg: (0, 0, 0),
+                bg: (255, 255, 255),
+            }
+        );
+    }
+
+    #[test]
+    fn colorfgbg_takes_the_background_from_the_last_field() {
+        assert_eq!(
+            guessed_default_colors(|key| (key == "COLORFGBG").then(|| "15;default;0".to_string())),
+            DefaultColors {
+                fg: (255, 255, 255),
+                bg: (0, 0, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_reports_nothing_is_assumed_dark() {
+        assert_eq!(guessed_default_colors(|_| None), DARK_DEFAULT_COLORS);
+        assert_eq!(
+            guessed_default_colors(|_| Some("nonsense".to_string())),
+            DARK_DEFAULT_COLORS
         );
     }
 

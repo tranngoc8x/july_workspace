@@ -187,7 +187,7 @@ impl TestWorkspace {
             .create_thread_with_primary_work(
                 &thread,
                 WorkItemId::new(),
-                "local-user",
+                "july",
                 &agents.iter().map(|agent| agent.id).collect::<Vec<_>>(),
             )
             .unwrap();
@@ -1049,7 +1049,7 @@ fn repl_thread_context_keeps_dm_and_thread_transcripts_separate() {
     assert!(stdout_output.lines().any(|line| {
         line.starts_with(&settlement.to_string())
             && line.contains("user")
-            && line.contains("local-user")
+            && line.contains("july")
             && line.ends_with("active")
     }));
 
@@ -1352,12 +1352,12 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
     let thread = workspace.seed_thread(&room, "work", &[&agent]);
     let dm = SqliteStore::open(&workspace.database)
         .unwrap()
-        .get_or_create_dm("local-user", agent.id, NOW)
+        .get_or_create_dm("july", agent.id, NOW)
         .unwrap();
     workspace.seed_message(
         dm.id,
         MemberType::User,
-        "local-user",
+        "july",
         "dm-user",
         "2026-09-01T10:00:01Z",
     );
@@ -1371,7 +1371,7 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
     workspace.seed_message(
         thread,
         MemberType::User,
-        "local-user",
+        "july",
         "thread-user",
         "2026-09-01T10:00:03Z",
     );
@@ -1426,7 +1426,7 @@ async fn inactive_tui_bridge_hydrates_room_history_with_explicit_sender_labels()
         let (sender_type, sender_id) = if index == 50 {
             (MemberType::Agent, agent.id.to_string())
         } else {
-            (MemberType::User, "local-user".to_owned())
+            (MemberType::User, "july".to_owned())
         };
         store
             .append_room_message(&RoomMessage {
@@ -1460,7 +1460,7 @@ async fn inactive_tui_bridge_hydrates_room_history_with_explicit_sender_labels()
     let transcript = app.transcript();
     assert!(transcript.starts_with("… showing 50 most recent messages …"));
     assert!(!transcript.contains("room-00"));
-    assert!(transcript.contains("[user:local-user] room-01"));
+    assert!(transcript.contains("[user:july] room-01"));
     assert!(transcript.contains(&format!("[agent:{}] room-50", agent.id)));
     assert_eq!(transcript.matches("room-").count(), 50);
     bridge.shutdown().await.unwrap();
@@ -2309,7 +2309,7 @@ fn repl_plain_room_input_persists_once_without_conversation_side_effects() {
         vec![(
             room.id.to_string(),
             "user".into(),
-            "local-user".into(),
+            "july".into(),
             "investigate refund issue".into(),
         )]
     );

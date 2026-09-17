@@ -214,9 +214,6 @@ pub enum TurnState {
     CancelAcknowledged,
 }
 
-/// The hint the composer's footer carries when nothing has gone wrong.
-const COMPOSER_FOOTER_HINT: (&str, &str) = ("/exit", "to leave");
-
 /// What the composer shows before anything is typed.
 const COMPOSER_PLACEHOLDER: &str = "Ask anything, / for commands, @ for agents and files";
 
@@ -538,15 +535,12 @@ impl App {
         self.exit_requested
     }
 
-    /// Puts July's own footer line into the composer's footer, which is now the only one.
+    /// Puts the current error on the composer's footer row, and hands the row back to the composer
+    /// once the error clears so its own hints show through.
     fn sync_footer_hint(&mut self) {
-        let items = match self.error() {
-            Some(error) => vec![("!".to_string(), error.to_string())],
-            None => vec![(
-                COMPOSER_FOOTER_HINT.0.to_string(),
-                COMPOSER_FOOTER_HINT.1.to_string(),
-            )],
-        };
+        let items = self
+            .error()
+            .map(|error| vec![("!".to_string(), error.to_string())]);
         self.bottom_pane.set_footer_hint(items);
     }
 
