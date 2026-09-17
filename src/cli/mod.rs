@@ -22,7 +22,7 @@ use crate::runtime::{
 use crate::transport::AcpTransport;
 use chrono::{SecondsFormat, Utc};
 use serde_json::json;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -2781,6 +2781,30 @@ fn agent_stream_end(
     }
 }
 
+/// Room transcripts address members by name; the stored sender id is only a key.
+async fn agent_names<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+) -> HashMap<String, String> {
+    service
+        .list_agents()
+        .await
+        .map(|agents| {
+            agents
+                .into_iter()
+                .map(|agent| (agent.id.to_string(), agent.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A retired or unknown sender keeps its id: a transcript line never goes blank.
+fn room_message_line(message: &RoomMessage, names: &HashMap<String, String>) -> String {
+    let sender = names
+        .get(&message.sender_id)
+        .map_or(message.sender_id.as_str(), String::as_str);
+    format!("[{}:{}] {}", message.sender_type, sender, message.body)
+}
+
 // Room activations share one UI turn, but retain independent session and permission identity.
 #[allow(clippy::too_many_arguments)]
 async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
@@ -2812,6 +2836,7 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
         ),
     >;
     let mut starting: Option<RecipientStartup<'_>> = None;
+    let names = agent_names(service).await;
     if initial_cancel {
         for (index, entry) in activations.iter_mut().enumerate() {
             if let Some((_, activation)) = entry {
@@ -2918,7 +2943,7 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                 match event {
                     Ok(Some(RoomRuntimeEvent::SharedMessage(message))) => {
                         if publications.insert(message.id) {
-                            let body = format!("[{}:{}] {}", message.sender_type, message.sender_id, message.body);
+                            let body = room_message_line(&message, &names);
                             if let Some(events) = tui_events {
                                 let _ = events.send(AppEvent::RoomMessage(body));
                             } else {
@@ -3268,6 +3293,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
     use crate::tui::app::{ContextSnapshot, History, HistoryAuthor, HistoryEntry};
 
     let context = project_repl_context(service, contexts).await?;
+    let names = agent_names(service).await;
     let history = match contexts.last() {
         Some(ReplContext::Room(room_id)) => service
             .list_recent_room_messages(*room_id, TUI_HISTORY_LIMIT)
@@ -3280,10 +3306,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
                             MemberType::User => HistoryAuthor::User,
                             MemberType::Agent => HistoryAuthor::Agent,
                         },
-                        body: format!(
-                            "[{}:{}] {}",
-                            message.sender_type, message.sender_id, message.body
-                        ),
+                        body: room_message_line(&message, &names),
                     })
                     .collect(),
                 truncated,
