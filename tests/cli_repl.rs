@@ -1461,7 +1461,7 @@ async fn inactive_tui_bridge_hydrates_room_history_with_explicit_sender_labels()
     assert!(transcript.starts_with("… showing 50 most recent messages …"));
     assert!(!transcript.contains("room-00"));
     assert!(transcript.contains("[user:july] room-01"));
-    assert!(transcript.contains(&format!("[agent:{}] room-50", agent.id)));
+    assert!(transcript.contains(&format!("[agent:{}] room-50", agent.name)));
     assert_eq!(transcript.matches("room-").count(), 50);
     bridge.shutdown().await.unwrap();
 }
@@ -3076,7 +3076,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             "{transcript}"
         );
         assert!(
-            transcript.contains(&format!("[agent:{}] shared refund answer", pay.id)),
+            transcript.contains(&format!("[agent:{}] shared refund answer", pay.name)),
             "{transcript}"
         );
         assert!(!transcript.contains("fixture reply"));

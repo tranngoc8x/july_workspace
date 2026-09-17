@@ -68,12 +68,12 @@ July cài ACP adapter nhưng không quản lý credential tài khoản model.
 
 ### Theo adapter
 
-| Adapter | Runtime | Công cụ cài đặt |
-|---|---|---|
-| `codex` | Codex qua `@agentclientprotocol/codex-acp` | npm |
-| `claude` | Claude Code qua `@agentclientprotocol/claude-agent-acp` | npm |
-| `claude-rust` | Claude Code qua `claude-code-acp-rs` | Cargo |
-| `deepseek` | DeepSeek Harness, experimental | npm |
+| Adapter       | Runtime                                                | Công cụ cài đặt |
+| ------------- | ------------------------------------------------------ | --------------- |
+| `codex`       | Codex qua`@agentclientprotocol/codex-acp`              | npm             |
+| `claude`      | Claude Code qua`@agentclientprotocol/claude-agent-acp` | npm             |
+| `claude-rust` | Claude Code qua`claude-code-acp-rs`                    | Cargo           |
+| `deepseek`    | DeepSeek Harness, experimental                         | npm             |
 
 `codex` và `claude` là hai adapter core được chọn mặc định trong màn hình
 onboarding. Các phiên bản package được July pin trong catalog của release.
@@ -144,11 +144,11 @@ Mặc định July sử dụng:
 
 Hai biến môi trường hữu ích:
 
-| Biến | Tác dụng |
-|---|---|
-| `JULY_HOME` | Đổi thư mục chứa adapter, identity và runtime state |
-| `JULY_WORKSPACE_DB` | Đổi chính xác đường dẫn SQLite database |
-| `JULY_ACP_LOG` | Bật chẩn đoán ACP: ghi stderr của adapter vào `<state_directory>/acp-stderr.log` và in kèm `message`/`data` của lỗi ACP. Mặc định tắt vì các chuỗi này do agent sinh ra |
+| Biến                | Tác dụng                                                                                                                                                               |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `JULY_HOME`         | Đổi thư mục chứa adapter, identity và runtime state                                                                                                                    |
+| `JULY_WORKSPACE_DB` | Đổi chính xác đường dẫn SQLite database                                                                                                                                |
+| `JULY_ACP_LOG`      | Bật chẩn đoán ACP: ghi stderr của adapter vào`<state_directory>/acp-stderr.log` và in kèm `message`/`data` của lỗi ACP. Mặc định tắt vì các chuỗi này do agent sinh ra |
 
 Ví dụ tạo một môi trường thử nghiệm tách khỏi dữ liệu thật:
 
@@ -627,31 +627,31 @@ xem mục 5, bước 6.
 
 ### Chọn giao diện
 
-| Cách chạy | Kết quả |
-|---|---|
-| `july` trong terminal | Full-screen TUI |
-| `printf '/status\n/quit\n' \| july` | Line REPL |
-| `july dm <agent>` | DM stream độc lập |
-| `july thread open ...` | Work stream độc lập |
-| Command quản trị | Output hữu hạn rồi thoát |
+| Cách chạy                           | Kết quả                  |
+| ----------------------------------- | ------------------------ |
+| `july` trong terminal               | Full-screen TUI          |
+| `printf '/status\n/quit\n' \| july` | Line REPL                |
+| `july dm <agent>`                   | DM stream độc lập        |
+| `july thread open ...`              | Work stream độc lập      |
+| Command quản trị                    | Output hữu hạn rồi thoát |
 
 TUI và line REPL dùng cùng context model và cùng slash-command registry.
 
 ### Phím TUI
 
-| Phím | Hành vi |
-|---|---|
-| `Enter` | Gửi input hiện tại |
-| `Tab` | Hoàn thành tên agent đang gõ sau `@` |
-| `Alt+Enter` | Xuống dòng trong editor |
-| `PageUp` / `PageDown` | Cuộn transcript |
-| `End` | Trở lại cuối transcript và bật follow-tail |
-| `Esc` | Hủy thao tác theo context; không thoát July |
-| `Ctrl-D` | Thoát khi turn idle và input trống |
-| `Ctrl-C` khi input có chữ | Xóa input |
-| `Ctrl-C` khi idle và input trống | Thoát TUI |
-| `Ctrl-C` khi turn đang chạy | Gửi cancel |
-| `Ctrl-C` lần nữa khi đang cancel | Thoát |
+| Phím                             | Hành vi                                     |
+| -------------------------------- | ------------------------------------------- |
+| `Enter`                          | Gửi input hiện tại                          |
+| `Tab`                            | Hoàn thành tên agent đang gõ sau`@`         |
+| `Alt+Enter`                      | Xuống dòng trong editor                     |
+| `PageUp` / `PageDown`            | Cuộn transcript                             |
+| `End`                            | Trở lại cuối transcript và bật follow-tail  |
+| `Esc`                            | Hủy thao tác theo context; không thoát July |
+| `Ctrl-D`                         | Thoát khi turn idle và input trống          |
+| `Ctrl-C` khi input có chữ        | Xóa input                                   |
+| `Ctrl-C` khi idle và input trống | Thoát TUI                                   |
+| `Ctrl-C` khi turn đang chạy      | Gửi cancel                                  |
+| `Ctrl-C` lần nữa khi đang cancel | Thoát                                       |
 
 Khi permission modal xuất hiện:
 
@@ -678,13 +678,13 @@ không kết thúc Work và không xóa conversation.
 
 `@` chỉ có nghĩa khi đứng ở **đầu** dòng. Phần còn lại của dòng là prompt.
 
-| Bạn gõ | July làm gì |
-|---|---|
-| `@cashpoint fix callback retry` | Mở/nối việc trực tiếp với `cashpoint`, vào luôn, gửi prompt |
-| `@cashpoint` | Vào việc trực tiếp, không gửi gì |
-| `@cashpoint @pay implement refund flow` | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt |
-| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại |
-| `@nobody hi` | Báo `agent nobody does not exist`, giữ nguyên context |
+| Bạn gõ                                    | July làm gì                                                |
+| ----------------------------------------- | ---------------------------------------------------------- |
+| `@cashpoint fix callback retry`           | Mở/nối việc trực tiếp với`cashpoint`, vào luôn, gửi prompt |
+| `@cashpoint`                              | Vào việc trực tiếp, không gửi gì                           |
+| `@cashpoint @pay implement refund flow`   | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt  |
+| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại             |
+| `@nobody hi`                              | Báo`agent nobody does not exist`, giữ nguyên context       |
 
 Quy tắc bổ sung:
 
@@ -702,23 +702,23 @@ Quy tắc bổ sung:
 
 ### Slash commands
 
-| Command | Context hợp lệ | Mục đích |
-|---|---|---|
-| `/room <room>` | mọi context | Vào Room |
-| `/work` | Room | Liệt kê Work của Room |
-| `/work <work-id> [--agent <agent>]` | Room, Work | Vào một Work |
-| `/work` | Work | Liệt kê work item bên trong Work hiện tại |
-| `/dm <agent> [câu hỏi]` | mọi context | Mở việc trực tiếp; có câu hỏi thì gửi luôn (tương đương `@agent [câu hỏi]`). Tên agent nhận cả dạng `@agent` |
-| `/back` | mọi context | Quay lại context trước |
-| `/rooms` | mọi context | Liệt kê Room |
-| `/agents` | mọi context | Liệt kê Agent |
-| `/members` | Room, Work | Liệt kê thành viên active |
-| `/results` | Work | Liệt kê Result |
-| `/status` | mọi context | Xem context hiện tại |
-| `/publish <result> [--to <work>]` | Work | Publish Result |
-| `/restart` | việc trực tiếp, Work | Đóng rồi mở lại binding của context hiện tại |
-| `/help [command]` | mọi context | Xem help theo context |
-| `/exit`, `/quit` | mọi context | Thoát July |
+| Command                             | Context hợp lệ       | Mục đích                                                                                                    |
+| ----------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `/room <room>`                      | mọi context          | Vào Room                                                                                                    |
+| `/work`                             | Room                 | Liệt kê Work của Room                                                                                       |
+| `/work <work-id> [--agent <agent>]` | Room, Work           | Vào một Work                                                                                                |
+| `/work`                             | Work                 | Liệt kê work item bên trong Work hiện tại                                                                   |
+| `/dm <agent> [câu hỏi]`             | mọi context          | Mở việc trực tiếp; có câu hỏi thì gửi luôn (tương đương`@agent [câu hỏi]`). Tên agent nhận cả dạng `@agent` |
+| `/back`                             | mọi context          | Quay lại context trước                                                                                      |
+| `/rooms`                            | mọi context          | Liệt kê Room                                                                                                |
+| `/agents`                           | mọi context          | Liệt kê Agent                                                                                               |
+| `/members`                          | Room, Work           | Liệt kê thành viên active                                                                                   |
+| `/results`                          | Work                 | Liệt kê Result                                                                                              |
+| `/status`                           | mọi context          | Xem context hiện tại                                                                                        |
+| `/publish <result> [--to <work>]`   | Work                 | Publish Result                                                                                              |
+| `/restart`                          | việc trực tiếp, Work | Đóng rồi mở lại binding của context hiện tại                                                                |
+| `/help [command]`                   | mọi context          | Xem help theo context                                                                                       |
+| `/exit`, `/quit`                    | mọi context          | Thoát July                                                                                                  |
 
 `/work <id>` xác nhận bằng `work\t<work-id>\t<agent>`; `/status` trong một Work
 in `work\t<work-id>\t<agent>\t<binding-id>\t<trạng thái>`.
@@ -751,9 +751,9 @@ Hai command legacy vẫn chạy nhưng không còn xuất hiện trong `/help`:
 
 Chú ý `/work` có hai nghĩa theo context:
 
-| Ở đâu | `/work` in ra |
-|---|---|
-| Trong Room | `<work-id>  <status>  <title>` — danh sách Work để vào |
+| Ở đâu          | `/work` in ra                                                 |
+| -------------- | ------------------------------------------------------------- |
+| Trong Room     | `<work-id>  <status>  <title>` — danh sách Work để vào        |
 | Trong một Work | `<item-id>  <status>  <title>  <owner>` — work item bên trong |
 
 Hai ID này khác nhau: `/work <work-id>` dùng ID ở cột đầu của bảng trên,
@@ -835,40 +835,49 @@ july publish <result-id> --to <thread-id> --json
 Các output chính:
 
 ```json
-{"agent_id":"...","name":"cashpoint","project_root":"/path/to/cashpoint","transport_type":"acp","runtime":"codex","status":"active","created_at":"...","updated_at":"..."}
+{
+  "agent_id": "...",
+  "name": "cashpoint",
+  "project_root": "/path/to/cashpoint",
+  "transport_type": "acp",
+  "runtime": "codex",
+  "status": "active",
+  "created_at": "...",
+  "updated_at": "..."
+}
 ```
 
 ```json
-{"room_id":"..."}
+{ "room_id": "..." }
 ```
 
 ```json
-{"thread_id":"...","primary_work_id":"..."}
+{ "thread_id": "...", "primary_work_id": "..." }
 ```
 
 Khi thành công, JSON được ghi ra stdout và process exit `0`. Khi lỗi, process
 exit `1`, JSON error được ghi ra stderr theo dạng:
 
 ```json
-{"error":{"code":"room_not_found","message":"..."}}
+{ "error": { "code": "room_not_found", "message": "..." } }
 ```
 
 Shape để viết script:
 
-| Command | JSON success |
-|---|---|
-| `--version` | object: `name`, `version` |
-| `agent add/show/update/remove` | Agent object như ví dụ trên |
-| `agent list` | array của Agent object |
-| `room create` | object: `room_id` |
-| `room list` | array: `room_id`, `name`, `description`, `status`, `created_at`, `updated_at` |
-| `room members` | array: `room_id`, `agent_id`, `role`, `generation`, `joined_at`, `left_at`, `state` |
-| `room member add/remove` | object: `state`, `changed` |
-| `thread create` | object: `thread_id`, `primary_work_id` |
-| `thread list` | array: `thread_id`, `room_id`, `title`, `goal`, `status`, `created_at`, `updated_at` |
-| `thread members` | array: `thread_id`, `member_type`, `member_id`, `generation`, `joined_at`, `left_at`, `state` |
-| `thread member add/remove` | object: `state`, `changed` |
-| `publish` | object: `publish_id`, `result_id`, `source_conversation_id`, `target_conversation_id`, `published_at` |
+| Command                        | JSON success                                                                                         |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `--version`                    | object:`name`, `version`                                                                             |
+| `agent add/show/update/remove` | Agent object như ví dụ trên                                                                          |
+| `agent list`                   | array của Agent object                                                                               |
+| `room create`                  | object:`room_id`                                                                                     |
+| `room list`                    | array:`room_id`, `name`, `description`, `status`, `created_at`, `updated_at`                         |
+| `room members`                 | array:`room_id`, `agent_id`, `role`, `generation`, `joined_at`, `left_at`, `state`                   |
+| `room member add/remove`       | object:`state`, `changed`                                                                            |
+| `thread create`                | object:`thread_id`, `primary_work_id`                                                                |
+| `thread list`                  | array:`thread_id`, `room_id`, `title`, `goal`, `status`, `created_at`, `updated_at`                  |
+| `thread members`               | array:`thread_id`, `member_type`, `member_id`, `generation`, `joined_at`, `left_at`, `state`         |
+| `thread member add/remove`     | object:`state`, `changed`                                                                            |
+| `publish`                      | object:`publish_id`, `result_id`, `source_conversation_id`, `target_conversation_id`, `published_at` |
 
 Không dùng `--json` với:
 
