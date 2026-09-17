@@ -630,13 +630,20 @@ async fn run_owner<T: AgentTransport>(
                         if route.session != *session {
                             continue;
                         }
-                        // Private Room output is drained here, before the bounded consumer queue.
-                        // A slow UI cannot expose it or block sibling sessions with text/tool traffic.
+                        // What the agent is writing feeds the caller's live view of the turn, but
+                        // only as an offer: it never becomes a pending delivery, so a consumer that
+                        // stops draining loses chunks instead of stalling this agent's other
+                        // sessions behind the bounded queue.
+                        if route.room && matches!(event, TransportEvent::AgentTextDelta { .. }) {
+                            let _ = route.events.try_send(event);
+                            continue;
+                        }
+                        // The rest of the private Room output is drained here, before the bounded
+                        // consumer queue, for the same reason.
                         if route.room
                             && matches!(
                                 event,
-                                TransportEvent::AgentTextDelta { .. }
-                                    | TransportEvent::AgentMessageCompleted { .. }
+                                TransportEvent::AgentMessageCompleted { .. }
                                     | TransportEvent::ToolCallStarted { .. }
                                     | TransportEvent::ToolCallFinished { .. }
                                     | TransportEvent::UsageReported { .. }
