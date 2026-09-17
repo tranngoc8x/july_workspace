@@ -9,17 +9,19 @@ use super::support::render::renderable::Renderable;
 use super::SYSTEM_COLOR;
 
 pub fn render(frame: &mut Frame, app: &App) {
+    // The frame is the bottom band july owns, not the whole screen: finished transcript rows live
+    // in the terminal's scrollback, above this.
     let area = frame.area();
-    if area.width < 12 || area.height < 6 {
+    if area.width < 12 || area.height < 2 {
         frame.render_widget(Paragraph::new("July"), area);
         return;
     }
 
-    // Header, transcript, composer. The composer draws its own footer hints, so July no longer
-    // keeps a row of its own below it.
+    // Header, the rows still being streamed, then the composer. The composer draws its own footer
+    // hints, so July no longer keeps a row of its own below it.
     let areas = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
+        Constraint::Min(0),
         Constraint::Length(app.input_height()),
     ])
     .split(area);
@@ -38,10 +40,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     ];
     frame.render_widget(Paragraph::new(Line::from(header)), areas[0]);
 
+    // What is still streaming: finished rows have already gone to the terminal's scrollback, so
+    // this region is short. It is pinned to its tail, which is where the new text lands.
+    let live = Paragraph::new(app.transcript_text()).wrap(Wrap { trim: false });
+    let rows: u16 = live
+        .line_count(areas[1].width.max(1))
+        .try_into()
+        .unwrap_or(u16::MAX);
     frame.render_widget(
-        Paragraph::new(app.transcript_text())
-            .wrap(Wrap { trim: false })
-            .scroll((app.transcript_scroll(), 0)),
+        live.scroll((rows.saturating_sub(areas[1].height), 0)),
         areas[1],
     );
 
@@ -74,8 +81,6 @@ mod tests {
 
     use super::render;
 
-    const TALL_MARKDOWN: &str = "0  \n1  \n2  \n3  \n4  \n5  \n6  \n7  \n8  \n9";
-
     fn row(terminal: &Terminal<TestBackend>, y: u16) -> String {
         (0..terminal.backend().buffer().area.width)
             .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol())
@@ -84,34 +89,18 @@ mod tests {
             .to_owned()
     }
 
-    /// First row of the transcript viewport.
-    ///
-    /// The layout is header, transcript, composer, footer; only the header is above the transcript.
-    const TRANSCRIPT_TOP: u16 = 1;
-
-    /// The row the composer's draft sits on, for a terminal `height` rows tall.
+    /// The row the composer's draft sits on, for a band `height` rows tall.
     ///
     /// Derived rather than hard-coded: the composer decides how tall it needs to be, and a test
     /// that pins that number breaks every time its footer hints change.
     fn draft_row(app: &App, height: u16) -> u16 {
-        // The band ends at the bottom of the screen, and the composer insets its draft by one row.
+        // The composer ends at the bottom of the band and insets its draft by one row.
         height - app.input_height() + 1
     }
 
     /// The rows the composer's band covers.
     fn composer_rows(app: &App, height: u16) -> std::ops::Range<u16> {
         (height - app.input_height())..height
-    }
-
-    /// The transcript rows currently on screen, blank rows dropped.
-    ///
-    /// The transcript viewport shrinks and grows with the composer, so tests say which rows are
-    /// visible rather than pinning one to a fixed y.
-    fn visible_transcript(terminal: &Terminal<TestBackend>, app: &App, height: u16) -> Vec<String> {
-        (TRANSCRIPT_TOP..composer_rows(app, height).start)
-            .map(|y| row(terminal, y))
-            .filter(|line| !line.is_empty())
-            .collect()
     }
 
     #[test]
@@ -261,15 +250,7 @@ mod tests {
             agent: pay,
             delta: "Inspecting refund state...".into(),
         });
-        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        let rendered: Vec<String> = (0..16)
-            .map(|y| row(&terminal, y))
-            .filter(|line| !line.is_empty())
-            .collect();
-        let screen = rendered.join("\n");
+        let screen = app.transcript_text_for_tests();
         for expected in [
             "cashpoint",
             "Checking callback handler...",
@@ -403,9 +384,9 @@ mod tests {
         add_lines(&mut app, 7);
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let capped = app.input_height();
-        // The header and at least one transcript row always survive.
+        // The header and at least one scrollback row always survive.
         assert!(capped <= 12 - 2, "composer took {capped} of 12 rows");
-        assert!(composer_rows(&app, 12).start > TRANSCRIPT_TOP);
+        assert!(composer_rows(&app, 12).start > 0, "the header keeps row 0");
 
         add_lines(&mut app, 4);
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -503,120 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn tall_transcript_follows_the_actual_tail() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 20,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        // The viewport is pinned to the tail: the newest row is on screen and the oldest is not.
-        let visible = visible_transcript(&terminal, &app, 10);
-        assert_eq!(visible.last().map(String::as_str), Some("9"), "{visible:?}");
-        assert!(!visible.iter().any(|line| line == "0"), "{visible:?}");
-    }
-
-    #[test]
-    fn scrolling_up_from_a_tall_transcript_renders_earlier_wrapped_rows() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 20,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        for _ in 0..2 {
-            app.reduce(AppEvent::Scroll { up: true, rows: 1 });
-        }
-        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        // Two rows back from the tail: the newest row has scrolled off and an earlier one is in.
-        let visible = visible_transcript(&terminal, &app, 10);
-        assert_eq!(visible.last().map(String::as_str), Some("8"), "{visible:?}");
-        assert!(visible.iter().any(|line| line == "7"), "{visible:?}");
-    }
-
-    #[test]
-    fn streamed_content_keeps_a_manually_scrolled_row_visible() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 20,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(TALL_MARKDOWN.into())));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        for _ in 0..2 {
-            app.reduce(AppEvent::Scroll { up: true, rows: 1 });
-        }
-        let before = {
-            let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
-            terminal.draw(|frame| render(frame, &app)).unwrap();
-            visible_transcript(&terminal, &app, 10)
-        };
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("  \n10  \n11".into())));
-        let mut terminal = Terminal::new(TestBackend::new(20, 10)).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        // New content arriving must not drag the viewport away from where the user scrolled to.
-        let after = visible_transcript(&terminal, &app, 10);
-        assert_eq!(after, before, "the scrolled-to rows stayed put");
-        assert!(!after.iter().any(|line| line == "11"), "{after:?}");
-    }
-
-    #[test]
-    fn narrow_spaced_words_follow_paragraph_wrap_geometry() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 12,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "aaaaa 0 aaaaa 1 aaaaa 2 bbbbb 3 bbbbb 4 bbbbb 5 ccccc 6 ccccc 7 ccccc 8".into(),
-        )));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
-
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        // Wrapping follows paragraph geometry: a row breaks between words, so each one reads as a
-        // whole "word digit" pair rather than being cut mid-word at column 12.
-        let content = [
-            "aaaaa 0", "aaaaa 1", "aaaaa 2", "bbbbb 3", "bbbbb 4", "bbbbb 5", "ccccc 6",
-            "ccccc 7", "ccccc 8",
-        ];
-        let visible = visible_transcript(&terminal, &app, 10);
-        assert!(
-            visible.iter().all(|line| content.contains(&line.as_str())),
-            "rows break between words: {visible:?}"
-        );
-        assert_eq!(visible.last().map(String::as_str), Some("ccccc 8"), "{visible:?}");
-        let top_before = content
-            .iter()
-            .position(|line| Some(*line) == visible.first().map(String::as_str))
-            .expect("the top row is one of the wrapped rows");
-
-        app.reduce(AppEvent::Scroll { up: true, rows: 1 });
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        // Scrolling reveals the row before the one that was on top. The transcript puts a blank
-        // spacer between rows, so a one-row scroll can uncover a row without hiding the tail.
-        let scrolled = visible_transcript(&terminal, &app, 10);
-        let top_after = content
-            .iter()
-            .position(|line| Some(*line) == scrolled.first().map(String::as_str))
-            .expect("the top row is one of the wrapped rows");
-        assert_eq!(top_after + 1, top_before, "{scrolled:?} vs {visible:?}");
-    }
-
-    #[test]
     fn markdown_render_hides_fences_and_formats_quotes() {
         let mut app = App::new(Context::root());
         app.reduce(AppEvent::Resize {
@@ -627,16 +494,14 @@ mod tests {
             "> quoted\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |".into(),
         )));
         app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
 
-        terminal.draw(|frame| render(frame, &app)).unwrap();
-
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content()
+        // Finished rows go to the terminal's scrollback, not the band, so the assertion is on the
+        // rendered text rather than on the frame.
+        let text = app.transcript_text();
+        let rendered: String = text
+            .lines
             .iter()
-            .map(|cell| cell.symbol())
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
             .collect();
         assert!(!rendered.contains("```"));
         assert!(rendered.contains("quoted"));
@@ -646,22 +511,19 @@ mod tests {
         for cell in ["A", "B", "1", "2"] {
             assert!(rendered.contains(cell));
         }
-        let quote = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .find(|cell| cell.symbol() == "q")
-            .unwrap();
-        assert_ne!(quote.style(), ratatui::style::Style::default());
-        let code = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .find(|cell| cell.symbol() == "f")
-            .unwrap();
-        assert_ne!(code.style(), ratatui::style::Style::default());
+        let styled = |needle: &str| {
+            text.lines
+                .iter()
+                .find_map(|line| {
+                    line.spans
+                        .iter()
+                        .find(|span| span.content.contains(needle))
+                        .map(|span| line.style.patch(span.style))
+                })
+                .unwrap_or_default()
+        };
+        assert_ne!(styled("quoted"), ratatui::style::Style::default());
+        assert_ne!(styled("fn main"), ratatui::style::Style::default());
     }
 
     #[test]
