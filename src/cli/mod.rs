@@ -2797,12 +2797,34 @@ async fn agent_names<R: crate::application::CollaborationRuntime>(
         .unwrap_or_default()
 }
 
+/// The sender label and the body, kept apart: the body is Markdown, and a prefix glued to its
+/// first line would stop a leading heading, list or fence from being one.
+///
 /// A retired or unknown sender keeps its id: a transcript line never goes blank.
-fn room_message_line(message: &RoomMessage, names: &HashMap<String, String>) -> String {
+fn room_message_parts(message: &RoomMessage, names: &HashMap<String, String>) -> (String, String) {
     let sender = names
         .get(&message.sender_id)
         .map_or(message.sender_id.as_str(), String::as_str);
-    format!("[{}:{}] {}", message.sender_type, sender, message.body)
+    (
+        format!("[{}:{}]", message.sender_type, sender),
+        message.body.clone(),
+    )
+}
+
+/// The CLI has no Markdown renderer, so one line is the whole record.
+fn room_message_line(message: &RoomMessage, names: &HashMap<String, String>) -> String {
+    let (label, body) = room_message_parts(message, names);
+    format!("{label} {body}")
+}
+
+/// The TUI parses an agent body as Markdown, so the label is its own block. A user line is
+/// rendered verbatim and stays on one row.
+fn room_message_transcript(message: &RoomMessage, names: &HashMap<String, String>) -> String {
+    let (label, body) = room_message_parts(message, names);
+    match message.sender_type {
+        MemberType::Agent => format!("{label}\n\n{body}"),
+        MemberType::User => format!("{label} {body}"),
+    }
 }
 
 // Room activations share one UI turn, but retain independent session and permission identity.
@@ -2943,11 +2965,15 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                 match event {
                     Ok(Some(RoomRuntimeEvent::SharedMessage(message))) => {
                         if publications.insert(message.id) {
-                            let body = room_message_line(&message, &names);
                             if let Some(events) = tui_events {
-                                let _ = events.send(AppEvent::RoomMessage(body));
+                                let _ = events.send(AppEvent::RoomMessage(
+                                    room_message_transcript(&message, &names),
+                                ));
                             } else {
-                                repl_write(stdout, format_args!("{body}\n"))?;
+                                repl_write(
+                                    stdout,
+                                    format_args!("{}\n", room_message_line(&message, &names)),
+                                )?;
                             }
                             if !cancelled {
                                 pending.extend(message.mentions.iter().map(|target| (message.id, *target)));
@@ -3306,7 +3332,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
                             MemberType::User => HistoryAuthor::User,
                             MemberType::Agent => HistoryAuthor::Agent,
                         },
-                        body: room_message_line(&message, &names),
+                        body: room_message_transcript(&message, &names),
                     })
                     .collect(),
                 truncated,

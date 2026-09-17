@@ -107,6 +107,15 @@ impl MarkdownStream {
         &self.tail
     }
 
+    /// Hands out the oldest finished block, which the caller writes to the terminal's scrollback.
+    ///
+    /// Popping rather than indexing is what makes a double-write unrepresentable: what is left in
+    /// `completed` is exactly what has not been written yet, so rebuilding the stream on a scope
+    /// switch needs no bookkeeping of its own.
+    pub(super) fn pop_completed(&mut self) -> Option<Text<'static>> {
+        (!self.completed.is_empty()).then(|| self.completed.remove(0))
+    }
+
     pub(super) fn text(&self) -> Text<'static> {
         let mut text = Text::default();
         for block in &self.completed {

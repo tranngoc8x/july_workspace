@@ -1,32 +1,30 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crossterm::cursor::{Hide, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyModifiers, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers,
 };
 #[cfg(not(windows))]
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::style::Print;
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size};
 use futures_util::StreamExt;
-use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::{Terminal, style::Color};
+use ratatui::backend::{Backend, ClearType as BufferClear, CrosstermBackend};
+use ratatui::layout::{Position, Rect, Size};
+use ratatui::{Terminal, TerminalOptions, Viewport, style::Color};
 
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Transcript rows moved per wheel notch.
-const WHEEL_ROWS: u16 = 3;
-
 pub mod app;
 mod markdown;
+/// Writing finished transcript rows into the terminal's scrollback.
+mod scrollback;
 /// The composer and everything that can take the bottom of the screen from it.
 pub(crate) mod bottom_pane;
 /// Finding workspace files for the composer's `@` popup.
@@ -107,10 +105,14 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             #[cfg(not(windows))]
             keyboard_enhanced: false,
         };
+        // No alternate screen and no mouse capture: the transcript lives in the terminal's own
+        // scrollback, so scrolling and selecting text stay the terminal's job. Capture would eat
+        // drag-select and force the user to hold Shift.
         if let Err(operation) = execute!(
             guard.writer,
-            EnterAlternateScreen,
-            EnableMouseCapture,
+            MoveTo(0, 0),
+            Clear(ClearType::Purge),
+            Clear(ClearType::All),
             // Without this a paste arrives as individual key events, and the composer has to guess
             // from timing which of them were typed.
             EnableBracketedPaste,
@@ -151,11 +153,13 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             Ok(())
         };
         let show = execute!(self.writer, Show);
+        // The viewport sits on the last rows, so the shell prompt needs a line of its own below
+        // whatever july left on screen.
         let leave = execute!(
             self.writer,
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            LeaveAlternateScreen
+            MoveTo(0, size().map(|(_, rows)| rows.saturating_sub(1)).unwrap_or(0)),
+            Print("\r\n"),
+            DisableBracketedPaste
         );
         let raw = self.raw_mode.disable();
         let mut errors = Vec::new();
@@ -167,7 +171,7 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
             errors.push(format!("show cursor failed: {error}"));
         }
         if let Err(error) = leave {
-            errors.push(format!("leave alternate screen failed: {error}"));
+            errors.push(format!("release terminal failed: {error}"));
         }
         if let Err(error) = raw {
             errors.push(format!("disable raw mode failed: {error}"));
@@ -221,7 +225,7 @@ where
     F: for<'writer> FnOnce(&mut TuiTerminal<'writer>) -> io::Result<T>,
 {
     run_with_terminal(io::stdout(), CrosstermRawMode, |writer| {
-        let mut terminal = Terminal::new(CrosstermBackend::new(writer))?;
+        let mut terminal = open_terminal(writer, &App::new(Context::root()))?;
         operation(&mut terminal)
     })
 }
@@ -258,14 +262,14 @@ pub async fn run_app(
     let _signals = ExitSignals::install().map_err(ShellError::Operation)?;
     let mut guard = TerminalGuard::enter(io::stdout(), CrosstermRawMode)?;
     let operation = async {
-        let mut terminal = Terminal::new(CrosstermBackend::new(&mut guard.writer))?;
         let mut app = App::new(initial_context);
         app.reduce(app::AppEvent::Agents(agents));
+        let mut terminal = open_terminal(&mut guard.writer, &app)?;
         let mut terminal_events = event::EventStream::new();
         let mut frames = tokio::time::interval(Duration::from_millis(33));
         frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         seed_viewport(&mut terminal, &mut app);
-        draw_inactive(&mut terminal, &app)?;
+        draw(&mut terminal, &mut app)?;
         let mut dirty = false;
 
         loop {
@@ -276,18 +280,11 @@ pub async fn run_app(
             tokio::select! {
                 terminal_event = terminal_events.next() => match terminal_event {
                     Some(Ok(Event::Resize(width, height))) => {
-                        terminal.autoresize()?;
                         dispatch_all(
                             app.reduce(app::AppEvent::Resize { width, height }),
                             &mut dispatch,
                         )?;
                         dirty = true;
-                    }
-                    Some(Ok(Event::Mouse(mouse))) => {
-                        if let Some(event) = scroll_event(mouse) {
-                            dispatch_all(app.reduce(event), &mut dispatch)?;
-                            dirty = true;
-                        }
                     }
                     Some(Ok(Event::Key(key))) => {
                         dispatch_all(app.reduce(app::AppEvent::Key(key)), &mut dispatch)?;
@@ -309,7 +306,7 @@ pub async fn run_app(
                         dirty = true;
                     }
                     if dirty {
-                        draw_inactive(&mut terminal, &app)?;
+                        draw(&mut terminal, &mut app)?;
                         dirty = false;
                     }
                 }
@@ -340,19 +337,6 @@ pub async fn run_app(
     }
 }
 
-/// Map a wheel event onto a transcript scroll, ignoring other mouse input.
-fn scroll_event(mouse: MouseEvent) -> Option<app::AppEvent> {
-    let up = match mouse.kind {
-        MouseEventKind::ScrollUp => true,
-        MouseEventKind::ScrollDown => false,
-        _ => return None,
-    };
-    Some(app::AppEvent::Scroll {
-        up,
-        rows: WHEEL_ROWS,
-    })
-}
-
 fn dispatch_all(
     commands: Vec<app::AppCommand>,
     dispatch: &mut impl FnMut(app::AppCommand) -> io::Result<()>,
@@ -364,11 +348,13 @@ fn dispatch_all(
 }
 
 fn seed_viewport<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) {
-    let area = terminal.get_frame().area();
-    app.reduce(app::AppEvent::Resize {
-        width: area.width,
-        height: area.height,
-    });
+    // The app reasons about the whole screen; the viewport is only the band it draws into.
+    if let Ok(screen) = terminal.size() {
+        app.reduce(app::AppEvent::Resize {
+            width: screen.width,
+            height: screen.height,
+        });
+    }
 }
 
 fn handle_event<B: Backend>(
@@ -377,15 +363,7 @@ fn handle_event<B: Backend>(
     event: Event,
 ) -> Result<bool, B::Error> {
     match event {
-        Event::Mouse(mouse) => {
-            if let Some(scroll) = scroll_event(mouse) {
-                app.reduce(scroll);
-                draw_inactive(terminal, app)?;
-            }
-            Ok(false)
-        }
         Event::Resize(width, height) => {
-            terminal.autoresize()?;
             app.reduce(app::AppEvent::Resize { width, height });
             draw_inactive(terminal, app)?;
             Ok(false)
@@ -401,8 +379,85 @@ fn handle_event<B: Backend>(
     }
 }
 
+/// The rows july owns: header, whatever is still being streamed, and the composer, pinned to the
+/// bottom of the screen. Everything above the band belongs to the terminal's scrollback.
+///
+/// The live region is capped at half the screen so a long unfinished block cannot push the
+/// scrollback off; the band then shows its tail, which is where the new text is.
+fn viewport_band(screen: Size, app: &App) -> Rect {
+    let live = scrollback::rendered_rows(app.transcript_text(), screen.width)
+        .min(screen.height.saturating_sub(app.input_height().saturating_add(1)) / 2);
+    let height = live
+        .saturating_add(app.input_height())
+        .saturating_add(1)
+        .clamp(1, screen.height.max(1));
+    Rect::new(
+        0,
+        screen.height.saturating_sub(height),
+        screen.width,
+        height,
+    )
+}
+
+fn open_terminal<W: Write>(writer: W, app: &App) -> io::Result<Terminal<CrosstermBackend<W>>> {
+    let backend = CrosstermBackend::new(writer);
+    let band = viewport_band(backend.size()?, app);
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(band),
+        },
+    )
+}
+
+/// Keeps the viewport on the bottom rows as the composer grows and the window resizes.
+///
+/// A fixed viewport is never autoresized (that is what keeps ratatui from repainting over
+/// scrollback), so the band is recomputed here before every frame.
+fn sync_viewport<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), B::Error> {
+    let band = viewport_band(terminal.size()?, app);
+    let current = terminal.get_frame().area();
+    if current == band {
+        return Ok(());
+    }
+    // A shrinking band leaves its old top rows behind, and resizing only clears the new rect, so
+    // the rows the band is giving up are erased here.
+    let backend = terminal.backend_mut();
+    backend.set_cursor_position(Position::new(0, current.y.min(band.y)))?;
+    backend.clear_region(BufferClear::AfterCursor)?;
+    terminal.resize(band)
+}
+
 fn draw_inactive<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<(), B::Error> {
+    sync_viewport(terminal, app)?;
     terminal.draw(|frame| ui::render(frame, app)).map(|_| ())
+}
+
+/// Moves everything july has finished into the terminal's scrollback, then repaints the band.
+///
+/// Writing above the band scrolls the screen, so the band has to be repainted afterwards - which
+/// this does by ending in the ordinary draw.
+fn draw<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    app: &mut App,
+) -> io::Result<()> {
+    if app.take_scope_changed() {
+        // Everything on screen and in scrollback belongs to the scope being left. The new scope's
+        // history is already rebuilt in the app, so the loop below writes it into a clean terminal.
+        scrollback::purge(terminal.backend_mut())?;
+        // Unconditionally, because the screen is now blank while ratatui still believes it painted
+        // the band: resizing a fixed viewport is what forces the next draw to repaint in full.
+        let band = viewport_band(terminal.size()?, app);
+        terminal.resize(band)?;
+    }
+    let band = terminal.get_frame().area();
+    while let Some(block) = app.take_finished_block() {
+        scrollback::write_above(terminal.backend_mut(), band, block)?;
+        // The rows above the band moved up, so nothing ratatui remembers about the band is true
+        // any more. Resizing to the same rect is how a fixed viewport is told to repaint in full.
+        terminal.resize(band)?;
+    }
+    draw_inactive(terminal, app)
 }
 
 #[cfg(unix)]
@@ -482,7 +537,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    use super::{RawMode, app::Context, handle_event, run_with_terminal, seed_viewport};
+    use ratatui::layout::Size;
+
+    use crate::application::ChatEvent;
+
+    use super::app::{App, Context};
+    use super::{RawMode, app, handle_event, run_with_terminal, seed_viewport, viewport_band};
 
     #[derive(Clone)]
     struct FakeRawMode {
@@ -526,7 +586,9 @@ mod tests {
     impl Write for FailingRestoreWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             self.0.borrow_mut().extend_from_slice(bytes);
-            if bytes == b"\x1b[?25l" || bytes == b"\x1b[?25h" || bytes == b"\x1b[?1049l" {
+            // Show/hide cursor and the teardown's bracketed-paste reset, which is the last
+            // thing july writes on the way out.
+            if bytes == b"\x1b[?25l" || bytes == b"\x1b[?25h" || bytes == b"\x1b[?2004l" {
                 Err(io::Error::other("screen write failed"))
             } else {
                 Ok(bytes.len())
@@ -558,14 +620,16 @@ mod tests {
         run_with_terminal(writer, raw_mode, |_| Ok(())).unwrap();
 
         let output = output.borrow();
-        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049h"));
+        // July owns the bottom rows of the ordinary screen, never the alternate one: that is what
+        // leaves scrollback and mouse selection to the terminal.
+        assert!(!output.windows(8).any(|bytes| bytes == b"\x1b[?1049h"));
+        assert!(output.windows(4).any(|bytes| bytes == b"\x1b[3J"));
         #[cfg(not(windows))]
         assert!(output.windows(5).any(|bytes| bytes == b"\x1b[>1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25l"));
         #[cfg(not(windows))]
         assert!(output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
-        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         assert_eq!(*calls.borrow(), ["enable", "disable"]);
     }
 
@@ -597,14 +661,10 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("screen write failed"), "{message}");
-        assert!(
-            message.contains("leave alternate screen failed"),
-            "{message}"
-        );
+        assert!(message.contains("release terminal failed"), "{message}");
         assert!(message.contains("restore failed"), "{message}");
         let output = output.borrow();
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
-        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         assert_eq!(*calls.borrow(), ["enable", "disable"]);
     }
 
@@ -625,8 +685,35 @@ mod tests {
         #[cfg(not(windows))]
         assert!(output.windows(5).any(|bytes| bytes == b"\x1b[<1u"));
         assert!(output.windows(6).any(|bytes| bytes == b"\x1b[?25h"));
-        assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         assert_eq!(*calls.borrow(), ["enable", "disable"]);
+    }
+
+    #[test]
+    fn the_band_sits_on_the_bottom_rows_and_never_takes_the_whole_screen() {
+        let screen = Size::new(80, 24);
+        let mut app = App::new(Context::root());
+        app.reduce(app::AppEvent::Resize {
+            width: screen.width,
+            height: screen.height,
+        });
+
+        let idle = viewport_band(screen, &app);
+        assert_eq!(idle.x, 0);
+        assert_eq!(idle.width, screen.width);
+        assert_eq!(idle.bottom(), screen.height, "the band is pinned to the bottom");
+        assert!(idle.height < screen.height, "scrollback keeps the rows above");
+
+        // A block still being streamed grows the band, because it has nowhere else to be drawn.
+        app.reduce(app::AppEvent::Chat(ChatEvent::TextDelta(
+            "still typing".repeat(40),
+        )));
+        let streaming = viewport_band(screen, &app);
+        assert!(streaming.height > idle.height, "{streaming:?} vs {idle:?}");
+        assert_eq!(streaming.bottom(), screen.height);
+        assert!(
+            streaming.height < screen.height,
+            "a long unfinished block must not swallow the scrollback: {streaming:?}"
+        );
     }
 
     #[test]

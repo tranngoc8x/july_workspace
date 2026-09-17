@@ -4,12 +4,11 @@ use std::fmt;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Wrap};
 
 use super::bottom_pane::events::{NoticeLevel, PaneEvent};
 use super::bottom_pane::slash_commands::commands_from_names;
 use super::bottom_pane::{BottomPane, BottomPaneParams, CancellationEvent, InputResult};
-use super::markdown::MarkdownStream;
+use super::markdown::{MarkdownStream, render as render_markdown};
 use super::support::render::renderable::Renderable;
 use super::{AGENT_COLOR, CODE_COLOR, COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
 use crate::application::{ChatEvent, ChatFailureKind, ChatPermissionRequestId};
@@ -161,11 +160,6 @@ pub enum AppEvent {
         width: u16,
         height: u16,
     },
-    /// Wheel or trackpad scroll over the transcript.
-    Scroll {
-        up: bool,
-        rows: u16,
-    },
     Tick,
     /// Agent names for `@` completion, sent once when the session opens.
     Agents(Vec<String>),
@@ -233,15 +227,10 @@ pub struct ComposerDraft {
 
 /// One conversation scope's transient view state.
 ///
-/// Kept in memory only. Nothing here belongs in SQLite: it is where the user had scrolled to and
-/// what they had half-typed, which is meaningless once the process exits.
+/// Kept in memory only. Nothing here belongs in SQLite: it is what the user had half-typed, which
+/// is meaningless once the process exits. Scroll position is the terminal's business now.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoomUiState {
-    /// Rows scrolled back from the newest transcript row.
-    pub scroll_offset: usize,
-    /// Whether the transcript was pinned to the newest row, which is what makes `scroll_offset`
-    /// mean "where the user was" rather than "where the transcript happened to end".
-    pub follow_tail: bool,
     pub draft: ComposerDraft,
     /// ponytail: always `None`. July's transcript has no per-message selection or reply UI yet, so
     /// there is nothing to capture; the fields are here so that when those land, the save/restore
@@ -251,11 +240,9 @@ pub struct RoomUiState {
 }
 
 impl Default for RoomUiState {
-    /// A scope opened for the first time starts pinned to the newest row with an empty draft.
+    /// A scope opened for the first time starts with an empty draft.
     fn default() -> Self {
         Self {
-            scroll_offset: 0,
-            follow_tail: true,
             draft: ComposerDraft::default(),
             reply_to: None,
             selected_message: None,
@@ -278,8 +265,6 @@ pub struct App {
     bottom_pane: BottomPane,
     viewport: Viewport,
     markdown: MarkdownStream,
-    scroll_offset: usize,
-    follow_tail: bool,
     pending: Option<ContextId>,
     turn: TurnState,
     /// The permission request whose prompt is open in the pane, so a resolved request can close it.
@@ -292,6 +277,7 @@ pub struct App {
     live_cells: BTreeMap<AgentId, LiveCell>,
     /// Set when the bottom pane changed outside a key press, so the frame loop redraws.
     pane_redraw: bool,
+    scope_changed: bool,
     tick: usize,
     exit_requested: bool,
 }
@@ -316,8 +302,6 @@ impl App {
             bottom_pane,
             viewport: Viewport::new(0, 0),
             markdown: MarkdownStream::default(),
-            scroll_offset: 0,
-            follow_tail: true,
             pending: None,
             turn: TurnState::Idle,
             pending_permission: None,
@@ -325,6 +309,7 @@ impl App {
             room_ui: HashMap::new(),
             live_cells: BTreeMap::new(),
             pane_redraw: false,
+            scope_changed: false,
             tick: 0,
             exit_requested: false,
         }
@@ -354,7 +339,7 @@ impl App {
     /// scope's.
     ///
     /// The caller applies the returned state, because a switch that also reloads the transcript has
-    /// to rebuild it first - restoring a scroll offset over the old transcript would land nowhere.
+    /// to rebuild it first.
     #[must_use]
     fn set_context(&mut self, context: Context) -> Option<RoomUiState> {
         self.bottom_pane
@@ -365,6 +350,8 @@ impl App {
             self.context = context;
             return None;
         }
+        // A real switch, so the previous scope's rows stop being what the user is looking at.
+        self.scope_changed = true;
         let outgoing = self.capture_room_ui();
         self.room_ui.insert(self.context.id.clone(), outgoing);
         let incoming = self.room_ui.get(&context.id).cloned().unwrap_or_default();
@@ -379,8 +366,6 @@ impl App {
     /// that command, or nothing.
     fn capture_room_ui(&self) -> RoomUiState {
         RoomUiState {
-            scroll_offset: self.scroll_offset,
-            follow_tail: self.follow_tail,
             draft: self
                 .room_ui
                 .get(&self.context.id)
@@ -409,17 +394,11 @@ impl App {
     /// Puts the user back where they were in this scope.
     fn restore_room_ui(&mut self, state: RoomUiState) {
         let RoomUiState {
-            scroll_offset,
-            follow_tail,
             draft,
             reply_to: _,
             selected_message: _,
         } = state;
         self.bottom_pane.restore_composer_draft(draft);
-        self.follow_tail = follow_tail;
-        self.scroll_offset = scroll_offset;
-        let max_scroll = self.max_scroll_offset();
-        self.clamp_scroll(max_scroll);
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -447,22 +426,8 @@ impl App {
     }
 
     pub(crate) fn transcript_text(&self) -> Text<'static> {
-        // ponytail: terminal cells have no line-height; one spacer row between
-        // consecutive non-empty lines is the closest equivalent.
         let text = self.markdown.text();
-        let mut lines = Vec::with_capacity(text.lines.len() * 2);
-        let mut rest = text.lines.into_iter().peekable();
-        while let Some(line) = rest.next() {
-            let spaced = line.width() > 0
-                && line.style.fg != Some(CODE_COLOR)
-                && rest.peek().is_some_and(|next: &Line<'static>| {
-                    next.width() > 0 && next.style.fg != Some(CODE_COLOR)
-                });
-            lines.push(line);
-            if spaced {
-                lines.push(Line::default());
-            }
-        }
+        let mut lines = spaced_rows(text.lines);
         let live = self.live_cell_lines();
         if !live.is_empty() {
             // One blank row separates the live block from the committed transcript; inside the
@@ -491,20 +456,6 @@ impl App {
             style: text.style,
             lines,
         }
-    }
-
-    pub(crate) fn transcript_scroll(&self) -> u16 {
-        self.max_scroll_offset()
-            .saturating_sub(self.scroll_offset)
-            .min(u16::MAX.into()) as u16
-    }
-
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
-    }
-
-    pub fn follow_tail(&self) -> bool {
-        self.follow_tail
     }
 
     pub fn turn_active(&self) -> bool {
@@ -549,6 +500,14 @@ impl App {
         std::mem::take(&mut self.pane_redraw)
     }
 
+    /// Whether the scope changed since this was last asked.
+    ///
+    /// A room shows that room and nothing else, so the render layer answers this by erasing the
+    /// terminal's scrollback before writing the new scope's history into it.
+    pub fn take_scope_changed(&mut self) -> bool {
+        std::mem::take(&mut self.scope_changed)
+    }
+
     pub fn reduce(&mut self, event: AppEvent) -> Vec<AppCommand> {
         let commands = self.reduce_inner(event);
         // One place to keep the composer's footer in step with the app, rather than a call beside
@@ -560,34 +519,9 @@ impl App {
 
     fn reduce_inner(&mut self, event: AppEvent) -> Vec<AppCommand> {
         match event {
-            AppEvent::Key(key) => {
-                let old_input_height = self.input_height();
-                let old_max_scroll = self.max_scroll_offset();
-                let was_following_tail = self.follow_tail;
-                let commands = self.reduce_key(key);
-                if self.input_height() != old_input_height {
-                    let new_max_scroll = self.max_scroll_offset();
-                    if !was_following_tail {
-                        self.scroll_offset = if new_max_scroll >= old_max_scroll {
-                            self.scroll_offset
-                                .saturating_add(new_max_scroll - old_max_scroll)
-                        } else {
-                            self.scroll_offset
-                                .saturating_sub(old_max_scroll - new_max_scroll)
-                        };
-                    }
-                    self.clamp_scroll(new_max_scroll);
-                }
-                commands
-            }
+            AppEvent::Key(key) => self.reduce_key(key),
             AppEvent::Resize { width, height } => {
                 self.viewport = Viewport::new(width, height);
-                let max_scroll = self.max_scroll_offset();
-                self.clamp_scroll(max_scroll);
-                Vec::new()
-            }
-            AppEvent::Scroll { up, rows } => {
-                self.scroll_by(usize::from(rows), up);
                 Vec::new()
             }
             AppEvent::Agents(agents) => {
@@ -712,22 +646,6 @@ impl App {
         }
 
         match key.code {
-            KeyCode::PageUp => {
-                self.scroll_by(self.transcript_rows(), true);
-                return Vec::new();
-            }
-            KeyCode::PageDown => {
-                self.scroll_by(self.transcript_rows(), false);
-                return Vec::new();
-            }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_by(1, true);
-                return Vec::new();
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_by(1, false);
-                return Vec::new();
-            }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.turn == TurnState::Idle && self.bottom_pane.composer_is_empty() {
                     self.exit_requested = true;
@@ -936,8 +854,6 @@ impl App {
         let restored = self.set_context(snapshot.context);
         self.markdown = MarkdownStream::default();
         self.live_cells.clear();
-        self.scroll_offset = 0;
-        self.follow_tail = true;
 
         let error = match snapshot.history {
             Ok(history) => {
@@ -1008,6 +924,25 @@ impl App {
             .join("\n")
     }
 
+    /// The rows of one finished block, ready for the terminal's scrollback.
+    ///
+    /// Returns `None` once nothing is left to write; the live tail and the live cells stay in the
+    /// viewport, because they are still changing.
+    pub(crate) fn take_finished_block(&mut self) -> Option<Text<'static>> {
+        let block = self.markdown.pop_completed()?;
+        let mut lines = spaced_rows(block.lines);
+        // Blocks are written one at a time, so the separator that `spaced_rows` puts *between*
+        // rows has to be added after the last one too.
+        if lines.last().is_some_and(|line| line.width() > 0) {
+            lines.push(Line::default());
+        }
+        Some(Text {
+            alignment: block.alignment,
+            style: block.style,
+            lines,
+        })
+    }
+
     /// The live cells as transcript rows: a header per agent, its streamed body, and a cursor.
     fn live_cell_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
@@ -1019,12 +954,7 @@ impl App {
                 cell.label.clone(),
                 Style::default().fg(AGENT_COLOR),
             )));
-            for body_line in cell.body.lines() {
-                lines.push(Line::from(Span::styled(
-                    body_line.to_owned(),
-                    Style::default().fg(AGENT_COLOR),
-                )));
-            }
+            lines.extend(render_markdown(&cell.body).lines);
             lines.push(Line::from(Span::styled(
                 "▌",
                 Style::default().fg(SYSTEM_COLOR),
@@ -1057,23 +987,10 @@ impl App {
         &mut self,
         events: impl IntoIterator<Item = ChatEvent>,
     ) -> Vec<AppCommand> {
-        let old_max_scroll = self.max_scroll_offset();
-        let was_following_tail = self.follow_tail;
         let mut commands = Vec::new();
         for event in events {
             commands.extend(self.reduce_chat(event));
         }
-        let new_max_scroll = self.max_scroll_offset();
-        if !was_following_tail {
-            self.scroll_offset = if new_max_scroll >= old_max_scroll {
-                self.scroll_offset
-                    .saturating_add(new_max_scroll - old_max_scroll)
-            } else {
-                self.scroll_offset
-                    .saturating_sub(old_max_scroll - new_max_scroll)
-            };
-        }
-        self.clamp_scroll(new_max_scroll);
         commands
     }
 
@@ -1136,44 +1053,25 @@ impl App {
         self.markdown.finish();
     }
 
-    fn scroll_by(&mut self, rows: usize, up: bool) {
-        if up {
-            self.follow_tail = false;
-            self.scroll_offset = self.scroll_offset.saturating_add(rows);
-        } else {
-            self.scroll_offset = self.scroll_offset.saturating_sub(rows);
-        }
-        let max_scroll = self.max_scroll_offset();
-        self.clamp_scroll(max_scroll);
-    }
+}
 
-    /// Rows the transcript pane owns: the frame minus header, input and hints.
-    fn transcript_rows(&self) -> usize {
-        usize::from(
-            self.viewport
-                .height
-                .saturating_sub(self.input_height().saturating_add(2)),
-        )
-        .max(1)
-    }
-
-    fn clamp_scroll(&mut self, max_scroll: usize) {
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-        if self.scroll_offset == 0 {
-            self.follow_tail = true;
+/// ponytail: terminal cells have no line-height; one spacer row between consecutive non-empty
+/// lines is the closest equivalent. Code rows keep their own spacing, so they are left alone.
+fn spaced_rows(rows: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(rows.len() * 2);
+    let mut rest = rows.into_iter().peekable();
+    while let Some(line) = rest.next() {
+        let spaced = line.width() > 0
+            && line.style.fg != Some(CODE_COLOR)
+            && rest.peek().is_some_and(|next: &Line<'static>| {
+                next.width() > 0 && next.style.fg != Some(CODE_COLOR)
+            });
+        lines.push(line);
+        if spaced {
+            lines.push(Line::default());
         }
     }
-
-    fn max_scroll_offset(&self) -> usize {
-        self.wrapped_row_count()
-            .saturating_sub(self.transcript_rows())
-    }
-
-    fn wrapped_row_count(&self) -> usize {
-        Paragraph::new(self.transcript_text())
-            .wrap(Wrap { trim: false })
-            .line_count(self.viewport.width.max(1))
-    }
+    lines
 }
 
 pub fn next_event(terminal: Option<AppEvent>, chat: &mut VecDeque<ChatEvent>) -> Option<AppEvent> {
@@ -1375,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_a_room_and_coming_back_restores_its_draft_and_scroll() {
+    fn leaving_a_room_and_coming_back_restores_its_draft() {
         let mut app = App::new(room("alpha"));
         app.reduce(AppEvent::Resize {
             width: 40,
@@ -1385,24 +1283,15 @@ mod tests {
         for character in "half typed".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
-        app.reduce(AppEvent::Scroll {
-            up: true,
-            rows: 5,
-        });
-        let alpha_scroll = app.scroll_offset();
-        assert!(alpha_scroll > 0, "the test needs a scrolled transcript");
 
         switch_to(&mut app, room("beta"));
         assert_eq!(app.input(), "", "a fresh room starts with an empty draft");
-        assert_eq!(app.scroll_offset(), 0);
         for character in "beta draft".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
 
         switch_to(&mut app, room("alpha"));
         assert_eq!(app.input(), "half typed");
-        assert_eq!(app.scroll_offset(), alpha_scroll);
-        assert!(!app.follow_tail(), "the scrolled-back position is restored too");
 
         switch_to(&mut app, room("beta"));
         assert_eq!(app.input(), "beta draft");
@@ -1419,20 +1308,14 @@ mod tests {
         for character in "draft".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
-        app.reduce(AppEvent::Scroll {
-            up: true,
-            rows: 4,
-        });
 
         switch_to(&mut app, room("never-seen"));
 
         assert_eq!(app.input(), "");
-        assert_eq!(app.scroll_offset(), 0);
-        assert!(app.follow_tail());
     }
 
     #[test]
-    fn a_reloaded_transcript_restores_the_draft_without_a_stale_scroll_offset() {
+    fn a_reloaded_transcript_restores_the_draft() {
         let mut app = App::new(room("alpha"));
         app.reduce(AppEvent::Resize {
             width: 40,
@@ -1442,14 +1325,10 @@ mod tests {
         for character in "kept".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
-        app.reduce(AppEvent::Scroll {
-            up: true,
-            rows: 6,
-        });
 
         switch_to(&mut app, room("beta"));
-        // Coming back through a history reload: the transcript is rebuilt before the saved offset
-        // is applied, and an offset past the shorter transcript is clamped rather than kept.
+        // Coming back through a history reload: the transcript is rebuilt from storage and the
+        // draft survives it.
         switch_to_with_history(
             &mut app,
             room("alpha"),
@@ -1460,7 +1339,6 @@ mod tests {
         );
 
         assert_eq!(app.input(), "kept");
-        assert!(app.scroll_offset() <= app.max_scroll_offset());
     }
 
     // ---- live agent cells ---------------------------------------------------
@@ -1561,6 +1439,65 @@ mod tests {
             transcript.contains("still looking"),
             "the other agent's preview is still on screen:\n{transcript}"
         );
+    }
+
+    #[test]
+    fn only_a_real_scope_switch_asks_for_the_scrollback_to_be_erased() {
+        let mut app = App::new(room("alpha"));
+        assert!(!app.take_scope_changed(), "opening is not a switch");
+
+        switch_to(&mut app, room("beta"));
+        assert!(app.take_scope_changed());
+        assert!(!app.take_scope_changed(), "asking twice does not erase twice");
+
+        // A refresh of the same scope - a new label or command list - is not a switch.
+        switch_to(&mut app, room("beta"));
+        assert!(!app.take_scope_changed());
+    }
+
+    #[test]
+    fn finished_blocks_leave_the_transcript_oldest_first_and_the_live_tail_stays() {
+        let mut app = App::new(Context::root());
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 12,
+        });
+        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
+            "first block\n\nsecond block\n\nstill typ".into(),
+        )));
+
+        let first = app.take_finished_block().expect("first block is finished");
+        let second = app.take_finished_block().expect("second block is finished");
+
+        assert!(first.to_string().contains("first block"), "{first:?}");
+        assert!(second.to_string().contains("second block"), "{second:?}");
+        // The unfinished tail is still being written, so it stays in the band rather than being
+        // handed to the scrollback.
+        assert_eq!(app.take_finished_block(), None);
+        assert!(
+            app.transcript_text_for_tests().contains("still typ"),
+            "{}",
+            app.transcript_text_for_tests()
+        );
+        assert!(!app.transcript_text_for_tests().contains("first block"));
+    }
+
+    #[test]
+    fn a_live_preview_is_styled_as_markdown_like_the_message_it_becomes() {
+        let mut app = App::new(room("alpha"));
+        let cashpoint = agent(1);
+        start(&mut app, cashpoint, "cashpoint");
+        delta(&mut app, cashpoint, "run `cargo test`");
+
+        let foreground = app
+            .transcript_text()
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.clone())
+            .find(|span| span.content == "cargo test")
+            .and_then(|span| span.style.fg);
+
+        assert_eq!(foreground, Some(CODE_COLOR));
     }
 
     #[test]
@@ -1988,79 +1925,6 @@ curl --request POST 'https://example.com/v1/orders' \
         assert_eq!(app.input(), "second!");
     }
     #[test]
-    fn viewport_scroll_disables_follow_tail_until_end_and_resize_clamps_it() {
-        let mut app = App::new(Context::root());
-
-        app.reduce(AppEvent::Resize {
-            width: 5,
-            height: 8,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "long wrapped content keeps the transcript taller than the viewport".into(),
-        )));
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-
-        assert_eq!(app.viewport(), Viewport::new(5, 8));
-        assert!(app.scroll_offset() > 0);
-        assert!(!app.follow_tail());
-
-        app.reduce(AppEvent::Resize {
-            width: 80,
-            height: 24,
-        });
-
-        assert_eq!(app.viewport(), Viewport::new(80, 24));
-        assert_eq!(app.scroll_offset(), 0);
-        assert!(app.follow_tail());
-    }
-
-    #[test]
-    fn shrinking_input_clamps_the_transcript_scroll() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 10,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "one two three four five six seven eight nine ten".into(),
-        )));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        for _ in 0..4 {
-            app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
-        }
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        let scrolled_back = app.scroll_offset();
-        assert!(scrolled_back > 0, "the test needs a scrolled transcript");
-
-        // Clearing the draft shrinks the composer, which lengthens the transcript viewport and can
-        // leave the old offset past the end.
-        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
-
-        assert!(app.input().is_empty());
-        assert!(app.scroll_offset() <= app.max_scroll_offset());
-    }
-
-    #[test]
-    fn growing_input_preserves_the_manually_scrolled_transcript_row() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 20,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            (0..20).map(|row| format!("{row}  \n")).collect(),
-        )));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        app.reduce(AppEvent::Scroll { up: true, rows: 2 });
-        let visible_row = app.transcript_scroll();
-
-        app.reduce(AppEvent::Key(alt_key(KeyCode::Enter)));
-
-        assert_eq!(app.transcript_scroll(), visible_row);
-    }
-
-    #[test]
     fn terminal_chat_events_keep_pending_until_matching_submit_ack() {
         let terminal_events = [
             ChatEvent::TurnCompleted,
@@ -2285,24 +2149,6 @@ curl --request POST 'https://example.com/v1/orders' \
     }
 
     #[test]
-    fn scrolling_clamps_against_wrapped_rows_not_message_count() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 4,
-            height: 8,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "1234567890123456".into(),
-        )));
-        for _ in 0..10 {
-            app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        }
-
-        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
-        assert!(!app.follow_tail());
-    }
-
-    #[test]
     fn leading_blanks_still_execute_a_command_and_failures_surface_as_an_error() {
         let mut app = App::new(Context::root());
         for character in "  /thread 01 --agent cashpoint".chars() {
@@ -2330,39 +2176,6 @@ curl --request POST 'https://example.com/v1/orders' \
         assert!(app.error().is_none());
     }
 
-    #[test]
-    fn page_keys_move_a_transcript_page_and_the_wheel_moves_its_rows() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 20,
-            height: 10,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            (0..40).map(|row| format!("{row}  \n")).collect::<String>(),
-        )));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-
-        // A page is the transcript viewport, which shrinks as the composer grows.
-        let page = app.transcript_rows();
-
-        app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        assert_eq!(app.scroll_offset(), page);
-        assert!(!app.follow_tail());
-
-        app.reduce(AppEvent::Scroll { up: true, rows: 3 });
-        assert_eq!(app.scroll_offset(), page + 3);
-
-        app.reduce(AppEvent::Key(key(KeyCode::PageDown)));
-        assert_eq!(app.scroll_offset(), 3);
-
-        app.reduce(AppEvent::Scroll {
-            up: false,
-            rows: 3,
-        });
-        assert_eq!(app.scroll_offset(), 0);
-        assert!(app.follow_tail());
-    }
-
     /// Home and End edit the draft; the transcript is paged with PageUp/PageDown and Ctrl+Up/Down.
     ///
     /// July used Home/End for the transcript before the composer owned multi-line editing, where
@@ -2386,64 +2199,11 @@ curl --request POST 'https://example.com/v1/orders' \
         app.reduce(AppEvent::Key(key(KeyCode::Char('X'))));
 
         assert_eq!(app.input(), "Xabc");
-        assert_eq!(app.scroll_offset(), 0);
-        assert!(app.follow_tail());
 
         app.reduce(AppEvent::Key(key(KeyCode::End)));
         app.reduce(AppEvent::Key(key(KeyCode::Char('Y'))));
 
         assert_eq!(app.input(), "XabcY");
-        assert_eq!(app.scroll_offset(), 0);
-    }
-
-    #[test]
-    fn wrapped_row_count_matches_paragraph_word_wrapping() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 5,
-            height: 7,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("a a a a a a".into())));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-
-        assert_eq!(app.wrapped_row_count(), 2);
-    }
-
-    #[test]
-    fn scrolling_stops_at_the_top_wrapped_row() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 4,
-            height: 6,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "1234567890123456".into(),
-        )));
-        app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
-        for _ in 0..10 {
-            app.reduce(AppEvent::Key(key(KeyCode::PageUp)));
-        }
-
-        assert_eq!(app.scroll_offset(), app.max_scroll_offset());
-        assert_eq!(app.scroll_offset(), 3);
-    }
-
-    #[test]
-    fn shrinking_markdown_tail_preserves_the_manually_scrolled_row() {
-        let mut app = App::new(Context::root());
-        app.reduce(AppEvent::Resize {
-            width: 6,
-            height: 7,
-        });
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta(
-            "0  \n1  \n1234 **x".into(),
-        )));
-        app.reduce(AppEvent::Key(ctrl_key(KeyCode::Up)));
-        assert_eq!(app.scroll_offset(), 1);
-
-        app.reduce(AppEvent::Chat(ChatEvent::TextDelta("**".into())));
-
-        assert_eq!(app.scroll_offset(), 0);
     }
 
     #[test]

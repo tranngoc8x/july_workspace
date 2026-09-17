@@ -20,7 +20,9 @@ use serde_json::json;
 
 const CHILD_MODE: &str = "JULY_TUI_TEST_CHILD";
 const ENTER_SCREEN: &[u8] = b"\x1b[?1049h";
-const LEAVE_SCREEN: &[u8] = b"\x1b[?1049l";
+/// What july writes on the way in, and the first thing a PTY child emits: it clears the screen and
+/// the scrollback so the session starts on a clean terminal.
+const PURGE: &[u8] = b"\x1b[3J";
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 const PUSH_KEYBOARD: &[u8] = b"\x1b[>1u";
@@ -105,7 +107,7 @@ fn pty_restores_after_unwind() {
 #[test]
 fn pty_ctrl_c_restores_terminal() {
     let mut child = spawn_pty("inactive");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     child.master.write_all(b"\x03").unwrap();
     assert_restored(child, None);
 }
@@ -113,7 +115,7 @@ fn pty_ctrl_c_restores_terminal() {
 #[test]
 fn active_pty_ctrl_c_restores_terminal() {
     let mut child = spawn_pty("active");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     child.master.write_all(b"\x03").unwrap();
     assert_restored(child, None);
 }
@@ -131,7 +133,7 @@ fn enhanced_shift_enter_reaches_the_reducer_as_a_newline() {
 #[test]
 fn active_pty_sigterm_restores_terminal() {
     let mut child = spawn_pty("active");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     send_signal(&child.child, libc::SIGTERM);
     assert_restored(child, None);
 }
@@ -139,7 +141,7 @@ fn active_pty_sigterm_restores_terminal() {
 #[test]
 fn active_pty_sighup_restores_terminal() {
     let mut child = spawn_pty("active");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     send_signal(&child.child, libc::SIGHUP);
     assert_restored(child, None);
 }
@@ -151,7 +153,7 @@ fn no_argument_binary_uses_tui_when_both_streams_are_terminals() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_july"));
     command.env("JULY_WORKSPACE_DB", &database);
     let mut child = spawn_pty_command(command);
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     child.master.write_all(b"\x03").unwrap();
     assert_restored(child, None);
     let _ = std::fs::remove_file(database);
@@ -278,7 +280,7 @@ fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
 #[test]
 fn pty_sigterm_restores_terminal() {
     let mut child = spawn_pty("inactive");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     let pid = child.child.id();
     send_signal(&child.child, libc::SIGTERM);
     assert_restored(child, Some(format!("SIGTERM child {pid}")));
@@ -287,7 +289,7 @@ fn pty_sigterm_restores_terminal() {
 #[test]
 fn pty_sighup_restores_terminal() {
     let mut child = spawn_pty("inactive");
-    child.wait_for(ENTER_SCREEN);
+    child.wait_for(PURGE);
     let pid = child.child.id();
     send_signal(&child.child, libc::SIGHUP);
     assert_restored(child, Some(format!("SIGHUP child {pid}")));
@@ -297,7 +299,7 @@ fn pty_sighup_restores_terminal() {
 fn dropping_pty_child_kills_and_reaps_it() {
     let pid = {
         let mut child = spawn_pty("inactive");
-        child.wait_for(ENTER_SCREEN);
+        child.wait_for(PURGE);
         child.child.id() as libc::pid_t
     };
 
@@ -520,10 +522,13 @@ fn assert_restored(child: PtyChild, context: Option<String>) {
         "{context} exited with {status}: {:?}",
         String::from_utf8_lossy(&output)
     );
+    // July lives on the bottom rows of the ordinary screen, never the alternate one: that is what
+    // leaves scrollback and mouse selection to the terminal.
     assert!(
-        contains(&output, ENTER_SCREEN),
-        "{context} never entered alternate screen"
+        !contains(&output, ENTER_SCREEN),
+        "{context} entered the alternate screen"
     );
+    assert!(contains(&output, PURGE), "{context} never cleared the screen");
     assert!(contains(&output, HIDE_CURSOR), "{context} never hid cursor");
     assert!(
         contains(&output, PUSH_KEYBOARD),
@@ -536,10 +541,6 @@ fn assert_restored(child: PtyChild, context: Option<String>) {
     assert!(
         contains(&output, SHOW_CURSOR),
         "{context} never restored cursor"
-    );
-    assert!(
-        contains(&output, LEAVE_SCREEN),
-        "{context} never left alternate screen"
     );
     assert_eq!(restored.c_iflag, initial.c_iflag, "{context} input flags");
     assert_eq!(restored.c_oflag, initial.c_oflag, "{context} output flags");
