@@ -99,8 +99,8 @@ Each project has a persistent logical agent.
 Example:
 
 ```bash
-july agent add cashpoint \
-  --project ~/work/cashpoint \
+july agent add agent_order \
+  --project ~/work/agent_order \
   --runtime codex
 ```
 
@@ -117,7 +117,7 @@ july
 ### 3. Open a DM with an agent
 
 ```text
-/dm cashpoint
+/dm agent_order
 ```
 
 July resolves the logical agent and lazily creates or resumes the runtime session when necessary.
@@ -181,7 +181,7 @@ A Codex, Claude, ACP, or future runtime session is an execution detail, not the 
 Use a DM when you want to work directly with one project agent.
 
 ```text
-/dm cashpoint
+/dm agent_order
 ```
 
 DMs preserve durable conversation/workspace state while runtime sessions may be resumed or recreated as needed.
@@ -198,7 +198,7 @@ Example:
 Room: VNA
 
 members:
-- cashpoint
+- agent_order
 - pay
 - infra
 ```
@@ -269,7 +269,7 @@ Example:
 ```text
 auth-api
    ↓ READY
-cashpoint integration
+agent_order integration
    ↓ READY
 E2E
 ```

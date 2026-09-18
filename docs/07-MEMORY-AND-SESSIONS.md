@@ -21,9 +21,11 @@ Conversation
 ```
 
 If remote session exists:
+
 - resume it.
 
 If remote session disappears:
+
 - conversation remains;
 - create replacement session;
 - recover from durable state.
@@ -51,6 +53,7 @@ content are excluded. Normal resume sends no capsule or replay.
 Compact working state.
 
 Contains:
+
 - goal;
 - current state;
 - accepted decisions;
@@ -59,6 +62,7 @@ Contains:
 - last processed message.
 
 Create a new checkpoint:
+
 - after milestones;
 - when work becomes BLOCKED/READY;
 - after meaningful decision;
@@ -75,7 +79,7 @@ Conversation/Agent pair and is deterministic even when timestamps tie.
 ```json
 {
   "version": "JULY_RECOVERY_V1",
-  "agent": { "name": "cashpoint", "project_root": "/workspace/cashpoint" },
+  "agent": { "name": "agent_order", "project_root": "/workspace/agent_order" },
   "conversation": { "title": "VNA/payment-42" },
   "project_memories": [],
   "room_memories": [],
@@ -93,6 +97,7 @@ Conversation/Agent pair and is deterministic even when timestamps tie.
 ## Memory is not transcript
 
 Message:
+
 > I think Pay may return the wrong field.
 
 must NOT automatically become:
@@ -107,17 +112,21 @@ Result never creates Memory automatically.
 ## Long-lived memory scopes
 
 ### Project
+
 Non-obvious codebase/business constraints.
 
 ### Room
+
 Shared business contracts and accepted decisions.
 
 ### Agent
+
 Only if there is durable agent-specific operational knowledge.
 
 ## Thread data
 
 Thread working state normally remains:
+
 - checkpoint;
 - work;
 - result.
@@ -127,6 +136,7 @@ Do not promote all thread details into long-lived memory.
 ## Provenance
 
 Every durable memory should retain:
+
 - source conversation;
 - kind;
 - evidence where available;
@@ -167,6 +177,7 @@ SQLite + FTS5
 ```
 
 Do not add:
+
 - Mem0;
 - Letta;
 - vector DB;
@@ -176,11 +187,13 @@ Do not add:
 ## Codebase is memory
 
 Do not persist what an agent can cheaply recover from source:
+
 - obvious folder structure;
 - implementation details;
 - current code symbols.
 
 Persist things expensive or impossible to infer:
+
 - business decisions;
 - intentional quirks;
 - external constraints;

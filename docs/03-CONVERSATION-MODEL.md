@@ -14,13 +14,13 @@ fork context
 ## DM workflow
 
 ```text
-/dm cashpoint
+/dm agent_order
 ```
 
 Flow:
 
 ```text
-User ↔ cashpoint agent ↔ cashpoint repo
+User ↔ agent_order agent ↔ agent_order repo
 ```
 
 If target is explicit, no July LLM is required.
@@ -30,15 +30,15 @@ If target is explicit, no July LLM is required.
 Quick question:
 
 ```text
-cashpoint → pay DM
+agent_order → pay DM
 ```
 
 Longer shared investigation:
 
 ```text
-cashpoint DM
+agent_order DM
 → create/join Room Thread
-→ cashpoint + pay collaborate
+→ agent_order + pay collaborate
 ```
 
 The source DM remains intact.
@@ -53,12 +53,12 @@ Example:
 
 ```text
 Room VNA
-members: cashpoint, pay, infra, mobile
+members: agent_order, pay, infra, mobile
 ```
 
 `Thread payment` may include only:
 
-- cashpoint
+- agent_order
 - pay
 
 Infra/mobile are not woken and do not receive the thread transcript.
@@ -73,7 +73,7 @@ than cascading them silently.
 Dynamic membership through mentions is a Phase 5 feature. Phase 4 membership
 changes are explicit july commands.
 
-If Cashpoint says:
+If AgentOrder says:
 
 ```text
 @pay check this contract
@@ -105,7 +105,7 @@ A side issue should create a new DM context:
 
 ```text
 Thread VNA/payment
-→ DM cashpoint / redis-side-issue
+→ DM agent_order / redis-side-issue
 ```
 
 The main thread remains clean.

@@ -25,34 +25,36 @@
 
 ## Bảng file
 
-| File | Trách nhiệm |
-|---|---|
-| `src/adapter/mod.rs` (tạo) | Khai báo submodule, `pub use`, `AdapterError` |
-| `src/adapter/catalog.rs` (tạo) | `AdapterSpec`, `ADAPTERS`, `find()`. Không biết filesystem |
-| `src/adapter/store.rs` (tạo) | `AdapterStore`: đường dẫn, phiên bản đã cài, `identities.json`, `config_for()`, cài đặt |
-| `src/cli/keys.rs` (tạo) | `RawMode` guard qua termios, `decode()` bytes sang `Key` |
-| `src/cli/init.rs` (tạo) | `Selection` state machine, vẽ màn hình, luồng `july init` |
-| `src/lib.rs` (sửa) | Thêm `pub mod adapter;` |
-| `src/transport/mod.rs` (sửa) | Thêm `AgentIdentity`, `pub use acp::probe_agent_identity` |
-| `src/transport/acp.rs` (sửa) | Thêm `probe_agent_identity()` |
-| `src/runtime/mod.rs` (sửa) | `pub(crate) use direct_message::parse_acp_config` |
-| `src/runtime/direct_message.rs` (sửa) | `parse_acp_config` thành `pub(crate)` |
-| `src/cli/mod.rs` (sửa) | `Command::Init`, `AgentOperation::Add.adapter`, `AgentOperation::Update`, `CliError::Adapter`, USAGE |
-| `src/application/collaboration.rs` (sửa) | `UpdateAgent` command cho `agent update` |
-| `docs/08-RUNTIME-AND-CLI.md` (sửa) | Tài liệu `init`, `agent add --adapter`, `agent update` |
-| `tests/adapter_probe.rs` (tạo) | Probe danh tính adapter qua fixture python |
-| `tests/cli_init.rs` (tạo) | `july init` ở chế độ không TTY |
+| File                                     | Trách nhiệm                                                                                          |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `src/adapter/mod.rs` (tạo)               | Khai báo submodule, `pub use`, `AdapterError`                                                        |
+| `src/adapter/catalog.rs` (tạo)           | `AdapterSpec`, `ADAPTERS`, `find()`. Không biết filesystem                                           |
+| `src/adapter/store.rs` (tạo)             | `AdapterStore`: đường dẫn, phiên bản đã cài, `identities.json`, `config_for()`, cài đặt              |
+| `src/cli/keys.rs` (tạo)                  | `RawMode` guard qua termios, `decode()` bytes sang `Key`                                             |
+| `src/cli/init.rs` (tạo)                  | `Selection` state machine, vẽ màn hình, luồng `july init`                                            |
+| `src/lib.rs` (sửa)                       | Thêm `pub mod adapter;`                                                                              |
+| `src/transport/mod.rs` (sửa)             | Thêm `AgentIdentity`, `pub use acp::probe_agent_identity`                                            |
+| `src/transport/acp.rs` (sửa)             | Thêm `probe_agent_identity()`                                                                        |
+| `src/runtime/mod.rs` (sửa)               | `pub(crate) use direct_message::parse_acp_config`                                                    |
+| `src/runtime/direct_message.rs` (sửa)    | `parse_acp_config` thành `pub(crate)`                                                                |
+| `src/cli/mod.rs` (sửa)                   | `Command::Init`, `AgentOperation::Add.adapter`, `AgentOperation::Update`, `CliError::Adapter`, USAGE |
+| `src/application/collaboration.rs` (sửa) | `UpdateAgent` command cho `agent update`                                                             |
+| `docs/08-RUNTIME-AND-CLI.md` (sửa)       | Tài liệu `init`, `agent add --adapter`, `agent update`                                               |
+| `tests/adapter_probe.rs` (tạo)           | Probe danh tính adapter qua fixture python                                                           |
+| `tests/cli_init.rs` (tạo)                | `july init` ở chế độ không TTY                                                                       |
 
 ---
 
 ### Task 1: Danh mục adapter
 
 **Files:**
+
 - Create: `src/adapter/mod.rs`
 - Create: `src/adapter/catalog.rs`
 - Modify: `src/lib.rs`
 
 **Interfaces:**
+
 - Consumes: không có.
 - Produces: `adapter::{AdapterSpec, Installer, Tier, ADAPTERS, find}`. `AdapterSpec` có các field `id: &'static str`, `package: &'static str`, `version: &'static str`, `bin: &'static str`, `installer: Installer`, `tier: Tier`, `summary: &'static str`. `find(id: &str) -> Option<&'static AdapterSpec>`.
 
@@ -249,10 +251,12 @@ git commit -m "feat(adapter): add static catalog of supported ACP adapters"
 ### Task 2: Đường dẫn và phiên bản đã cài
 
 **Files:**
+
 - Create: `src/adapter/store.rs`
 - Modify: `src/adapter/mod.rs`
 
 **Interfaces:**
+
 - Consumes: `adapter::{AdapterSpec, Installer, find}` từ Task 1.
 - Produces:
   - `AdapterError` với các variant `MissingHome`, `UnknownAdapter(String)`, `NotInstalled { id: String }`, `NotVerified { id: String }`, `ToolMissing { tool: &'static str }`, `InstallFailed { id: String, tool: &'static str, status: String }`, `Probe(String)`, `Io(io::Error)`, `Json(serde_json::Error)`.
@@ -519,11 +523,13 @@ git commit -m "feat(adapter): resolve adapter paths and installed versions"
 Adapter tự khai `agentInfo.name` và `agentInfo.version` trong phản hồi `initialize`, và `validate_handshake` (src/transport/acp.rs:463) so khớp chính xác hai giá trị đó. Chúng không suy ra được từ metadata package, nên phải hỏi chính adapter. Hàm này đặt trong `transport` để giữ bất biến "chỉ tầng transport nói ACP".
 
 **Files:**
+
 - Modify: `src/transport/acp.rs`
 - Modify: `src/transport/mod.rs`
 - Test: `tests/adapter_probe.rs`
 
 **Interfaces:**
+
 - Consumes: không có từ task trước.
 - Produces: `transport::AgentIdentity { pub name: String, pub version: String }` và `transport::probe_agent_identity(executable: &Path, arguments: &[String]) -> Result<AgentIdentity, TransportError>`.
 
@@ -734,11 +740,13 @@ git commit -m "feat(transport): probe an adapter for the identity it declares"
 Đây là task khoá lại lỗi gốc: nơi ghi `transport_config` và nơi đọc nó phải cùng một hợp đồng.
 
 **Files:**
+
 - Modify: `src/adapter/store.rs`
 - Modify: `src/runtime/direct_message.rs:381`
 - Modify: `src/runtime/mod.rs`
 
 **Interfaces:**
+
 - Consumes: `AdapterStore`, `AdapterError`, `ensure_state_directory` từ Task 2; `AgentIdentity` từ Task 3.
 - Produces:
   - `AdapterIdentity { pub name: String, pub version: String, pub bin: PathBuf }` với `serde_json` đọc/ghi thủ công qua `Value`.
@@ -799,7 +807,7 @@ Thêm vào `mod tests` của `src/adapter/store.rs`:
         let store = AdapterStore::new(scratch());
 
         assert!(matches!(
-            store.config_for("nope", "cashpoint"),
+            store.config_for("nope", "agent_order"),
             Err(AdapterError::UnknownAdapter(id)) if id == "nope"
         ));
     }
@@ -809,7 +817,7 @@ Thêm vào `mod tests` của `src/adapter/store.rs`:
         let store = AdapterStore::new(scratch());
 
         assert!(matches!(
-            store.config_for("codex", "cashpoint"),
+            store.config_for("codex", "agent_order"),
             Err(AdapterError::NotVerified { id }) if id == "codex"
         ));
     }
@@ -821,7 +829,7 @@ Thêm vào `mod tests` của `src/adapter/store.rs`:
         store.record_identity("codex", identity()).expect("record");
 
         let config = store
-            .config_for("codex", "cashpoint")
+            .config_for("codex", "agent_order")
             .expect("config generated");
 
         // Đây là hợp đồng bị vỡ trước đây: nơi ghi và nơi đọc phải khớp nhau.
@@ -829,7 +837,7 @@ Thêm vào `mod tests` của `src/adapter/store.rs`:
         assert_eq!(parsed.executable, identity().bin);
         assert_eq!(parsed.expected_agent_name, "codex-acp");
         assert_eq!(parsed.expected_agent_version, "1.6.2");
-        assert_eq!(parsed.state_directory, home.join("state/cashpoint"));
+        assert_eq!(parsed.state_directory, home.join("state/agent_order"));
         assert!(parsed.arguments.is_empty());
         assert!(parsed.environment.is_empty());
         assert!(
@@ -982,11 +990,13 @@ git commit -m "feat(adapter): generate a transport_config the runtime parser acc
 ### Task 5: Raw mode và giải mã phím
 
 **Files:**
+
 - Create: `src/cli/keys.rs`
 - Modify: `src/cli/mod.rs`
 - Modify: `Cargo.toml`
 
 **Interfaces:**
+
 - Consumes: không có.
 - Produces: `Key` enum (`Up`, `Down`, `Space`, `Enter`, `Quit`, `Interrupt`, `Other`), `decode(bytes: &[u8]) -> Option<(Key, usize)>`, `RawMode::enable() -> io::Result<Option<RawMode>>` (trả `None` khi stdin không phải TTY).
 
@@ -1144,10 +1154,12 @@ git commit -m "feat(cli): add termios raw mode guard and key decoding"
 ### Task 6: Máy trạng thái lựa chọn
 
 **Files:**
+
 - Create: `src/cli/init.rs`
 - Modify: `src/cli/mod.rs`
 
 **Interfaces:**
+
 - Consumes: `adapter::{ADAPTERS, AdapterSpec, Tier}` từ Task 1.
 - Produces: `Selection::new(items: Vec<&'static AdapterSpec>) -> Self`, `up()`, `down()`, `toggle()`, `cursor() -> usize`, `is_checked(index: usize) -> bool`, `chosen() -> Vec<&'static AdapterSpec>`.
 
@@ -1326,10 +1338,12 @@ git commit -m "feat(cli): add the adapter selection state machine"
 ### Task 7: Cài adapter
 
 **Files:**
+
 - Modify: `src/adapter/store.rs`
 - Modify: `src/adapter/mod.rs`
 
 **Interfaces:**
+
 - Consumes: `AdapterSpec`, `Installer`, `AdapterError`, `AdapterStore` từ Task 1 và 2.
 - Produces: `trait PackageInstaller { fn install(&self, spec: &AdapterSpec, root: &Path) -> Result<(), AdapterError>; }`, `struct SystemInstaller`, `fn install_command(spec: &AdapterSpec, root: &Path) -> (&'static str, Vec<String>)`.
 
@@ -1488,12 +1502,14 @@ git commit -m "feat(adapter): install adapters into the july-owned prefix"
 ### Task 8: Lệnh `july init`
 
 **Files:**
+
 - Modify: `src/cli/init.rs`
 - Modify: `src/cli/mod.rs`
 - Modify: `docs/08-RUNTIME-AND-CLI.md`
 - Test: `tests/cli_init.rs`
 
 **Interfaces:**
+
 - Consumes: `Selection` (Task 6), `keys::{Key, RawMode, decode}` (Task 5), `AdapterStore`, `SystemInstaller`, `PackageInstaller`, `AdapterIdentity` (Task 2, 4, 7), `transport::probe_agent_identity` (Task 3).
 - Produces: `Command::Init { adapters: Option<Vec<String>> }`, `pub(crate) async fn run_init(adapters: Option<Vec<String>>) -> Result<(), CliError>`, `CliError::{Adapter, NoAdapterSelected}`.
 
@@ -1802,11 +1818,13 @@ git commit -m "feat(cli): add july init to select, install, and verify adapters"
 Đổi ý nghĩa flag: `--adapter` từ nay trỏ id trong danh mục, không còn là `transport_type`. Chỗ escape cho cấu hình lạ chuyển sang `--transport <type> --config <file>`. Project ở 0.1.0 chưa phát hành nên rename này chấp nhận được, nhưng phải phản ánh trong USAGE và tài liệu.
 
 **Files:**
+
 - Modify: `src/cli/mod.rs:395-406` (`AgentOperation::Add`), `:592-620` (`parse_agent_add`), `:1683-1708` (`run_agent`)
 - Modify: `docs/08-RUNTIME-AND-CLI.md`
 - Test: `tests/cli_agent.rs`
 
 **Interfaces:**
+
 - Consumes: `AdapterStore::config_for` (Task 4), `CliError::Adapter` (Task 8).
 - Produces: `AgentOperation::Add { name, project, runtime, transport, adapter: Option<String>, config: Option<PathBuf> }`.
 
@@ -1824,7 +1842,7 @@ async fn agent_add_rejects_an_acp_agent_without_an_adapter_or_config() {
     let error = july_workspace::cli::run(arguments(&[
         "agent",
         "add",
-        "cashpoint",
+        "agent_order",
         "--project",
         &project.to_string_lossy(),
     ]))
@@ -1843,7 +1861,7 @@ async fn agent_add_rejects_adapter_and_config_together() {
         july_workspace::cli::run(arguments(&[
             "agent",
             "add",
-            "cashpoint",
+            "agent_order",
             "--project",
             "/tmp",
             "--adapter",
@@ -1867,7 +1885,7 @@ async fn agent_add_rejects_an_adapter_that_was_never_verified() {
     let error = july_workspace::cli::run(arguments(&[
         "agent",
         "add",
-        "cashpoint",
+        "agent_order",
         "--project",
         "/tmp",
         "--adapter",
@@ -2006,12 +2024,14 @@ git commit -m "feat(cli): generate agent transport config from a catalog adapter
 Không có lệnh này thì một config sai là không sửa được: `agent remove` chỉ đặt `status = "inactive"` (src/application/collaboration.rs:503) nên tên vẫn bị chiếm và tạo lại cùng tên báo `AgentNameConflict`.
 
 **Files:**
+
 - Modify: `src/application/collaboration.rs`
 - Modify: `src/cli/mod.rs`
 - Modify: `docs/08-RUNTIME-AND-CLI.md`
 - Test: `tests/cli_agent.rs`, `tests/phase4_application.rs`
 
 **Interfaces:**
+
 - Consumes: `AdapterStore::config_for` (Task 4), `CollaborationService::resolve_agent` đã có.
 - Produces: `CollaborationService::set_agent_transport(&mut self, reference: AgentRef, transport_type: String, transport_config: Value, changed_at: String) -> Result<Agent, CollaborationError>`, `AgentOperation::Update { agent: AgentRef, adapter: Option<String>, config: Option<PathBuf> }`.
 
@@ -2040,7 +2060,7 @@ async fn agent_update_requires_an_adapter_or_a_config() {
     unsafe { std::env::set_var("JULY_WORKSPACE_DB", &database) };
 
     assert!(
-        july_workspace::cli::run(arguments(&["agent", "update", "cashpoint"]))
+        july_workspace::cli::run(arguments(&["agent", "update", "agent_order"]))
             .await
             .is_err()
     );
@@ -2060,7 +2080,7 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
     service
         .add_agent(AddAgent {
             agent_id,
-            name: "cashpoint".into(),
+            name: "agent_order".into(),
             project_root: "/tmp".into(),
             transport_type: "acp".into(),
             transport_config: serde_json::json!({ "executable": "/old/bin" }),
@@ -2072,7 +2092,7 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
 
     let updated = service
         .set_agent_transport(
-            AgentRef::Name("cashpoint".into()),
+            AgentRef::Name("agent_order".into()),
             "acp".into(),
             serde_json::json!({ "executable": "/new/bin" }),
             "2026-08-25T01:00:00Z".into(),
@@ -2085,7 +2105,7 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
     assert_eq!(updated.updated_at, "2026-08-25T01:00:00Z");
 
     let reloaded = service
-        .resolve_agent(AgentRef::Name("cashpoint".into()))
+        .resolve_agent(AgentRef::Name("agent_order".into()))
         .await
         .expect("agent reloaded");
     assert_eq!(
@@ -2232,7 +2252,7 @@ Chạy trên máy dev, không nằm trong test tự động:
 1. `JULY_HOME=$(mktemp -d) cargo run --bin july -- init` - chọn `codex`, xác nhận nó cài, probe, và in danh tính thật.
 2. `cargo run --bin july -- agent add probe-test --project $(pwd) --adapter codex`
 3. `cargo run --bin july -- dm probe-test` - phải mở được, không còn lỗi `field executable must be a non-empty string`.
-4. Dọn nợ ở mục 9 của spec: `july agent update cashpoint --adapter codex`, rồi xoá `~/.july/workspace.db.bak-*` và `~/.july/cashpoint-acp.json`.
+4. Dọn nợ ở mục 9 của spec: `july agent update agent_order --adapter codex`, rồi xoá `~/.july/workspace.db.bak-*` và `~/.july/agent_order-acp.json`.
 
 ## Tự soát kế hoạch
 

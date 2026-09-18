@@ -97,7 +97,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         scopes: CommandScope::ALL,
         summary: "open a direct message with an agent",
         usage: "/dm <agent> [message]",
-        examples: &["/dm cashpoint", "/dm @cashpoint what is still open?"],
+        examples: &["/dm agent_order", "/dm @agent_order what is still open?"],
     },
     CommandSpec {
         name: "/room",
@@ -221,7 +221,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         scopes: &[Thread],
         summary: "assign an explicit work item to an agent",
         usage: "/work assign <work-id> --agent <agent>",
-        examples: &["/work assign 01ARZ3NDEKTSV4RRFFQ69G5FAV --agent cashpoint"],
+        examples: &["/work assign 01ARZ3NDEKTSV4RRFFQ69G5FAV --agent agent_order"],
     },
     CommandSpec {
         name: "/work status",
@@ -383,10 +383,10 @@ pub fn visible_for_scope(scope: CommandScope) -> impl Iterator<Item = &'static C
 /// `@` targets work, `/` runs a command: the two things a user must remember.
 const HELP_PREAMBLE: &str = "\
 Work with one agent
-  @cashpoint fix callback retry
+  @agent_order fix callback retry
 
 Work with several agents (inside a room)
-  @cashpoint @pay implement refund flow
+  @agent_order @pay implement refund flow
 
 ";
 
@@ -621,7 +621,7 @@ mod tests {
     #[test]
     fn help_teaches_mentions_and_no_longer_advertises_threads() {
         let room = help(Room);
-        assert!(room.contains("@cashpoint @pay implement refund flow"));
+        assert!(room.contains("@agent_order @pay implement refund flow"));
         assert!(room.contains("/work [work]"));
         assert!(!room.contains("/thread"));
         // Hidden is not removed: the commands still resolve and still explain.

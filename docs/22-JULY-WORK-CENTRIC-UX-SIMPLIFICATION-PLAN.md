@@ -27,15 +27,15 @@ Work  = việc đang làm
 Mục tiêu UX:
 
 ```text
-> @cashpoint fix callback retry
+> @agent_order fix callback retry
 ```
 
-→ mở/resume direct work với `cashpoint`
+→ mở/resume direct work với `agent_order`
 
 và:
 
 ```text
-[vna] > @cashpoint @pay implement refund flow
+[vna] > @agent_order @pay implement refund flow
 ```
 
 → tạo một Work collaboration mới trong Room `vna`
@@ -88,15 +88,15 @@ Không làm migration lớn trong phase này.
 ### Single agent
 
 ```text
-> @cashpoint fix callback retry
+> @agent_order fix callback retry
 ```
 
 July:
 
 ```text
-Opening cashpoint...
+Opening agent_order...
 
-[cashpoint] >
+[agent_order] >
 ```
 
 Prompt tiếp theo:
@@ -110,14 +110,14 @@ Prompt tiếp theo:
 ### Multi-agent trong Room
 
 ```text
-[vna] > @cashpoint @pay implement refund flow
+[vna] > @agent_order @pay implement refund flow
 ```
 
 July:
 
 ```text
 Created work: Refund flow
-Agents: cashpoint, pay
+Agents: agent_order, pay
 
 [vna/refund-flow] >
 ```
@@ -151,9 +151,9 @@ Hiển thị picker:
 ```text
 Who should work on this?
 
-› cashpoint
+› agent_order
   pay
-  cashpoint + pay
+  agent_order + pay
 ```
 
 Sau khi chọn, July tạo đúng context và dispatch prompt.
@@ -175,7 +175,7 @@ current Work
 ### Rule B — one `@agent`
 
 ```text
-@cashpoint ...
+@agent_order ...
 → resolve agent
 → create/resume direct context
 → auto-enter
@@ -185,7 +185,7 @@ current Work
 ### Rule C — multiple `@agent`
 
 ```text
-@cashpoint @pay ...
+@agent_order @pay ...
 → create/resume collaboration Work
 → ensure participants
 → create internal Thread if current architecture requires it
@@ -309,7 +309,7 @@ Không persist Room-level chat transcript.
 User-facing có thể vẫn hiện:
 
 ```text
-[cashpoint] >
+[agent_order] >
 ```
 
 nhưng không nhất thiết phải expose khái niệm `DM`.
@@ -326,7 +326,7 @@ vẫn giữ nếu đang cần.
 Về sau `/dm` có thể deprecate vì:
 
 ```text
-@cashpoint
+@agent_order
 ```
 
 đã đủ.
@@ -356,13 +356,13 @@ Example:
 render:
 
 ```text
-cashpoint
+agent_order
 ```
 
 Multiple mentions được hỗ trợ:
 
 ```text
-@cashpoint @pay ...
+@agent_order @pay ...
 ```
 
 ---
@@ -374,13 +374,13 @@ Bất kỳ action nào tạo usable work context phải auto-enter.
 Ví dụ:
 
 ```text
-@cashpoint ...
+@agent_order ...
 ```
 
 → enter direct context.
 
 ```text
-@cashpoint @pay ...
+@agent_order @pay ...
 ```
 
 → enter new/existing Work.
@@ -431,7 +431,7 @@ Tên struct chỉ minh họa; không cần tạo abstraction mới nếu code hi
 Khi multiple agents được target:
 
 ```text
-@cashpoint @pay implement refund flow
+@agent_order @pay implement refund flow
 ```
 
 July nên:
@@ -457,7 +457,7 @@ Không broadcast full prompt blindly tới tất cả agents nếu collaboration
 Multiple targeted agents trong Room:
 
 ```text
-[vna] > @cashpoint @pay ...
+[vna] > @agent_order @pay ...
 ```
 
 nên require các agent là Room members.
@@ -524,10 +524,10 @@ Thay bằng:
 
 ```text
 Work with one agent:
-  @cashpoint fix callback retry
+  @agent_order fix callback retry
 
 Work with multiple agents:
-  @cashpoint @pay implement refund flow
+  @agent_order @pay implement refund flow
 
 Commands:
   /room
@@ -622,7 +622,7 @@ Verify old collaboration/runtime behavior vẫn hoạt động.
 ### Single-agent routing
 
 ```text
-@cashpoint prompt
+@agent_order prompt
 ```
 
 Verify:
@@ -637,7 +637,7 @@ prompt delivered once
 ### Multi-agent routing
 
 ```text
-@cashpoint @pay prompt
+@agent_order @pay prompt
 ```
 
 Verify:
@@ -826,17 +826,17 @@ Sau khi UX mới ổn định, mới đánh giá việc merge Thread vào Work �
 
 ### Regression tests (§17)
 
-| Case §17 | Test |
-|---|---|
-| Single-agent routing | `repl_single_mention_opens_direct_work_and_sends_the_prompt`, `repl_bare_mention_enters_direct_work_without_sending_anything` |
-| Single-agent resume | `repl_repeated_mention_resumes_the_same_direct_work` |
-| Multi-agent routing | `repl_multiple_mentions_create_a_work_in_the_room_and_auto_enter_it` |
-| Current Work | `repl_plain_prompt_inside_work_stays_in_that_work` |
-| Room prompt | `repl_plain_room_prompt_offers_targets_instead_of_a_command_error` |
-| Auto-enter | `repl_work_lists_room_work_and_opens_one_without_thread` |
-| Isolation | `repl_two_mention_created_works_keep_separate_transcripts` |
+| Case §17             | Test                                                                                                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Single-agent routing | `repl_single_mention_opens_direct_work_and_sends_the_prompt`, `repl_bare_mention_enters_direct_work_without_sending_anything`                                                                     |
+| Single-agent resume  | `repl_repeated_mention_resumes_the_same_direct_work`                                                                                                                                              |
+| Multi-agent routing  | `repl_multiple_mentions_create_a_work_in_the_room_and_auto_enter_it`                                                                                                                              |
+| Current Work         | `repl_plain_prompt_inside_work_stays_in_that_work`                                                                                                                                                |
+| Room prompt          | `repl_plain_room_prompt_offers_targets_instead_of_a_command_error`                                                                                                                                |
+| Auto-enter           | `repl_work_lists_room_work_and_opens_one_without_thread`                                                                                                                                          |
+| Isolation            | `repl_two_mention_created_works_keep_separate_transcripts`                                                                                                                                        |
 | Resume trong context | `repl_mentioning_the_same_agents_inside_a_work_continues_it`, `repl_mentioning_the_open_agent_inside_direct_work_continues_it`, `repl_mentioning_a_different_set_inside_a_work_still_creates_one` |
-| Compatibility | Toàn bộ suite cũ giữ nguyên, xanh |
+| Compatibility        | Toàn bộ suite cũ giữ nguyên, xanh                                                                                                                                                                 |
 
 ### Chưa làm (đúng như §19)
 

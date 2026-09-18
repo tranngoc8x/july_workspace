@@ -54,7 +54,7 @@ Historical July implementations are reference material only.
 ### One workspace, many codebases
 
 ```text
-/dm cashpoint
+/dm agent_order
 /room vna
 /thread payment-42
 ```
@@ -64,8 +64,8 @@ No manual terminal/session juggling required.
 ### Cross-project communication
 
 ```text
-cashpoint ↔ pay
-cashpoint ↔ infra
+agent_order ↔ pay
+agent_order ↔ infra
 ```
 
 No mandatory July LLM paraphrasing layer.
@@ -73,8 +73,8 @@ No mandatory July LLM paraphrasing layer.
 ### Context isolation
 
 ```text
-cashpoint identity
-├── DM cashpoint
+agent_order identity
+├── DM agent_order
 ├── VNA/payment
 ├── VNA/refund
 └── Grab/callback
@@ -113,30 +113,39 @@ July Workspace is not:
 ## 6. Design philosophy
 
 ### Prompt-light
+
 Only preserve instructions representing genuine product invariants or security boundaries.
 
 ### Runtime-first
+
 Routing, persistence, dependency propagation and session binding are deterministic runtime responsibilities.
 
 ### Native-first
+
 Use structured/native agent protocols where practical.
 
 ### Small abstractions
+
 Do not build fallback stacks before there is evidence they are needed.
 
 ### Explicit context boundaries
+
 A conversation never silently inherits another conversation's history.
 
 ### Results over transcripts
+
 Share compact Result/capsule/evidence/reference data.
 
 ### SQLite first
+
 No semantic/vector memory until actual scale proves a need.
 
 ### No terminal dependency
+
 Terminal tools are optional presentation/integration layers.
 
 ### Greenfield freedom
+
 When historical behavior conflicts with the cleaner design, prefer the new design.
 
 ## 7. Success criteria

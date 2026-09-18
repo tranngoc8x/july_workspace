@@ -28,9 +28,9 @@ rejected.
 
 Readiness-probed adapter profiles on 2026-08-10:
 
-| Agent | Provisioned adapter | Observed without a model prompt |
-|---|---|---|
-| Codex | `@agentclientprotocol/codex-acp = 1.1.13` | Version, initialize, two creates, cancel, close and clean exit; a never-prompted session was not resumable |
+| Agent  | Provisioned adapter                              | Observed without a model prompt                                                                              |
+| ------ | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| Codex  | `@agentclientprotocol/codex-acp = 1.1.13`        | Version, initialize, two creates, cancel, close and clean exit; a never-prompted session was not resumable   |
 | Claude | `@agentclientprotocol/claude-agent-acp = 0.66.0` | Version, initialize, create, set manual mode, close and clean exit; authenticated prompt flow was not tested |
 
 Codex launches from an absolute `codex-acp` path with no arguments and
@@ -134,13 +134,13 @@ turn-terminal and session-loss events are never dropped.
 
 Initial runtime limits:
 
-| Limit | Value |
-|---|---:|
-| Commands per Agent connection | 32 |
-| Events per Agent connection | 256 |
-| Storage commands | 64 |
-| One coalesced text event | 64 KiB |
-| Turn cancellation grace | 10 seconds |
+| Limit                         |      Value |
+| ----------------------------- | ---------: |
+| Commands per Agent connection |         32 |
+| Events per Agent connection   |        256 |
+| Storage commands              |         64 |
+| One coalesced text event      |     64 KiB |
+| Turn cancellation grace       | 10 seconds |
 
 Command and storage producers wait when their queues are full. Consecutive
 text deltas are coalesced up to 64 KiB, after which the reader waits for event
@@ -157,12 +157,14 @@ shutdown and error paths; tasks are not detached.
 ## Ownership
 
 July owns:
+
 - logical conversation;
 - agent identity;
 - binding record;
 - delivery state.
 
 Remote agent harness owns:
+
 - current model context;
 - compaction;
 - reasoning;
@@ -173,7 +175,7 @@ Remote agent harness owns:
 ```text
 Thread VNA/payment
 
-cashpoint → ACP session C17
+agent_order → ACP session C17
 pay       → ACP session P42
 ```
 
@@ -182,7 +184,7 @@ Never share one agent session between codebase owners.
 ## Agent-to-agent message
 
 ```text
-cashpoint → @pay
+agent_order → @pay
 ```
 
 Runtime resolves target and sends through Pay's binding.
@@ -227,6 +229,7 @@ marks every current binding on that connection `Disconnected`.
 ## Reconnect
 
 Transport failure:
+
 1. change `Active` to `Disconnected`;
 2. reconnect the Agent connection;
 3. attempt resume only if the agent advertises resume capability and the

@@ -3,15 +3,18 @@
 ## 1. Domain tests
 
 Agent:
+
 - create/update;
 - duplicate rejection.
 
 Room:
+
 - create;
 - membership generation add/no-op/remove/no-op/rejoin;
 - same agent in multiple rooms.
 
 Conversation:
+
 - DM;
 - Thread;
 - active Room membership required for Agent Thread membership;
@@ -21,6 +24,7 @@ Conversation:
 - origin relation.
 
 Work:
+
 - exactly one primary Work is created with each new Thread;
 - valid lifecycle and owner transitions with exact-retry no-ops;
 - invalid transition, owner, and terminal timestamp rejection;
@@ -36,11 +40,12 @@ Work completion and dependency Result-reference invariants.
 ### Same agent, two threads
 
 ```text
-cashpoint / thread A
-cashpoint / thread B
+agent_order / thread A
+agent_order / thread B
 ```
 
 Assert:
+
 - distinct session bindings;
 - B bootstrap excludes A transcript;
 - A result appears in B only through explicit publish.
@@ -48,18 +53,21 @@ Assert:
 ### DM while thread active
 
 Assert:
+
 - DM recent history excludes thread messages;
 - thread recent history excludes DM.
 
 ## 3. Messaging
 
 Current Phase 5.1 coverage:
+
 - exact active unordered Agent pair reuse;
 - target-only exact-body delivery through the shared owner;
 - deterministic typed routing to the target owner;
 - durable source/target attribution for both sides of the DM.
 
 Current Phase 5.2 coverage:
+
 - explicit target-only Thread mention routing through the shared owner;
 - atomic message persistence with idempotent join and generational rejoin;
 - capsule-before-body delivery for new members and body-only active delivery;
@@ -68,6 +76,7 @@ Current Phase 5.2 coverage:
 - isolation from unrelated Agents, Threads, Rooms, and DMs.
 
 Current Phase 5.3 coverage:
+
 - per-target delivery rows with `PENDING`, `DELIVERED`, and `FAILED`;
 - message-plus-delivery persistence before transport;
 - `DELIVERED` after transport acceptance and `FAILED` on owner/open/send
@@ -78,6 +87,7 @@ Current Phase 5.3 coverage:
   semantics.
 
 Current Phase 5.4 coverage:
+
 - startup reconciliation transitions persisted `PENDING` deliveries to `FAILED`
   before storage-worker readiness, without transport send or automatic retry;
 - cancellation/process-loss DM and Thread delivery reopen real runtime and
@@ -90,6 +100,7 @@ Current Phase 5.4 coverage:
 ## 4. Publish
 
 Current Phase 6 coverage in `tests/result_publish.rs` asserts:
+
 - the target query returns the complete immutable structured Result and source
   conversation reference;
 - source transcript Messages are not copied;
@@ -107,6 +118,7 @@ A corrected Result → matching outgoing SATISFIED edge SUPERSEDED + replacement
 ```
 
 Current Phase 6 coverage in `tests/work_dependencies.rs` asserts:
+
 - new edges start `WAITING`; exact add/retry is idempotent;
 - missing Work, self-dependency, and recursive cycles are rejected without
   partial rows;
@@ -130,6 +142,7 @@ slice.
 ## 6. Session
 
 Test:
+
 - create;
 - resume;
 - disconnect/reconnect;
@@ -145,6 +158,7 @@ fallback. Add the fixture with the first `ACPTransport` failing test; a
 standalone harness before that has nothing useful to exercise.
 
 The fixture must prove:
+
 - initialize rejects the wrong protocol or unexpected adapter identity;
 - one Agent connection creates two independent sessions;
 - only one active turn is admitted per session;
@@ -205,6 +219,7 @@ transcript replay, and mandatory live-provider smoke are not asserted.
 ## 8. SQLite crash safety
 
 Interrupt:
+
 - create thread transaction;
 - result + work completion;
 - publish;
@@ -229,6 +244,7 @@ commit must leave the durable aggregate intact and retryable.
 ## 10. Dependency absence tests
 
 Run core suite with:
+
 - Beads unavailable;
 - Herdr unavailable;
 - Zellij unavailable;
@@ -239,6 +255,7 @@ Everything must still pass.
 ## 11. Context/token regression
 
 Track baseline for:
+
 - DM bootstrap;
 - thread join capsule;
 - recovery capsule;
@@ -249,22 +266,28 @@ Add budget checks after real baselines exist.
 ## 12. E2E scenarios
 
 ### A — Single-project DM
-User → cashpoint → code change → result → resume later.
+
+User → agent_order → code change → result → resume later.
 
 ### B — Agent quick DM
-Cashpoint asks Pay → Pay replies → Cashpoint continues.
+
+AgentOrder asks Pay → Pay replies → AgentOrder continues.
 
 ### C — Room collaboration
-VNA/payment starts with Cashpoint; Pay joins later.
+
+VNA/payment starts with AgentOrder; Pay joins later.
 
 ### D — Cross-thread publish
+
 Auth READY → Payment receives dependency update.
 
 ### E — Session loss
+
 Kill session → recover → continue.
 
 ### F — Isolation
-Unrelated Cashpoint DM runs while VNA/payment remains active; no leakage.
+
+Unrelated AgentOrder DM runs while VNA/payment remains active; no leakage.
 
 ## 13. Phase 10 TUI and compatibility
 

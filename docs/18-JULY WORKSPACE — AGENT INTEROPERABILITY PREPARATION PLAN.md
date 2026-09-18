@@ -160,7 +160,7 @@ Ví dụ hiện tại:
 
 ```text
 Agent:
-    cashpoint
+    agent_order
 
 Runtime:
     adapter = acp
@@ -412,7 +412,7 @@ thông qua Agent Registry/Resolver.
 Ví dụ:
 
 ```text
-cashpoint
+agent_order
 pay
 gateway
 ```
@@ -443,7 +443,7 @@ Ví dụ:
 
 ```text
 Task A
-owner: cashpoint
+owner: agent_order
 
     ↓ needs
 
@@ -480,8 +480,8 @@ Ví dụ:
 ```text
 Task #123
 │
-├── Message cashpoint → pay
-├── Message pay → cashpoint
+├── Message agent_order → pay
+├── Message pay → agent_order
 │
 └── Result
 ```
@@ -564,7 +564,7 @@ Có thể bắt đầu bằng unit/integration tests.
 ## Scenario 1 — Agent A giao việc Agent B
 
 ```text
-cashpoint
+agent_order
     ↓
 Task Manager
     ↓
@@ -574,7 +574,7 @@ pay runtime
     ↓
 Result
     ↓
-cashpoint task resumes
+agent_order task resumes
 ```
 
 Không agent nào gọi runtime của agent còn lại trực tiếp.

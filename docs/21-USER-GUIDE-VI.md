@@ -208,7 +208,7 @@ Bản vừa cài phải qua kiểm tra version và ACP trước khi được ch�
 ### Bước 2: Thêm project agent
 
 ```bash
-cd /absolute/path/to/cashpoint
+cd /absolute/path/to/agent_order
 july init
 ```
 
@@ -220,16 +220,16 @@ chuyển về không dấu và khoảng trắng thành `_`; ví dụ `Dự án T
 Cho script hoặc automation, dùng dạng đầy đủ không tương tác:
 
 ```bash
-july agent add cashpoint \
-  --project /absolute/path/to/cashpoint \
+july agent add agent_order \
+  --project /absolute/path/to/agent_order \
   --adapter codex
 ```
 
 `--runtime` là metadata tùy chọn, không thay thế `--adapter`:
 
 ```bash
-july agent add cashpoint \
-  --project /absolute/path/to/cashpoint \
+july agent add agent_order \
+  --project /absolute/path/to/agent_order \
   --adapter codex \
   --runtime codex
 ```
@@ -238,7 +238,7 @@ Kiểm tra agent:
 
 ```bash
 july agent list
-july agent show cashpoint
+july agent show agent_order
 ```
 
 `agent add` và `agent show` in một dòng tab-separated gồm:
@@ -256,22 +256,22 @@ july
 ```
 
 ```text
-> @cashpoint fix callback retry
+> @agent_order fix callback retry
 ```
 
-July mở việc trực tiếp với `cashpoint` và gửi luôn prompt. Gõ tiếp là đi vào
+July mở việc trực tiếp với `agent_order` và gửi luôn prompt. Gõ tiếp là đi vào
 cùng ngữ cảnh đó:
 
 ```text
 > also add regression tests
 ```
 
-Gọi lại `@cashpoint` sau này sẽ nối tiếp đúng transcript cũ.
+Gọi lại `@agent_order` sau này sẽ nối tiếp đúng transcript cũ.
 
 Nếu chỉ cần một stream DM độc lập, không qua workspace shell:
 
 ```bash
-july dm cashpoint
+july dm agent_order
 ```
 
 Nhập prompt rồi nhấn `Enter`. Khi đang ở prompt idle, dùng `/exit`, `/quit`, EOF
@@ -284,7 +284,7 @@ Trong `july dm`, các chuỗi như `/status` không phải command July; ngoại
 
 ```bash
 july room create VNA --description "VNA product collaboration"
-july room member add VNA cashpoint
+july room member add VNA agent_order
 july room members VNA
 ```
 
@@ -303,7 +303,7 @@ Vào Room rồi gọi tên các agent cần làm việc cùng nhau:
 
 ```text
 /room VNA
-@cashpoint @pay implement refund flow
+@agent_order @pay implement refund flow
 ```
 
 July tạo Work mới, đưa bạn vào luôn, và gửi prompt:
@@ -344,7 +344,7 @@ Các command hữu hạn hỗ trợ `--json`; nên đặt ở đầu hoặc cu�
 
 ```bash
 july --json agent list
-july agent show cashpoint --json
+july agent show agent_order --json
 ```
 
 Chỉ dùng `--json` một lần.
@@ -367,7 +367,7 @@ bản cũ và không thay `transport_config` đã lưu trong Agent. Agent hiện
 tục dùng executable cũ. Khi muốn chuyển một Agent sang bản vừa xác minh:
 
 ```bash
-july agent update cashpoint --adapter codex
+july agent update agent_order --adapter codex
 ```
 
 Nếu executable cũ đã hỏng, setup không tự sửa cấu hình Agent đó; dùng lệnh trên
@@ -404,7 +404,7 @@ Migrating
 Runtimes
 ✓ codex 1.10.0
 ↑ claude 0.6.1 → 0.70.0
-  ↻ repointed 2 agent(s): cashpoint, ops
+  ↻ repointed 2 agent(s): agent_order, ops
   ⌫ reclaimed 1 superseded installation(s)
 
 July 0.9.0 is ready.
@@ -561,7 +561,7 @@ Ví dụ:
 
 ```bash
 july room create Payments --description "Payment workstream"
-july room member add Payments cashpoint
+july room member add Payments agent_order
 july room list --json
 july room members Payments --json
 ```
@@ -589,13 +589,13 @@ Ví dụ tạo Thread với nhiều Agent:
 
 ```bash
 # Hai Agent phải tồn tại và đã là thành viên của Room.
-july room member add Payments cashpoint
+july room member add Payments agent_order
 july room member add Payments pay
 
 july thread create "Payment callback" \
   --room Payments \
   --goal "Chốt callback contract và triển khai" \
-  --member cashpoint \
+  --member agent_order \
   --member pay
 ```
 
@@ -610,7 +610,7 @@ july thread create "Payment callback" \
 Mở trực tiếp một Thread mà không qua workspace shell:
 
 ```bash
-july thread open <thread-id> --agent cashpoint
+july thread open <thread-id> --agent agent_order
 ```
 
 `thread open` là interactive stream nên không hỗ trợ `--json`.
@@ -678,13 +678,13 @@ không kết thúc Work và không xóa conversation.
 
 `@` chỉ có nghĩa khi đứng ở **đầu** dòng. Phần còn lại của dòng là prompt.
 
-| Bạn gõ                                    | July làm gì                                                |
-| ----------------------------------------- | ---------------------------------------------------------- |
-| `@cashpoint fix callback retry`           | Mở/nối việc trực tiếp với`cashpoint`, vào luôn, gửi prompt |
-| `@cashpoint`                              | Vào việc trực tiếp, không gửi gì                           |
-| `@cashpoint @pay implement refund flow`   | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt  |
-| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại             |
-| `@nobody hi`                              | Báo`agent nobody does not exist`, giữ nguyên context       |
+| Bạn gõ                                    | July làm gì                                                  |
+| ----------------------------------------- | ------------------------------------------------------------ |
+| `@agent_order fix callback retry`         | Mở/nối việc trực tiếp với`agent_order`, vào luôn, gửi prompt |
+| `@agent_order`                            | Vào việc trực tiếp, không gửi gì                             |
+| `@agent_order @pay implement refund flow` | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt    |
+| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại               |
+| `@nobody hi`                              | Báo`agent nobody does not exist`, giữ nguyên context         |
 
 Quy tắc bổ sung:
 
@@ -737,7 +737,7 @@ Hai command legacy vẫn chạy nhưng không còn xuất hiện trong `/help`:
   ```text
   [vna] > investigate refund issue
   who should work on this?
-    @cashpoint investigate refund issue
+    @agent_order investigate refund issue
     @pay investigate refund issue
   ```
 
@@ -837,8 +837,8 @@ Các output chính:
 ```json
 {
   "agent_id": "...",
-  "name": "cashpoint",
-  "project_root": "/path/to/cashpoint",
+  "name": "agent_order",
+  "project_root": "/path/to/agent_order",
   "transport_type": "acp",
   "runtime": "codex",
   "status": "active",
@@ -1012,26 +1012,26 @@ lại một dòng.
 ```bash
 # Onboarding
 july setup --adapters codex
-july agent add cashpoint --project /path/to/cashpoint --adapter codex
+july agent add agent_order --project /path/to/agent_order --adapter codex
 
 # Agent
 july agent list
-july agent show cashpoint
-july agent update cashpoint --adapter codex
+july agent show agent_order
+july agent update agent_order --adapter codex
 
 # Room
 july room create VNA --description "VNA collaboration"
-july room member add VNA cashpoint
+july room member add VNA agent_order
 
 # Work (admin surface)
-july thread create "Refund flow" --room VNA --member cashpoint
+july thread create "Refund flow" --room VNA --member agent_order
 july thread list --room VNA
 july thread members <work-id>
 
 # Chat
 july
-july dm cashpoint
-july thread open <work-id> --agent cashpoint
+july dm agent_order
+july thread open <work-id> --agent agent_order
 
 # Automation
 july --json agent list
@@ -1041,9 +1041,9 @@ july thread list --room VNA --json
 
 ```text
 # Trong TUI/REPL — việc thường ngày
-@cashpoint fix callback retry              một agent
+@agent_order fix callback retry              một agent
 /room VNA
-@cashpoint @pay implement refund flow      nhiều agent, tạo Work
+@agent_order @pay implement refund flow      nhiều agent, tạo Work
 support partial refund too                 gõ tiếp vào Work đó
 
 # Điều hướng và tra cứu

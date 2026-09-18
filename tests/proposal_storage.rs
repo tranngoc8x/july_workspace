@@ -59,7 +59,7 @@ fn agent(name: &str) -> Agent {
 
 struct Seeded {
     thread_id: ConversationId,
-    cashpoint: AgentId,
+    agent_order: AgentId,
     pay: AgentId,
     outsider: AgentId,
 }
@@ -86,11 +86,11 @@ fn seed(path: &Path) -> Seeded {
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
     };
-    let cashpoint = agent("cashpoint");
+    let agent_order = agent("agent_order");
     let pay = agent("pay");
     let outsider = agent("outsider");
     store.insert_room(&room).unwrap();
-    for member in [&cashpoint, &pay, &outsider] {
+    for member in [&agent_order, &pay, &outsider] {
         store.insert_agent(member).unwrap();
         store
             .add_room_member(room.id, member.id, None, CREATED)
@@ -101,12 +101,12 @@ fn seed(path: &Path) -> Seeded {
             &thread,
             WorkItemId::new(),
             "tony",
-            &[cashpoint.id, pay.id],
+            &[agent_order.id, pay.id],
         )
         .unwrap();
     Seeded {
         thread_id: thread.id,
-        cashpoint: cashpoint.id,
+        agent_order: agent_order.id,
         pay: pay.id,
         outsider: outsider.id,
     }
@@ -186,7 +186,7 @@ fn supporting_a_proposal_needs_no_evidence_but_challenging_does() {
             evidence: Vec::new(),
             ..response(
                 created.id,
-                seeded.cashpoint,
+                seeded.agent_order,
                 ProposalResponseType::Challenge,
             )
         })
@@ -199,7 +199,7 @@ fn supporting_a_proposal_needs_no_evidence_but_challenging_does() {
     let challenge = store
         .respond_to_proposal(&response(
             created.id,
-            seeded.cashpoint,
+            seeded.agent_order,
             ProposalResponseType::Challenge,
         ))
         .unwrap();
@@ -224,7 +224,7 @@ fn an_amendment_request_marks_the_proposal_amended() {
     store
         .respond_to_proposal(&ProposalResponse {
             evidence: Vec::new(),
-            ..response(created.id, seeded.cashpoint, ProposalResponseType::Amend)
+            ..response(created.id, seeded.agent_order, ProposalResponseType::Amend)
         })
         .unwrap();
 
@@ -260,7 +260,7 @@ fn a_revision_supersedes_the_proposal_it_replaces() {
     let error = store
         .respond_to_proposal(&response(
             first.id,
-            seeded.cashpoint,
+            seeded.agent_order,
             ProposalResponseType::Support,
         ))
         .unwrap_err();
@@ -293,7 +293,7 @@ fn only_the_author_withdraws_a_proposal() {
         .unwrap();
 
     let error = store
-        .withdraw_proposal(created.id, seeded.cashpoint, REVISED)
+        .withdraw_proposal(created.id, seeded.agent_order, REVISED)
         .unwrap_err();
     assert!(
         matches!(error, StoreError::ProposalAuthorMismatch { expected, .. } if expected == seeded.pay),
@@ -362,7 +362,7 @@ fn replays_are_no_ops_and_changed_content_conflicts() {
 
     let answer = response(
         created.id,
-        seeded.cashpoint,
+        seeded.agent_order,
         ProposalResponseType::Challenge,
     );
     store.respond_to_proposal(&answer).unwrap();
@@ -399,7 +399,7 @@ fn a_decision_that_selects_a_proposal_accepts_it() {
             selected_proposal_id: None,
             alternatives: vec!["retry in Pay".into()],
             evidence: Vec::new(),
-            participants: vec![seeded.cashpoint, seeded.pay],
+            participants: vec![seeded.agent_order, seeded.pay],
             decision_owner: DecisionOwner::User,
             status: DecisionStatus::Pending,
             supersedes_decision_id: None,

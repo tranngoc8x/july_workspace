@@ -75,7 +75,7 @@ july/
 │
 └── .july/
     ├── agents/
-    │   ├── cashpoint.md
+    │   ├── agent_order.md
     │   └── pay.md
     └── rooms/
         └── vna.md
@@ -90,6 +90,7 @@ Pure July concepts and invariants.
 Allowed dependencies should be minimal (`serde` only if serialization on domain DTOs genuinely helps).
 
 Must not depend on:
+
 - ACP SDK;
 - rusqlite;
 - Tokio process APIs;
@@ -116,6 +117,7 @@ pub enum WorkStatus {
 Deterministic use cases coordinating domain + ports/repositories.
 
 Examples:
+
 - send message;
 - create thread;
 - add member;
@@ -128,6 +130,7 @@ Examples:
 Tokio-based lifecycle management.
 
 Owns:
+
 - long-lived tasks;
 - session lifecycle;
 - cancellation;
@@ -174,6 +177,7 @@ Runtime → calls Application and AgentTransport
 ```
 
 Avoid:
+
 - domain importing ACP;
 - domain importing rusqlite;
 - CLI writing SQLite directly;

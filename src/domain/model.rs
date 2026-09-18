@@ -1070,8 +1070,8 @@ mod tests {
     fn valid_agent() -> Agent {
         Agent {
             id: AgentId::new(),
-            name: "cashpoint".into(),
-            project_root: "/workspace/cashpoint".into(),
+            name: "agent_order".into(),
+            project_root: "/workspace/agent_order".into(),
             transport_type: "acp".into(),
             transport_config: json!({"command": "codex"}),
             status: "active".into(),
@@ -1166,7 +1166,7 @@ mod tests {
         Memory {
             id: MemoryId::new(),
             scope_type: MemoryScopeType::Project,
-            scope_id: "cashpoint".into(),
+            scope_id: "agent_order".into(),
             kind: MemoryKind::Fact,
             content: "Callbacks are idempotent".into(),
             source_conversation_id: None,
@@ -1543,7 +1543,7 @@ mod tests {
             Err(DomainError::EmptyField("memory.scope_id"))
         );
 
-        memory.scope_id = "cashpoint".into();
+        memory.scope_id = "agent_order".into();
         memory.content = " ".into();
         assert_eq!(
             memory.validate(),

@@ -8,21 +8,21 @@ This is an architectural choice for a long-running, stateful local developer run
 
 ## 2. Initial stack
 
-| Concern | Choice | Purpose |
-|---|---|---|
-| Language | Rust | core runtime/domain/CLI |
-| Async runtime | Tokio | ACP sessions, child processes, streaming, cancellation |
-| Agent protocol | `agent-client-protocol = "=2.0.0"` | stable ACP v1 client transport |
-| Codex ACP adapter | `@agentclientprotocol/codex-acp = 1.1.13` | pinned external ACP agent process |
-| Claude ACP adapter | `@agentclientprotocol/claude-agent-acp = 0.66.0` | pinned external ACP agent process |
-| Database | SQLite | canonical durable workspace state |
-| SQLite binding | rusqlite | explicit low-level SQLite access |
-| Serialization | serde + serde_json | config, protocol/domain metadata JSON |
-| CLI | stdlib parser in Phase 3; clap later | one current DM command; broader Phase 8 CLI |
-| Observability | tracing + tracing-subscriber | structured runtime logs/spans |
-| Domain errors | thiserror | typed library/domain errors |
-| Application boundary errors | anyhow (sparingly) | CLI/bootstrap context-rich errors |
-| IDs | ULID | stable, locally sortable identifiers; add a crate when Phase 1 implements IDs |
+| Concern                     | Choice                                           | Purpose                                                                       |
+| --------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------- |
+| Language                    | Rust                                             | core runtime/domain/CLI                                                       |
+| Async runtime               | Tokio                                            | ACP sessions, child processes, streaming, cancellation                        |
+| Agent protocol              | `agent-client-protocol = "=2.0.0"`               | stable ACP v1 client transport                                                |
+| Codex ACP adapter           | `@agentclientprotocol/codex-acp = 1.1.13`        | pinned external ACP agent process                                             |
+| Claude ACP adapter          | `@agentclientprotocol/claude-agent-acp = 0.66.0` | pinned external ACP agent process                                             |
+| Database                    | SQLite                                           | canonical durable workspace state                                             |
+| SQLite binding              | rusqlite                                         | explicit low-level SQLite access                                              |
+| Serialization               | serde + serde_json                               | config, protocol/domain metadata JSON                                         |
+| CLI                         | stdlib parser in Phase 3; clap later             | one current DM command; broader Phase 8 CLI                                   |
+| Observability               | tracing + tracing-subscriber                     | structured runtime logs/spans                                                 |
+| Domain errors               | thiserror                                        | typed library/domain errors                                                   |
+| Application boundary errors | anyhow (sparingly)                               | CLI/bootstrap context-rich errors                                             |
+| IDs                         | ULID                                             | stable, locally sortable identifiers; add a crate when Phase 1 implements IDs |
 
 Do not add dependencies just because they appear in this table; add them in the phase where they become necessary.
 
@@ -34,6 +34,7 @@ single-command surface.
 ## 3. Why Rust fits July Workspace
 
 July Workspace is primarily:
+
 - async I/O;
 - process/session lifecycle;
 - event routing;
@@ -42,11 +43,13 @@ July Workspace is primarily:
 - CLI tooling.
 
 It is not primarily:
+
 - model inference;
 - data science;
 - Python AI framework integration.
 
 Rust therefore gives July more useful advantages in:
+
 - typed state machines;
 - ownership/lifecycle clarity;
 - long-running reliability;
@@ -56,6 +59,7 @@ Rust therefore gives July more useful advantages in:
 ## 4. Tokio rules
 
 Use Tokio for:
+
 - one owned ACP connection task per Agent, hosting multiple sessions;
 - child-process stdio;
 - event streams;
@@ -64,12 +68,14 @@ Use Tokio for:
 - runtime channels.
 
 Avoid:
+
 - blocking SQLite calls directly on latency-sensitive async executor threads;
 - detached tasks with no ownership/cancellation path;
 - a giant shared mutable runtime object;
 - a global mutex around `SqliteStore`.
 
 Every spawned long-lived task should have:
+
 - an owner;
 - a shutdown path;
 - an error reporting path.
@@ -117,6 +123,7 @@ Cancellation, shutdown and unknown options map to `Cancelled`; there is no
 implicit approval.
 
 Because ACP evolves, dependency upgrades must be intentional:
+
 1. pin a known-good SDK version;
 2. run protocol/transport tests;
 3. verify Claude/Codex adapters;
@@ -129,6 +136,7 @@ Do not expose raw ACP request/event structs through workspace/domain APIs.
 Use direct SQL with rusqlite.
 
 Initial recommendation:
+
 - SQLite bundled into the binary build where practical;
 - WAL mode;
 - foreign keys enabled;
@@ -154,9 +162,11 @@ remain Phase 7 work.
 ## 7. Error strategy
 
 ### Domain/infrastructure errors
+
 Use `thiserror` enums where callers need to distinguish cases.
 
 Examples:
+
 - invalid work transition;
 - conversation missing;
 - session resume unavailable;
@@ -164,6 +174,7 @@ Examples:
 - storage conflict.
 
 ### CLI/bootstrap errors
+
 Use `anyhow` only at outer application boundaries for context-rich reporting.
 
 Avoid converting every internal error into `anyhow::Error`, which would erase useful types.
@@ -173,6 +184,7 @@ Avoid converting every internal error into `anyhow::Error`, which would erase us
 Use `tracing` fields rather than ad-hoc print statements.
 
 Useful fields:
+
 - `conversation_id`;
 - `thread_id`;
 - `agent_id`;
@@ -199,10 +211,10 @@ Use a human-editable config format supported by Serde. TOML is the preferred def
 Example:
 
 ```toml
-[agents.cashpoint]
-project_root = "/repos/cashpoint"
+[agents.agent_order]
+project_root = "/repos/agent_order"
 
-[agents.cashpoint.transport]
+[agents.agent_order.transport]
 type = "acp"
 executable = "/opt/july/adapters/claude-agent-acp-0.66.0"
 expected_agent = "@agentclientprotocol/claude-agent-acp"
@@ -230,6 +242,7 @@ cargo build --release
 ```
 
 Optional tooling can be added later only when justified:
+
 - nextest;
 - cargo-deny;
 - cargo-audit;
@@ -256,6 +269,7 @@ Start with the developer's current macOS target, then add other targets when rel
 ## 13. Explicitly rejected initially
 
 Do not add initially:
+
 - Axum/web server;
 - Tauri/desktop UI;
 - Ratatui/full TUI before Phase 10, where it is now explicitly approved;

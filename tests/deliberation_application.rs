@@ -45,7 +45,7 @@ impl Drop for TestDatabase {
 struct Seeded {
     thread_id: ConversationId,
     work_id: WorkItemId,
-    cashpoint: AgentId,
+    agent_order: AgentId,
     pay: AgentId,
     outsider: AgentId,
 }
@@ -86,11 +86,11 @@ fn seed(path: &Path) -> Seeded {
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
     };
-    let cashpoint = agent("cashpoint");
+    let agent_order = agent("agent_order");
     let pay = agent("pay");
     let outsider = agent("outsider");
     store.insert_room(&room).unwrap();
-    for member in [&cashpoint, &pay, &outsider] {
+    for member in [&agent_order, &pay, &outsider] {
         store.insert_agent(member).unwrap();
         store
             .add_room_member(room.id, member.id, None, CREATED)
@@ -98,12 +98,12 @@ fn seed(path: &Path) -> Seeded {
     }
     let work_id = WorkItemId::new();
     store
-        .create_thread_with_primary_work(&thread, work_id, "tony", &[cashpoint.id, pay.id])
+        .create_thread_with_primary_work(&thread, work_id, "tony", &[agent_order.id, pay.id])
         .unwrap();
     Seeded {
         thread_id: thread.id,
         work_id,
-        cashpoint: cashpoint.id,
+        agent_order: agent_order.id,
         pay: pay.id,
         outsider: outsider.id,
     }
@@ -118,7 +118,7 @@ fn proposal_handoff(seeded: &Seeded) -> Handoff {
         id: HandoffId::new(),
         thread_id: seeded.thread_id,
         work_id: seeded.work_id,
-        from_agent_id: seeded.cashpoint,
+        from_agent_id: seeded.agent_order,
         to_agent_id: seeded.pay,
         status: HandoffStatus::Proposed,
         reason: Some("Pay owns delivery".into()),
@@ -187,7 +187,7 @@ async fn a_rejected_handoff_can_be_resolved_by_its_source() {
         .unwrap();
 
     let resolved = service
-        .resolve_handoff(handoff.id, seeded.cashpoint, DECIDED.into())
+        .resolve_handoff(handoff.id, seeded.agent_order, DECIDED.into())
         .await
         .unwrap();
 
@@ -216,7 +216,7 @@ async fn an_exhausted_dispute_becomes_a_decision_and_then_work() {
         let (_, decision) = service
             .challenge_handoff(
                 handoff.id,
-                HandoffChallenge::new(seeded.cashpoint, vec![format!("log:{evidence}")]),
+                HandoffChallenge::new(seeded.agent_order, vec![format!("log:{evidence}")]),
                 ANSWERED.into(),
             )
             .await
@@ -281,7 +281,7 @@ async fn proposals_flow_through_the_service() {
         .respond_to_proposal(ProposalResponse {
             id: ProposalResponseId::new(),
             proposal_id: proposal.id,
-            agent_id: seeded.cashpoint,
+            agent_id: seeded.agent_order,
             response_type: ProposalResponseType::Support,
             reason: None,
             evidence: Vec::new(),
@@ -322,7 +322,7 @@ async fn service_errors_are_grouped_by_what_the_caller_can_do() {
         service
             .respond_to_handoff(
                 handoff.id,
-                HandoffResponse::accept(seeded.cashpoint),
+                HandoffResponse::accept(seeded.agent_order),
                 ANSWERED.into()
             )
             .await,

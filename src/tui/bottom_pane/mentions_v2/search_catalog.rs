@@ -34,16 +34,16 @@ mod tests {
 
     #[test]
     fn every_agent_becomes_one_mention_candidate() {
-        let catalog = build_search_catalog(&["cashpoint".to_string(), "cashflow".to_string()]);
+        let catalog = build_search_catalog(&["agent_order".to_string(), "cashflow".to_string()]);
 
         assert_eq!(catalog.len(), 2);
-        assert_eq!(catalog[0].display_name, "cashpoint");
+        assert_eq!(catalog[0].display_name, "agent_order");
         assert_eq!(catalog[0].mention_type, MentionType::Agent);
         assert_eq!(
             catalog[0].selection,
             Selection::Tool {
-                insert_text: "@cashpoint".to_string(),
-                path: Some("agent://cashpoint".to_string()),
+                insert_text: "@agent_order".to_string(),
+                path: Some("agent://agent_order".to_string()),
             }
         );
     }

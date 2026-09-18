@@ -90,7 +90,7 @@ checks pass. Do not close parent `JULY_WORKSPACE-sjc` before `.4` completes.
 - Produces: private `visible_command_names(CommandScope) -> Vec<String>`
 - Produces: `InactiveTuiBridge::initial_context(&self) -> Context`
 - Changes: `tui::run_app(initial_context: Context, agents: Vec<String>, ...)
-  -> Result<(), ShellError>`
+-> Result<(), ShellError>`
 - Preserves: `registry::resolve`, `InactiveTuiBridge::dispatch`, and all
   `AppCommand` variants.
 
@@ -542,7 +542,7 @@ fn exact_command_enter_appends_space_before_submit() {
 #[test]
 fn enter_completes_agent_mention() {
     let mut app = App::new(Context::root());
-    app.reduce(AppEvent::Agents(vec!["cashpoint".into(), "cashflow".into()]));
+    app.reduce(AppEvent::Agents(vec!["agent_order".into(), "cashflow".into()]));
     for character in "@cashf".chars() {
         app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
     }
@@ -781,7 +781,7 @@ fn footer_renders_default_mentions_commands_and_error_priority() {
     assert_eq!(terminal.backend().buffer().cell((0, 11)).unwrap().fg, Color::Cyan);
 
     let mut mentions = App::new(Context::root());
-    mentions.reduce(AppEvent::Agents(vec!["cashpoint".into(), "cashflow".into()]));
+    mentions.reduce(AppEvent::Agents(vec!["agent_order".into(), "cashflow".into()]));
     for character in "@cash".chars() {
         mentions.reduce(AppEvent::Key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char(character),
@@ -789,7 +789,7 @@ fn footer_renders_default_mentions_commands_and_error_priority() {
         )));
     }
     terminal.draw(|frame| render(frame, &mentions)).unwrap();
-    assert_eq!(row(&terminal, 11), "Enter/Tab  cashpoint  cashflow");
+    assert_eq!(row(&terminal, 11), "Enter/Tab  agent_order  cashflow");
 
     let mut error = App::new(
         Context::root().with_commands(vec!["/dm".into(), "/status".into()]),

@@ -28,7 +28,7 @@ impl Fixture {
             updated_at: NOW.into(),
         };
         store.create_room(&room).unwrap();
-        let agents: Vec<_> = ["cashpoint", "pay", "ops", "infra"]
+        let agents: Vec<_> = ["agent_order", "pay", "ops", "infra"]
             .into_iter()
             .map(|name| {
                 let agent = Agent {

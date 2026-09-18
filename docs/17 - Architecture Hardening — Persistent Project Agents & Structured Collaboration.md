@@ -142,12 +142,12 @@ A project agent does not automatically have authority over another project agent
 Example:
 
 ```text
-cashpoint → pay
+agent_order → pay
 
 REQUEST:
-Expose payment status for cashpoint.
+Expose payment status for agent_order.
 
-pay → cashpoint
+pay → agent_order
 
 COUNTER:
 Use the existing GET /payments/{id} endpoint instead of

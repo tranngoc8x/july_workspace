@@ -832,9 +832,9 @@ Codex ACP launcher now sets CODEX_PATH
 Không tự thay:
 
 ```text
-cashpoint project path
-cashpoint chosen model
-cashpoint custom instructions
+agent_order project path
+agent_order chosen model
+agent_order custom instructions
 room membership
 ```
 
@@ -1139,12 +1139,12 @@ Update all specs.
 
 Giữ nguyên install pins hiện tại. Theo policy conservative cho 0.x đã được Tony duyệt, Part 2 dùng các requirement sau (từ pin hiện tại đến trước minor kế tiếp):
 
-| Adapter | version_req | install_version |
-| --- | --- | --- |
-| Codex | `>=1.10.0, <2.0.0` | `1.10.0` |
-| Claude | `>=0.70.0, <0.71.0` | `0.70.0` |
-| Claude Rust | `>=0.1.22, <0.2.0` | `0.1.22` |
-| DeepSeek | `>=0.4.26, <0.5.0` | `0.4.26` |
+| Adapter     | version_req         | install_version |
+| ----------- | ------------------- | --------------- |
+| Codex       | `>=1.10.0, <2.0.0`  | `1.10.0`        |
+| Claude      | `>=0.70.0, <0.71.0` | `0.70.0`        |
+| Claude Rust | `>=0.1.22, <0.2.0`  | `0.1.22`        |
+| DeepSeek    | `>=0.4.26, <0.5.0`  | `0.4.26`        |
 
 Validate mỗi install_version thỏa version_req bằng SemVer; không coi mọi version 0.x tương thích. Các version cũ trong ví dụ minh họa không thay thế bảng pin này.
 

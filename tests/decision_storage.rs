@@ -61,7 +61,7 @@ fn agent(name: &str) -> Agent {
 struct Seeded {
     thread_id: ConversationId,
     work_id: WorkItemId,
-    cashpoint: AgentId,
+    agent_order: AgentId,
     pay: AgentId,
     architect: AgentId,
 }
@@ -88,11 +88,11 @@ fn seed(path: &Path) -> Seeded {
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
     };
-    let cashpoint = agent("cashpoint");
+    let agent_order = agent("agent_order");
     let pay = agent("pay");
     let architect = agent("architect");
     store.insert_room(&room).unwrap();
-    for member in [&cashpoint, &pay, &architect] {
+    for member in [&agent_order, &pay, &architect] {
         store.insert_agent(member).unwrap();
         store
             .add_room_member(room.id, member.id, None, CREATED)
@@ -104,13 +104,13 @@ fn seed(path: &Path) -> Seeded {
             &thread,
             work_id,
             "tony",
-            &[cashpoint.id, pay.id, architect.id],
+            &[agent_order.id, pay.id, architect.id],
         )
         .unwrap();
     Seeded {
         thread_id: thread.id,
         work_id,
-        cashpoint: cashpoint.id,
+        agent_order: agent_order.id,
         pay: pay.id,
         architect: architect.id,
     }
@@ -121,7 +121,7 @@ fn proposal(seeded: &Seeded) -> Handoff {
         id: Default::default(),
         thread_id: seeded.thread_id,
         work_id: seeded.work_id,
-        from_agent_id: seeded.cashpoint,
+        from_agent_id: seeded.agent_order,
         to_agent_id: seeded.pay,
         status: HandoffStatus::Proposed,
         reason: Some("Pay owns delivery".into()),
@@ -142,7 +142,7 @@ fn rejection(seeded: &Seeded, evidence: &str) -> HandoffResponse {
         "Pay returns transaction_ref per the current contract",
         vec![evidence.into()],
     )
-    .with_proposed_owner(seeded.cashpoint)
+    .with_proposed_owner(seeded.agent_order)
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn a_challenge_inside_the_budget_reopens_the_proposal() {
     let (challenged, decision) = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["log:callback_timeout".into()]),
+            &HandoffChallenge::new(seeded.agent_order, vec!["log:callback_timeout".into()]),
             ROUND_TWO,
         )
         .unwrap();
@@ -200,7 +200,7 @@ fn an_exhausted_dispute_escalates_to_needs_decision_and_stops() {
     store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["log:callback_timeout".into()]),
+            &HandoffChallenge::new(seeded.agent_order, vec!["log:callback_timeout".into()]),
             ROUND_ONE,
         )
         .unwrap();
@@ -215,7 +215,7 @@ fn an_exhausted_dispute_escalates_to_needs_decision_and_stops() {
     let (disputed, decision) = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["commit:9f21a".into()]),
+            &HandoffChallenge::new(seeded.agent_order, vec!["commit:9f21a".into()]),
             ROUND_TWO,
         )
         .unwrap();
@@ -227,14 +227,14 @@ fn an_exhausted_dispute_escalates_to_needs_decision_and_stops() {
     assert_eq!(decision.status, DecisionStatus::NeedsDecision);
     assert_eq!(decision.decision_type, DecisionType::Ownership);
     assert_eq!(decision.decision_owner, DecisionOwner::User);
-    assert_eq!(decision.participants, vec![seeded.cashpoint, seeded.pay]);
+    assert_eq!(decision.participants, vec![seeded.agent_order, seeded.pay]);
     assert!(decision.evidence.contains(&"commit:9f21a".to_owned()));
 
     // No further automatic turns: neither side may keep the loop running.
     let error = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["commit:aa11b".into()]),
+            &HandoffChallenge::new(seeded.agent_order, vec!["commit:aa11b".into()]),
             DECIDED,
         )
         .unwrap_err();
@@ -264,7 +264,7 @@ fn a_challenge_without_new_evidence_is_refused() {
     let error = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, Vec::new()),
+            &HandoffChallenge::new(seeded.agent_order, Vec::new()),
             ROUND_TWO,
         )
         .unwrap_err();
@@ -298,7 +298,7 @@ fn only_the_source_agent_may_challenge() {
         .unwrap_err();
 
     assert!(
-        matches!(error, StoreError::HandoffSourceMismatch { expected, .. } if expected == seeded.cashpoint),
+        matches!(error, StoreError::HandoffSourceMismatch { expected, .. } if expected == seeded.agent_order),
         "unexpected error: {error}"
     );
 }
@@ -311,7 +311,7 @@ fn escalate(store: &mut SqliteStore, seeded: &Seeded, owner: DecisionOwner) -> (
     store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["log:timeout".into()]).decided_by(owner),
+            &HandoffChallenge::new(seeded.agent_order, vec!["log:timeout".into()]).decided_by(owner),
             ROUND_ONE,
         )
         .unwrap();
@@ -325,7 +325,7 @@ fn escalate(store: &mut SqliteStore, seeded: &Seeded, owner: DecisionOwner) -> (
     let (handoff, decision) = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.cashpoint, vec!["commit:9f21a".into()]).decided_by(owner),
+            &HandoffChallenge::new(seeded.agent_order, vec!["commit:9f21a".into()]).decided_by(owner),
             ROUND_TWO,
         )
         .unwrap();
@@ -350,7 +350,7 @@ fn the_user_decides_a_dispute_and_ownership_follows_the_decision() {
                     "The contract is stable",
                     vec!["test:payment_contract".into()],
                 )
-                .assigning_owner(seeded.cashpoint),
+                .assigning_owner(seeded.agent_order),
             DECIDED,
         )
         .unwrap();
@@ -368,7 +368,7 @@ fn the_user_decides_a_dispute_and_ownership_follows_the_decision() {
             .unwrap()
             .unwrap()
             .owner_agent_id,
-        Some(seeded.cashpoint)
+        Some(seeded.agent_order)
     );
 }
 
@@ -485,7 +485,7 @@ fn technical_decision(seeded: &Seeded) -> Decision {
         selected_proposal_id: None,
         alternatives: vec!["retry in Pay".into(), "durable queue".into()],
         evidence: vec!["doc:sla".into()],
-        participants: vec![seeded.cashpoint, seeded.pay],
+        participants: vec![seeded.agent_order, seeded.pay],
         decision_owner: DecisionOwner::User,
         status: DecisionStatus::Pending,
         supersedes_decision_id: None,

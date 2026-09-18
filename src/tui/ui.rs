@@ -186,7 +186,7 @@ mod tests {
             height: 16,
         });
         app.reduce(AppEvent::Agents(vec![
-            "cashpoint".into(),
+            "agent_order".into(),
             "cashflow".into(),
         ]));
         let mut terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
@@ -215,7 +215,7 @@ mod tests {
         type_text(&mut app, "@cash");
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let mention = screen(&terminal);
-        assert!(mention.contains("cashpoint"), "mention popup:\n{mention}");
+        assert!(mention.contains("agent_order"), "mention popup:\n{mention}");
         assert!(mention.contains("cashflow"), "mention popup:\n{mention}");
         assert!(
             mention.contains("Agent"),
@@ -234,16 +234,16 @@ mod tests {
             width: 40,
             height: 16,
         });
-        let cashpoint = AgentId::from(ulid::Ulid::from(1u128));
+        let agent_order = AgentId::from(ulid::Ulid::from(1u128));
         let pay = AgentId::from(ulid::Ulid::from(2u128));
-        for (agent, label) in [(cashpoint, "cashpoint"), (pay, "pay")] {
+        for (agent, label) in [(agent_order, "agent_order"), (pay, "pay")] {
             app.reduce(AppEvent::AgentStreamStarted {
                 agent,
                 label: label.to_owned(),
             });
         }
         app.reduce(AppEvent::AgentStreamDelta {
-            agent: cashpoint,
+            agent: agent_order,
             delta: "Checking callback handler...".into(),
         });
         app.reduce(AppEvent::AgentStreamDelta {
@@ -252,7 +252,7 @@ mod tests {
         });
         let screen = app.transcript_text_for_tests();
         for expected in [
-            "cashpoint",
+            "agent_order",
             "Checking callback handler...",
             "pay",
             "Inspecting refund state...",

@@ -29,7 +29,6 @@ Do not turn July into a slash-command agent router.
 
 ---
 
-
 ## 1.1 Locked decisions for this revision
 
 The following decisions are canonical for this consolidation:
@@ -78,6 +77,7 @@ Provide a small read-only surface:
 Priority:
 
 **P0**
+
 ```text
 /help
 /rooms
@@ -85,6 +85,7 @@ Priority:
 ```
 
 **P1**
+
 ```text
 /members
 /work
@@ -92,6 +93,7 @@ Priority:
 ```
 
 **Optional / follow-up**
+
 ```text
 /activity
 ```
@@ -388,7 +390,7 @@ These belong to the collaboration protocol.
 Example:
 
 ```text
-Cashpoint
+AgentOrder
     ↓
 Handoff
     ↓
@@ -404,7 +406,6 @@ Decision
 The user should observe or intervene only when necessary.
 
 ---
-
 
 ## 9.5 Agent onboarding
 
@@ -437,8 +438,8 @@ Adding an agent creates a persistent logical Agent identity and binds it to a pr
 Example:
 
 ```bash
-july agent add cashpoint \
-  --project ~/work/cashpoint \
+july agent add agent_order \
+  --project ~/work/agent_order \
   --runtime codex
 ```
 
@@ -446,13 +447,13 @@ Conceptually:
 
 ```text
 Project
-  id: cashpoint
-  root: ~/work/cashpoint
+  id: agent_order
+  root: ~/work/agent_order
        │
        owns
        ▼
 Agent
-  id: cashpoint
+  id: agent_order
   runtime_preference: codex
 ```
 
@@ -465,13 +466,13 @@ Runtime/session creation remains lazy.
 Example:
 
 ```text
-july agent add cashpoint
+july agent add agent_order
         ↓
 persistent Agent exists
         ↓
 no active model session required
         ↓
-user opens /dm cashpoint
+user opens /dm agent_order
         ↓
 July creates or resumes conversation/session
         ↓
@@ -488,7 +489,7 @@ Example:
 > /agents
 
 AGENT        PROJECT                    RUNTIME
-cashpoint    ~/work/cashpoint           codex
+agent_order    ~/work/agent_order           codex
 pay          ~/work/pay                 claude
 infra        ~/work/infra               codex
 ```
@@ -508,7 +509,7 @@ Add a project agent with:
 Opening a DM resolves the logical agent first:
 
 ```text
-/dm cashpoint
+/dm agent_order
     ↓
 resolve Agent identity
     ↓
@@ -579,17 +580,17 @@ Room membership
 Example:
 
 ```bash
-july agent add cashpoint \
-  --project ~/repos/cashpoint \
+july agent add agent_order \
+  --project ~/repos/agent_order \
   --runtime codex
 
-july room member add vna cashpoint
+july room member add vna agent_order
 ```
 
 A single project-owned agent may belong to multiple Rooms without duplicating its identity:
 
 ```text
-cashpoint
+agent_order
 ├── VNA
 ├── GrabGift
 └── Loyalty
@@ -892,30 +893,30 @@ REMOVE
 
 Initial target:
 
-| Command | Action |
-|---|---|
-| `/dm` | KEEP |
-| `/room` | KEEP |
-| `/thread` | KEEP |
-| `/back` | KEEP |
-| `/help` | ADD |
-| `/help <command>` | ADD |
-| `/thread new` | ADD |
-| `/publish` | KEEP |
-| `/restart` | ADD |
-| `/exit` | KEEP/ADD as canonical REPL exit |
-| `/quit` | alias to `/exit` |
-| `/work` | KEEP, read-only |
-| `/work block` | REDUCE |
-| `/work ready` | REDUCE |
-| `/ask` | REMOVE if present |
-| `/delegate` | REMOVE if present |
-| `/handoff` | REMOVE if present |
-| `/activity` | OPTIONAL; only if application API already exists |
-| `/agents` | KEEP, read-only |
-| `july agent add/list/show/remove` | KEEP/ADD as administrative CLI/API |
-| REPL `/agent add` or `/agents add` | DO NOT ADD |
-| A2A commands | DO NOT ADD |
+| Command                            | Action                                           |
+| ---------------------------------- | ------------------------------------------------ |
+| `/dm`                              | KEEP                                             |
+| `/room`                            | KEEP                                             |
+| `/thread`                          | KEEP                                             |
+| `/back`                            | KEEP                                             |
+| `/help`                            | ADD                                              |
+| `/help <command>`                  | ADD                                              |
+| `/thread new`                      | ADD                                              |
+| `/publish`                         | KEEP                                             |
+| `/restart`                         | ADD                                              |
+| `/exit`                            | KEEP/ADD as canonical REPL exit                  |
+| `/quit`                            | alias to `/exit`                                 |
+| `/work`                            | KEEP, read-only                                  |
+| `/work block`                      | REDUCE                                           |
+| `/work ready`                      | REDUCE                                           |
+| `/ask`                             | REMOVE if present                                |
+| `/delegate`                        | REMOVE if present                                |
+| `/handoff`                         | REMOVE if present                                |
+| `/activity`                        | OPTIONAL; only if application API already exists |
+| `/agents`                          | KEEP, read-only                                  |
+| `july agent add/list/show/remove`  | KEEP/ADD as administrative CLI/API               |
+| REPL `/agent add` or `/agents add` | DO NOT ADD                                       |
+| A2A commands                       | DO NOT ADD                                       |
 
 Do not delete a command solely because it is not exposed in REPL; first determine whether it is still useful as an administrative/application API.
 
@@ -1088,7 +1089,7 @@ docs/08-RUNTIME-AND-CLI.md
 Cover:
 
 ```text
-/dm cashpoint
+/dm agent_order
 /room vna
 /thread abc
 /back
@@ -1166,7 +1167,7 @@ No LLM-based target inference is allowed.
 Verify:
 
 ```text
-july agent add cashpoint --project <path> --runtime codex
+july agent add agent_order --project <path> --runtime codex
 ```
 
 creates a persistent logical agent and project binding.
@@ -1175,7 +1176,7 @@ Verify:
 
 - adding an agent does not start an AgentSession;
 - `/agents` shows the new logical agent;
-- `/dm cashpoint` lazily creates/resumes its runtime session;
+- `/dm agent_order` lazily creates/resumes its runtime session;
 - runtime/session restart does not replace logical agent identity;
 - runtime preference can change without changing agent identity;
 - adding an agent does not add Room membership;
@@ -1280,10 +1281,10 @@ $ july
 July
 ┌─ VNA
 │  ├─ #payment
-│  └─ #cashpoint
+│  └─ #agent_order
 │
 ├─ DMs
-│  ├─ cashpoint
+│  ├─ agent_order
 │  └─ pay
 │
 └─ Activity
@@ -1294,7 +1295,7 @@ July
 Administrative onboarding example:
 
 ```bash
-july agent add cashpoint --project ~/work/cashpoint --runtime codex
+july agent add agent_order --project ~/work/agent_order --runtime codex
 july agent add pay --project ~/work/pay --runtime claude
 ```
 
@@ -1302,7 +1303,7 @@ Interactive REPL remains simple:
 
 ```text
 /agents
-/dm cashpoint
+/dm agent_order
 ```
 
 Typical interaction:
@@ -1320,7 +1321,7 @@ Typical interaction:
 Agents communicate independently:
 
 ```text
-Cashpoint
+AgentOrder
     ↕
 collaboration protocol
     ↕

@@ -512,7 +512,7 @@ fn repl_help_is_context_aware_and_explains_one_command() {
 fn repl_agents_is_inspection_only_and_guides_onboarding_when_empty() {
     let workspace = TestWorkspace::new();
 
-    let empty = workspace.repl("/agents\n/agents add cashpoint\n/quit\n");
+    let empty = workspace.repl("/agents\n/agents add agent_order\n/quit\n");
     assert!(empty.status.success(), "stderr: {}", stderr(&empty));
     assert!(stderr(&empty).contains(
         "no agents configured; add one with: \
@@ -2337,7 +2337,7 @@ fn repl_help_teaches_mentions_and_hides_threads() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let stdout_output = stdout(&output);
-    assert!(stdout_output.contains("@cashpoint @pay implement refund flow"));
+    assert!(stdout_output.contains("@agent_order @pay implement refund flow"));
     assert!(stdout_output.contains("/work [work]"));
     assert!(!stdout_output.contains("/thread"));
 }
@@ -2993,12 +2993,12 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
         content = message["params"]["prompt"][0]["text"]
         trigger = content.split("Current message:\nMessage: ", 1)[1].split("\n", 1)[0]
         args = {
-            "targets": ["pay"] if role == "cashpoint" else [],
-            "body": "check shared refund contract" if role == "cashpoint" else "shared refund answer",
+            "targets": ["pay"] if role == "agent_order" else [],
+            "body": "check shared refund contract" if role == "agent_order" else "shared refund answer",
             "reply_to": trigger,
             "request_id": "shared-reply",
         }
-        if role == "cashpoint" and os.environ["ROOM_TEST_STRUCTURED"] == "true":
+        if role == "agent_order" and os.environ["ROOM_TEST_STRUCTURED"] == "true":
             args["work"] = {"action": "create", "title": "Implement refund contract", "goal": "Return test evidence"}
         config = dict(room_configs[session_id][0])
         config["command"] = os.environ["ROOM_TEST_JULY"]
@@ -3007,11 +3007,11 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
         assert results[2]["result"] == results[3]["result"], results
 "#;
         std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
-        let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+        let agent_order = workspace.seed_acp_agent("agent_order", &["--no-permission"]);
         let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
         let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
         let connection = Connection::open(&workspace.database).unwrap();
-        for agent in [&cashpoint, &pay, &idle] {
+        for agent in [&agent_order, &pay, &idle] {
             workspace.add_member(&room, agent);
             let mut config = agent.transport_config.clone();
             config["arguments"][0] = json!(fixture);
@@ -3038,7 +3038,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             app.reduce(opened);
             let origin = app.context().id().clone();
             bridge
-                .dispatch(tui_command(&mut app, "@cashpoint investigate refund"))
+                .dispatch(tui_command(&mut app, "@agent_order investigate refund"))
                 .unwrap();
             let mut publications = 0;
             tokio::time::timeout(Duration::from_secs(15), async {
@@ -3062,7 +3062,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             bridge.shutdown().await.unwrap();
             transcript
         } else {
-            let output = workspace.repl("/room vna\n@cashpoint investigate refund\n/quit\n");
+            let output = workspace.repl("/room vna\n@agent_order investigate refund\n/quit\n");
             assert!(
                 output.status.success() && stderr(&output).is_empty(),
                 "structured={structured}: {}",
@@ -3085,7 +3085,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             "{transcript}"
         );
         assert!(!transcript.contains("fixture reply"));
-        for name in ["cashpoint", "pay"] {
+        for name in ["agent_order", "pay"] {
             let prompts =
                 std::fs::read_to_string(workspace.root.join(format!("{name}.prompts"))).unwrap();
             assert_eq!(prompts.lines().count(), 1, "no reactivation of {name}");
@@ -3096,7 +3096,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
         assert_eq!(messages.len(), 3);
         let request = messages
             .iter()
-            .find(|m| m.sender_id == cashpoint.id.to_string())
+            .find(|m| m.sender_id == agent_order.id.to_string())
             .unwrap();
         let reply = messages
             .iter()
@@ -3130,7 +3130,7 @@ async fn room_a2a_shared_reply_is_visible_once_without_waking_other_members() {
             assert_eq!(work.scope, WorkScope::Room(room.id));
             assert_eq!(work.owner_agent_id, Some(pay.id));
             assert_eq!(binding_room, room.id.to_string());
-            assert_eq!(requester, cashpoint.id.to_string());
+            assert_eq!(requester, agent_order.id.to_string());
             assert_eq!(owner, pay.id.to_string());
             let prompts = std::fs::read_to_string(workspace.root.join("pay.prompts")).unwrap();
             assert!(prompts.contains(&work_id));
@@ -3211,7 +3211,7 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
             while not (gate / name).exists():
                 assert time.monotonic() < deadline, name
                 time.sleep(0.005)
-        if role == "cashpoint":
+        if role == "agent_order":
             wait_for("pay-started")
             args = {"targets": ["pay"], "body": "explicit shared refund answer", "request_id": "same-publication"}
             config = dict(room_configs[session_id][0])
@@ -3226,11 +3226,11 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
             wait_for("release-pay")
 "#;
     std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
-    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let agent_order = workspace.seed_acp_agent("agent_order", &["--no-permission"]);
     let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
     let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
     let connection = Connection::open(&workspace.database).unwrap();
-    for agent in [&cashpoint, &pay, &idle] {
+    for agent in [&agent_order, &pay, &idle] {
         workspace.add_member(&room, agent);
         let mut config = agent.transport_config.clone();
         config["arguments"][0] = json!(fixture);
@@ -3255,7 +3255,7 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
         .unwrap();
     app.reduce(opened);
     bridge
-        .dispatch(tui_command(&mut app, "@cashpoint @pay investigate refund"))
+        .dispatch(tui_command(&mut app, "@agent_order @pay investigate refund"))
         .unwrap();
     let mut publications = 0;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -3292,7 +3292,7 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
     };
-    assert_eq!(prompts("cashpoint").len(), 1);
+    assert_eq!(prompts("agent_order").len(), 1);
     let received = prompts("pay");
     assert_eq!(received.len(), 2);
     assert!(!received[0].contains("explicit shared refund answer"));
@@ -3308,7 +3308,7 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
         .iter()
         .find(|message| message.sender_type == MemberType::Agent)
         .unwrap();
-    assert_eq!(published.sender_id, cashpoint.id.to_string());
+    assert_eq!(published.sender_id, agent_order.id.to_string());
     assert_eq!(published.mentions, vec![pay.id]);
     for table in ["conversations", "messages", "work_items"] {
         assert_eq!(
@@ -3363,7 +3363,7 @@ async fn room_a2a_stalled_recipient_does_not_hide_sender_permission_and_can_be_c
 "#,
     );
     std::fs::write(&fixture, source).unwrap();
-    let sender = workspace.seed_agent("cashpoint");
+    let sender = workspace.seed_agent("agent_order");
     let slow = workspace.seed_acp_agent("slow", &["--hang-new"]);
     let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
     let connection = Connection::open(&workspace.database).unwrap();
@@ -3391,7 +3391,7 @@ async fn room_a2a_stalled_recipient_does_not_hide_sender_permission_and_can_be_c
         .unwrap();
     app.reduce(event);
     bridge
-        .dispatch(tui_command(&mut app, "@cashpoint investigate"))
+        .dispatch(tui_command(&mut app, "@agent_order investigate"))
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while app.permission().is_none() {
@@ -3460,7 +3460,7 @@ async fn room_a2a_stalled_recipient_does_not_hide_sender_permission_and_can_be_c
 fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
     let workspace = TestWorkspace::new();
     let room = workspace.seed_room("vna");
-    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let agent_order = workspace.seed_acp_agent("agent_order", &["--no-permission"]);
     let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
     let fixture = workspace.root.join("room_restart.py");
     let marker = "        if \"--room-mcp\" in sys.argv:";
@@ -3470,12 +3470,12 @@ fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
         trigger = current.split("\n", 1)[0]
         recovered = "Recovered shared Room context." in content
         args = {
-            "targets": ["pay"] if role == "cashpoint" else [],
-            "body": "delegated restart contract" if role == "cashpoint" else ("recovered shared answer" if recovered else "initial shared answer"),
+            "targets": ["pay"] if role == "agent_order" else [],
+            "body": "delegated restart contract" if role == "agent_order" else ("recovered shared answer" if recovered else "initial shared answer"),
             "reply_to": trigger,
             "request_id": "stable-publication",
         }
-        if role == "cashpoint":
+        if role == "agent_order":
             args["work"] = {"action": "create", "title": "Restart contract", "goal": "Keep task identity"}
         config = dict(room_configs[session_id][0])
         config["command"] = os.environ["ROOM_TEST_JULY"]
@@ -3489,7 +3489,7 @@ fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
     )
     .unwrap();
     let connection = Connection::open(&workspace.database).unwrap();
-    for agent in [&cashpoint, &pay] {
+    for agent in [&agent_order, &pay] {
         workspace.add_member(&room, agent);
         let mut config = agent.transport_config.clone();
         config["arguments"][0] = json!(fixture);
@@ -3505,7 +3505,7 @@ fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
             )
             .unwrap();
     }
-    let first = workspace.repl("/room vna\n@cashpoint start contract\n/quit\n");
+    let first = workspace.repl("/room vna\n@agent_order start contract\n/quit\n");
     assert!(
         first.status.success() && stderr(&first).is_empty(),
         "{}",
@@ -3602,7 +3602,7 @@ fn room_a2a_restart_replaces_missing_acp_session_and_preserves_shared_work() {
     assert!(prompts[1].contains(&format!("A2A Task: {}", shared.binding.task_id)));
     assert!(!prompts[1].contains("fixture reply"));
     assert_eq!(
-        std::fs::read_to_string(workspace.root.join("cashpoint.prompts"))
+        std::fs::read_to_string(workspace.root.join("agent_order.prompts"))
             .unwrap()
             .lines()
             .count(),
@@ -3633,25 +3633,25 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
         if not initial.exists():
             publish(role + " initial public reply", [], "initial")
             initial.write_text("published")
-            if role == "cashpoint":
+            if role == "agent_order":
                 deadline = time.monotonic() + 10
                 while not (gate / "pay-initial").exists():
                     assert time.monotonic() < deadline, "pay initial reply"
                     time.sleep(0.005)
                 publish("Is payment_ref the payment identifier?", ["pay"], "question")
         elif role == "pay":
-            publish("Use reference_id for the payment identifier.", ["cashpoint"], "answer")
-        elif role == "cashpoint":
-            publish("Confirmed: cashpoint will use reference_id.", [], "final")
+            publish("Use reference_id for the payment identifier.", ["agent_order"], "answer")
+        elif role == "agent_order":
+            publish("Confirmed: agent_order will use reference_id.", [], "final")
         else:
             raise AssertionError("idle agent must not activate")
 "#;
     std::fs::write(&fixture, source.replace(marker, &format!("{hook}{marker}"))).unwrap();
-    let cashpoint = workspace.seed_acp_agent("cashpoint", &["--no-permission"]);
+    let agent_order = workspace.seed_acp_agent("agent_order", &["--no-permission"]);
     let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
     let idle = workspace.seed_acp_agent("idle", &["--no-permission"]);
     let connection = Connection::open(&workspace.database).unwrap();
-    for agent in [&cashpoint, &pay, &idle] {
+    for agent in [&agent_order, &pay, &idle] {
         workspace.add_member(&room, agent);
         let mut config = agent.transport_config.clone();
         config["arguments"][0] = json!(fixture);
@@ -3668,7 +3668,7 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
             )
             .unwrap();
     }
-    let output = workspace.repl("/room vna\n@cashpoint @pay review payment contract\n/quit\n");
+    let output = workspace.repl("/room vna\n@agent_order @pay review payment contract\n/quit\n");
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).is_empty(), "{}", stderr(&output));
     let transcript = stdout(&output);
@@ -3677,14 +3677,14 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
     let messages = store.list_recent_room_messages(room.id, 20).unwrap().0;
     assert_eq!(messages.len(), 6, "{transcript}");
     assert_eq!(messages[0].sender_type, MemberType::User);
-    assert_eq!(messages[0].mentions, vec![cashpoint.id, pay.id]);
+    assert_eq!(messages[0].mentions, vec![agent_order.id, pay.id]);
     for message in &messages[1..] {
         assert_eq!(message.room_id, room.id);
         assert_eq!(message.sender_type, MemberType::Agent);
         assert_eq!(transcript.matches(&message.body).count(), 1, "{transcript}");
         assert!(!message.body.contains("fixture reply"));
     }
-    for agent in [&cashpoint, &pay] {
+    for agent in [&agent_order, &pay] {
         let initial = messages[1..3]
             .iter()
             .find(|m| m.sender_id == agent.id.to_string())
@@ -3722,17 +3722,17 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
     }
     let question = &messages[3];
     assert_eq!(question.body, "Is payment_ref the payment identifier?");
-    assert_eq!(question.sender_id, cashpoint.id.to_string());
+    assert_eq!(question.sender_id, agent_order.id.to_string());
     assert_eq!(question.mentions, vec![pay.id]);
     let answer = &messages[4];
     assert_eq!(answer.body, "Use reference_id for the payment identifier.");
     assert_eq!(answer.sender_id, pay.id.to_string());
-    assert_eq!(answer.mentions, vec![cashpoint.id]);
+    assert_eq!(answer.mentions, vec![agent_order.id]);
     assert_eq!(answer.reply_to, Some(question.id));
     let final_reply = &messages[5];
     assert_eq!(
         final_reply.body,
-        "Confirmed: cashpoint will use reference_id."
+        "Confirmed: agent_order will use reference_id."
     );
     assert_eq!(final_reply.sender_id, cashpoint.id.to_string());
     assert_eq!(final_reply.reply_to, Some(answer.id));

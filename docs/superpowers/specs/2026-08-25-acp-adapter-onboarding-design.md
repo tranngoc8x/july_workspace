@@ -59,12 +59,12 @@ pub struct AdapterSpec {
 
 Danh mục ban đầu:
 
-| id | package | version | installer | tier |
-|---|---|---|---|---|
-| `codex` | `@agentclientprotocol/codex-acp` | 1.6.2 | Npm | Core |
-| `claude` | `@agentclientprotocol/claude-agent-acp` | 0.70.0 | Npm | Core |
-| `claude-rust` | `claude-code-acp-rs` | 0.1.22 | Cargo | Optional |
-| `deepseek` | `@openma/deepseek-harness-acp` | 0.4.26 | Npm | Optional |
+| id            | package                                 | version | installer | tier     |
+| ------------- | --------------------------------------- | ------- | --------- | -------- |
+| `codex`       | `@agentclientprotocol/codex-acp`        | 1.6.2   | Npm       | Core     |
+| `claude`      | `@agentclientprotocol/claude-agent-acp` | 0.70.0  | Npm       | Core     |
+| `claude-rust` | `claude-code-acp-rs`                    | 0.1.22  | Cargo     | Optional |
+| `deepseek`    | `@openma/deepseek-harness-acp`          | 0.4.26  | Npm       | Optional |
 
 Hai adapter Core cùng org với crate `agent-client-protocol` mà july đang pin `=2.0.0`, nên
 đồng bộ handshake tốt nhất. `claude-rust` dành cho máy không có node, đánh đổi là biên dịch
@@ -86,7 +86,7 @@ Quản lý `~/.july/adapters`:
   - `Cargo`: `cargo install <crate> --version <version> --root ~/.july/adapters`
 - Việc hỏi danh tính adapter gọi sang `transport::probe_agent_identity(executable, arguments)`
   - spawn adapter, gửi `initialize`, đọc `agent_info`, dừng. Hàm này nằm trong `transport`
-  chứ không nằm trong `store`, để giữ bất biến "chỉ tầng transport nói ACP".
+    chứ không nằm trong `store`, để giữ bất biến "chỉ tầng transport nói ACP".
 - `config_for(id, agent_name) -> serde_json::Value` - sinh `transport_config` đầy đủ.
 
 Store không biết stdin.
@@ -176,19 +176,19 @@ tức là `agent add` sẽ từ chối nó - chặn ở `init` thay vì để l�
 ## 6. Thay đổi ở `agent add`
 
 ```
-july agent add cashpoint --project ~/webroot/cashpoint --adapter codex
+july agent add agent_order --project ~/webroot/agent_order --adapter codex
 ```
 
-`store::config_for("codex", "cashpoint")` sinh sáu field:
+`store::config_for("codex", "agent_order")` sinh sáu field:
 
-| Field | Nguồn |
-|---|---|
-| `executable` | `identities.json`, đường dẫn tuyệt đối |
-| `arguments` | `AdapterSpec`, mặc định `[]` |
-| `environment` | `{}` |
-| `state_directory` | `~/.july/state/<agent-name>`, july `create_dir_all` |
-| `expected_agent_name` | `identities.json`, tên thật lấy lúc verify |
-| `expected_agent_version` | `identities.json`, version thật lấy lúc verify |
+| Field                    | Nguồn                                               |
+| ------------------------ | --------------------------------------------------- |
+| `executable`             | `identities.json`, đường dẫn tuyệt đối              |
+| `arguments`              | `AdapterSpec`, mặc định `[]`                        |
+| `environment`            | `{}`                                                |
+| `state_directory`        | `~/.july/state/<agent-name>`, july `create_dir_all` |
+| `expected_agent_name`    | `identities.json`, tên thật lấy lúc verify          |
+| `expected_agent_version` | `identities.json`, version thật lấy lúc verify      |
 
 `state_directory` nằm dưới `~/.july/state/` chứ không phải trong repo của người dùng: repo
 sạch, july kiểm soát được quyền ghi mà `verify_writable` (src/transport/acp.rs:450) đòi, và
@@ -203,13 +203,13 @@ database, vá đúng chỗ kẹt đã mô tả ở mục 1.
 
 ## 7. Xử lý lỗi
 
-| Tình huống | Hành xử |
-|---|---|
-| `npm` hoặc `cargo` không có trên PATH | Fail trước khi cài gì, in adapter nào cần trình cài nào |
-| Cài fail giữa danh sách | Giữ adapter đã cài xong, báo rõ cái fail, exit code khác 0, lần sau `init` cài tiếp cái còn thiếu |
-| Verify handshake fail hoặc treo | Timeout 30s, không ghi `identities.json`, adapter coi như chưa dùng được |
-| `q` hoặc Ctrl-C giữa màn chọn | Guard `Drop` restore termios, không cài gì, exit 0 |
-| Adapter đã cài, chạy `init` lần hai | Hiện trạng thái đã cài và bản mới nếu có, space để cập nhật |
+| Tình huống                            | Hành xử                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `npm` hoặc `cargo` không có trên PATH | Fail trước khi cài gì, in adapter nào cần trình cài nào                                           |
+| Cài fail giữa danh sách               | Giữ adapter đã cài xong, báo rõ cái fail, exit code khác 0, lần sau `init` cài tiếp cái còn thiếu |
+| Verify handshake fail hoặc treo       | Timeout 30s, không ghi `identities.json`, adapter coi như chưa dùng được                          |
+| `q` hoặc Ctrl-C giữa màn chọn         | Guard `Drop` restore termios, không cài gì, exit 0                                                |
+| Adapter đã cài, chạy `init` lần hai   | Hiện trạng thái đã cài và bản mới nếu có, space để cập nhật                                       |
 
 ## 8. Kiểm chứng
 
@@ -229,8 +229,8 @@ lần đầu.
 
 ## 9. Việc dọn dẹp còn nợ
 
-Agent `cashpoint` trên máy dev hiện đang mang `transport_config` do người viết tay
-(`state_directory` trỏ `/Users/tranngocthang/webroot/cashpoint/.codex`, `expected_agent_*`
+Agent `agent_order` trên máy dev hiện đang mang `transport_config` do người viết tay
+(`state_directory` trỏ `/Users/tranngocthang/webroot/agent_order/.codex`, `expected_agent_*`
 đoán theo codex-acp 1.1.13 và chưa được verify). Sau khi `july init` và
 `july agent update` chạy được, chuyển agent này sang config sinh tự động và xoá bản backup
 `~/.july/workspace.db.bak-*`.

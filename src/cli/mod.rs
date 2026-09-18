@@ -4968,7 +4968,7 @@ mod tests {
                 ["NAME", "STATUS"],
                 vec![
                     ["支付".into(), "active".into()],
-                    ["Cashpoint".into(), "idle".into()],
+                    ["AgentOrder".into(), "idle".into()],
                 ],
             ),
             "NAME       STATUS\n---------  ------\n支付       active\nCashpoint  idle"

@@ -60,20 +60,20 @@ Examples:
 ### Ownership dispute
 
 ```text
-cashpoint:
+agent_order:
 This issue belongs to Pay.
 
 pay:
 I checked Pay.
 The contract is correct.
-This belongs to Cashpoint.
+This belongs to AgentOrder.
 ```
 
 ### Technical debate
 
 ```text
-cashpoint:
-Retry in Cashpoint.
+agent_order:
+Retry in AgentOrder.
 
 pay:
 Retry belongs to Pay because Pay owns delivery.
@@ -325,11 +325,8 @@ Example:
 {
   "decision": "REJECT",
   "reason": "Pay returns transaction_ref according to the current contract.",
-  "evidence": [
-    "src/payment/callback.rs",
-    "test:payment_contract"
-  ],
-  "proposed_owner": "cashpoint"
+  "evidence": ["src/payment/callback.rs", "test:payment_contract"],
+  "proposed_owner": "agent_order"
 }
 ```
 
@@ -338,13 +335,9 @@ Partial ownership:
 ```json
 {
   "decision": "PARTIAL",
-  "owned_scope": [
-    "add new callback field"
-  ],
-  "rejected_scope": [
-    "map callback into voucher record"
-  ],
-  "proposed_owner": "cashpoint"
+  "owned_scope": ["add new callback field"],
+  "rejected_scope": ["map callback into voucher record"],
+  "proposed_owner": "agent_order"
 }
 ```
 
@@ -564,7 +557,7 @@ Pay owns callback retry.
 
 Generated work:
 - pay → implement retry
-- cashpoint → integration test
+- agent_order → integration test
 ```
 
 This conversion must be explicit, deterministic and auditable.
@@ -853,13 +846,13 @@ The system must work without the facilitator.
 Required E2E scenario:
 
 ```text
-cashpoint claims Pay owns issue
+agent_order claims Pay owns issue
         ↓
 handoff to pay
         ↓
 pay REJECTS with code/test evidence
         ↓
-cashpoint CHALLENGES with evidence
+agent_order CHALLENGES with evidence
         ↓
 dispute does not loop forever
         ↓
@@ -1025,6 +1018,7 @@ Defer:
 ## Agent loops
 
 Mitigation:
+
 - bounded rounds;
 - explicit state machine;
 - escalation.
@@ -1032,6 +1026,7 @@ Mitigation:
 ## Over-structuring simple work
 
 Mitigation:
+
 - deliberation is optional;
 - simple DM/Thread stays simple.
 
@@ -1052,6 +1047,7 @@ Do not create generic Meeting/Debate/Negotiation entities.
 ## Facilitator becomes another supervisor
 
 Mitigation:
+
 - facilitator receives scoped structured context;
 - recommendation is default;
 - routing/state remain deterministic.

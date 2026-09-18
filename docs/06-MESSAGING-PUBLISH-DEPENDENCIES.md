@@ -16,6 +16,7 @@ downstream Work transition. Agent deliberation (Phase 6.5), session recovery
 ## Messaging goals
 
 Messages should support:
+
 - user ↔ agent DM;
 - agent ↔ agent DM;
 - thread messages;
@@ -28,7 +29,7 @@ Messages should support:
 If user writes:
 
 ```text
-@cashpoint check callback
+@agent_order check callback
 ```
 
 runtime routes directly.
@@ -44,6 +45,7 @@ If Pay is not a member:
 ```
 
 runtime:
+
 1. adds Pay;
 2. creates/resumes Pay thread session;
 3. sends a compact thread capsule;
@@ -88,13 +90,13 @@ Phase 5.4.
 
 Phase 6 uses these explicit transitions:
 
-| From | Allowed targets |
-|---|---|
-| `OPEN` | `WORKING`, `BLOCKED`, `CANCELLED` |
-| `WORKING` | `BLOCKED`, `READY`, `FAILED`, `CANCELLED` |
-| `BLOCKED` | `WORKING`, `FAILED`, `CANCELLED` |
-| `READY` | `DONE` |
-| `DONE`, `FAILED`, `CANCELLED` | none |
+| From                          | Allowed targets                           |
+| ----------------------------- | ----------------------------------------- |
+| `OPEN`                        | `WORKING`, `BLOCKED`, `CANCELLED`         |
+| `WORKING`                     | `BLOCKED`, `READY`, `FAILED`, `CANCELLED` |
+| `BLOCKED`                     | `WORKING`, `FAILED`, `CANCELLED`          |
+| `READY`                       | `DONE`                                    |
+| `DONE`, `FAILED`, `CANCELLED` | none                                      |
 
 An exact transition retry is a no-op. `completed_at` is absent for `OPEN`,
 `WORKING`, `BLOCKED`, and `READY`, and is set exactly for terminal `DONE`,
@@ -135,6 +137,7 @@ Thread auth
 ```
 
 Target gets:
+
 - summary;
 - outputs;
 - evidence;
@@ -200,6 +203,7 @@ finished. `DONE` is the later terminal state after that remaining work.
 ## Quick coordination vs shared work
 
 Use:
+
 - DM for a quick question;
 - Thread for collaboration with lifecycle, owner, state and result.
 

@@ -58,7 +58,7 @@ fn agent(name: &str) -> Agent {
 struct Seeded {
     thread_id: ConversationId,
     work_id: WorkItemId,
-    cashpoint: AgentId,
+    agent_order: AgentId,
     pay: AgentId,
     infra: AgentId,
     outsider: AgentId,
@@ -86,12 +86,12 @@ fn seed(path: &Path) -> Seeded {
         created_at: CREATED.into(),
         updated_at: CREATED.into(),
     };
-    let cashpoint = agent("cashpoint");
+    let agent_order = agent("agent_order");
     let pay = agent("pay");
     let infra = agent("infra");
     let outsider = agent("outsider");
     store.insert_room(&room).unwrap();
-    for member in [&cashpoint, &pay, &infra, &outsider] {
+    for member in [&agent_order, &pay, &infra, &outsider] {
         store.insert_agent(member).unwrap();
         store
             .add_room_member(room.id, member.id, None, CREATED)
@@ -103,13 +103,13 @@ fn seed(path: &Path) -> Seeded {
             &thread,
             work_id,
             "tony",
-            &[cashpoint.id, pay.id, infra.id],
+            &[agent_order.id, pay.id, infra.id],
         )
         .unwrap();
     Seeded {
         thread_id: thread.id,
         work_id,
-        cashpoint: cashpoint.id,
+        agent_order: agent_order.id,
         pay: pay.id,
         infra: infra.id,
         outsider: outsider.id,
@@ -121,7 +121,7 @@ fn proposal(seeded: &Seeded) -> Handoff {
         id: Default::default(),
         thread_id: seeded.thread_id,
         work_id: seeded.work_id,
-        from_agent_id: seeded.cashpoint,
+        from_agent_id: seeded.agent_order,
         to_agent_id: seeded.pay,
         status: HandoffStatus::Proposed,
         reason: Some("Pay owns delivery".into()),
@@ -181,14 +181,14 @@ fn rejecting_a_handoff_keeps_the_owner_and_records_evidence() {
                     "test:payment_contract".into(),
                 ],
             )
-            .with_proposed_owner(seeded.cashpoint),
+            .with_proposed_owner(seeded.agent_order),
             ANSWERED,
         )
         .unwrap();
 
     assert_eq!(rejected.status, HandoffStatus::Rejected);
     assert_eq!(rejected.round_count, 1);
-    assert_eq!(rejected.proposed_owner_id, Some(seeded.cashpoint));
+    assert_eq!(rejected.proposed_owner_id, Some(seeded.agent_order));
     assert_eq!(rejected.evidence.len(), 2);
     assert_eq!(
         store
@@ -242,7 +242,7 @@ fn partial_ownership_records_both_scopes() {
                 vec!["add new callback field".into()],
                 vec!["map callback into voucher record".into()],
             )
-            .with_proposed_owner(seeded.cashpoint),
+            .with_proposed_owner(seeded.agent_order),
             ANSWERED,
         )
         .unwrap();
@@ -355,13 +355,13 @@ fn the_source_agent_resolves_a_rejection_it_accepts() {
         .unwrap();
 
     let resolved = store
-        .resolve_handoff(handoff.id, seeded.cashpoint, CLOSED)
+        .resolve_handoff(handoff.id, seeded.agent_order, CLOSED)
         .unwrap();
     assert_eq!(resolved.status, HandoffStatus::Resolved);
     assert!(!resolved.status.is_open());
 
     let error = store
-        .resolve_handoff(handoff.id, seeded.cashpoint, CLOSED)
+        .resolve_handoff(handoff.id, seeded.agent_order, CLOSED)
         .unwrap_err();
     assert!(
         matches!(error, StoreError::InvalidHandoffTransition { .. }),
@@ -380,12 +380,12 @@ fn only_the_source_agent_may_resolve_or_cancel() {
         .cancel_handoff(handoff.id, seeded.pay, CLOSED)
         .unwrap_err();
     assert!(
-        matches!(error, StoreError::HandoffSourceMismatch { expected, .. } if expected == seeded.cashpoint),
+        matches!(error, StoreError::HandoffSourceMismatch { expected, .. } if expected == seeded.agent_order),
         "unexpected error: {error}"
     );
 
     let cancelled = store
-        .cancel_handoff(handoff.id, seeded.cashpoint, CLOSED)
+        .cancel_handoff(handoff.id, seeded.agent_order, CLOSED)
         .unwrap();
     assert_eq!(cancelled.status, HandoffStatus::Cancelled);
 }
@@ -482,7 +482,7 @@ fn handoffs_survive_restart_with_their_evidence() {
                     "contract is correct",
                     vec!["test:payment_contract".into()],
                 )
-                .with_proposed_owner(seeded.cashpoint),
+                .with_proposed_owner(seeded.agent_order),
                 ANSWERED,
             )
             .unwrap();
@@ -492,7 +492,7 @@ fn handoffs_survive_restart_with_their_evidence() {
     let reopened = database.store().get_handoff(handoff_id).unwrap().unwrap();
     assert_eq!(reopened.status, HandoffStatus::Rejected);
     assert_eq!(reopened.evidence, vec!["test:payment_contract".to_owned()]);
-    assert_eq!(reopened.proposed_owner_id, Some(seeded.cashpoint));
+    assert_eq!(reopened.proposed_owner_id, Some(seeded.agent_order));
     assert_eq!(
         database
             .store()
@@ -589,13 +589,13 @@ fn work_items_keep_their_owner_when_a_handoff_is_cancelled() {
     let seeded = seed(database.path());
     let mut store = database.store();
     store
-        .assign_work_owner(seeded.work_id, seeded.cashpoint, CREATED)
+        .assign_work_owner(seeded.work_id, seeded.agent_order, CREATED)
         .unwrap();
     let handoff = store.propose_handoff(&proposal(&seeded)).unwrap();
     store
-        .cancel_handoff(handoff.id, seeded.cashpoint, CLOSED)
+        .cancel_handoff(handoff.id, seeded.agent_order, CLOSED)
         .unwrap();
 
     let work: WorkItem = store.get_work_item(seeded.work_id).unwrap().unwrap();
-    assert_eq!(work.owner_agent_id, Some(seeded.cashpoint));
+    assert_eq!(work.owner_agent_id, Some(seeded.agent_order));
 }

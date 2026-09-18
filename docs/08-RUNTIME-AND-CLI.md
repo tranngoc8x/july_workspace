@@ -5,6 +5,7 @@
 Terminal-first, but not terminal-dependent.
 
 Core must run with no:
+
 - Herdr;
 - Zellij;
 - tmux.
@@ -101,7 +102,7 @@ Runtime creation stays lazy: a session is created or resumed the first time
 ### DM
 
 ```bash
-july dm cashpoint
+july dm agent_order
 ```
 
 The Phase 3 command preserves the submitted line exactly except for the
@@ -200,20 +201,20 @@ There is no automatic retry/backoff and no exactly-once promise.
 
 ```bash
 july session list
-july session restart <conversation> --agent cashpoint
+july session restart <conversation> --agent agent_order
 ```
 
 ## Interactive shell
 
 No-argument dispatch is selected before terminal initialization:
 
-| Invocation | Standard streams | Behavior |
-|---|---|---|
-| `july` | stdin and stdout are TTYs | Phase 10 TUI |
-| `july` | either stream is not a TTY | Phase 8 line REPL |
-| `july dm ...` | any | existing standalone stream |
-| `july thread open ...` | any | existing standalone stream |
-| finite command or `--json` | any | existing CLI output |
+| Invocation                 | Standard streams           | Behavior                   |
+| -------------------------- | -------------------------- | -------------------------- |
+| `july`                     | stdin and stdout are TTYs  | Phase 10 TUI               |
+| `july`                     | either stream is not a TTY | Phase 8 line REPL          |
+| `july dm ...`              | any                        | existing standalone stream |
+| `july thread open ...`     | any                        | existing standalone stream |
+| finite command or `--json` | any                        | existing CLI output        |
 
 The TUI keeps application-owned scrollback, a multiline editor, Root/Room/DM/
 Thread navigation, progressive Markdown, resize and follow-tail behavior. A
@@ -233,8 +234,8 @@ resolved descriptor.
 ```text
 $ july
 
-> /dm cashpoint
-dm	<agent-id>	cashpoint
+> /dm agent_order
+dm	<agent-id>	agent_order
 > fix callback retry
 ```
 
@@ -445,6 +446,7 @@ Homebrew packaging stays deferred until the release cadence is stable.
 ## Optional integrations
 
 Later:
+
 - Herdr session visibility;
 - Zellij focus helpers;
 - desktop notifications;

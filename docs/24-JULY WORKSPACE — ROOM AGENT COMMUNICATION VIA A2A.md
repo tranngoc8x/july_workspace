@@ -10,23 +10,23 @@ Primary flow:
 
 ```text
 Room: VNA
-Members: user, cashpoint, pay
+Members: user, agent_order, pay
 
 user:
-@cashpoint @pay kiểm tra refund flow.
+@agent_order @pay kiểm tra refund flow.
 
-cashpoint:
+agent_order:
 Tôi kiểm tra callback integration.
 
 pay:
 Tôi kiểm tra refund/payment state.
 
-cashpoint:
+agent_order:
 @pay bên tôi đang gửi payment_ref.
 Bên pay expect field nào?
 
 pay:
-@cashpoint bên tôi expect reference_id.
+@agent_order bên tôi expect reference_id.
 Có vẻ contract đang lệch.
 ```
 
@@ -66,7 +66,7 @@ Không coi ACP và A2A là hai runtime adapter ngang hàng.
 Một logical Agent có thể đồng thời:
 
 ```text
-cashpoint
+agent_order
 ├── runtime: ACP → Codex
 └── collaboration: A2A → pay
 ```
@@ -93,7 +93,7 @@ cashpoint
                               A2A
                     ┌──────────┴──────────┐
                     │                     │
-                cashpoint                pay
+                agent_order                pay
                     │                     │
                    ACP                   ACP
                     │                     │
@@ -161,11 +161,11 @@ Ví dụ:
 
 ```text
 Room VNA:
-- cashpoint
+- agent_order
 - pay
 ```
 
-Nếu cashpoint gửi:
+Nếu agent_order gửi:
 
 ```text
 @infra check staging
@@ -307,7 +307,7 @@ Sender có thể là:
 
 ```text
 User
-Agent(cashpoint)
+Agent(agent_order)
 Agent(pay)
 System
 ```
@@ -333,18 +333,18 @@ Không dùng raw A2A Message làm database/domain model của Room.
 User:
 
 ```text
-[VNA] > @cashpoint kiểm tra callback retry
+[VNA] > @agent_order kiểm tra callback retry
 ```
 
 July:
 
 ```text
 1. parse mention
-2. resolve cashpoint
-3. validate cashpoint ∈ VNA
+2. resolve agent_order
+3. validate agent_order ∈ VNA
 4. persist RoomMessage
 5. render message in Room
-6. activate/resume cashpoint ACP runtime
+6. activate/resume agent_order ACP runtime
 7. deliver relevant Room context
 8. receive shared agent response
 9. persist response as RoomMessage
@@ -360,7 +360,7 @@ Không bắt buộc tạo Work.
 User:
 
 ```text
-[VNA] > @cashpoint @pay kiểm tra refund flow
+[VNA] > @agent_order @pay kiểm tra refund flow
 ```
 
 July:
@@ -370,17 +370,17 @@ persist one RoomMessage
         ↓
 resolve mentions
         ↓
-cashpoint ∈ VNA ✓
+agent_order ∈ VNA ✓
 pay ∈ VNA ✓
         ↓
-activate cashpoint
+activate agent_order
 activate pay
 ```
 
 Cả hai responses xuất hiện trong Room:
 
 ```text
-cashpoint:
+agent_order:
 Tôi kiểm tra integration.
 
 pay:
@@ -393,7 +393,7 @@ Không tự tạo Work chỉ vì có nhiều mentions.
 
 # 8. Agent → Agent flow
 
-Cashpoint:
+AgentOrder:
 
 ```text
 @pay check refund contract.
@@ -402,13 +402,13 @@ Cashpoint:
 Flow:
 
 ```text
-cashpoint ACP runtime
+agent_order ACP runtime
         │
         │ collaboration intent
         ▼
 July Room Messaging
         │
-        ├── validate cashpoint ∈ Room
+        ├── validate agent_order ∈ Room
         ├── resolve @pay
         ├── validate pay ∈ Room
         ├── persist RoomMessage
@@ -501,8 +501,8 @@ AgentCommunication {
 Ví dụ:
 
 ```text
-cashpoint.runtime = ACP/Codex
-cashpoint.communication = A2A
+agent_order.runtime = ACP/Codex
+agent_order.communication = A2A
 ```
 
 Reuse existing types nếu code hiện tại đã có equivalent.
@@ -583,9 +583,9 @@ July resolve tất cả.
 Support:
 
 ```text
-@cashpoint
+@agent_order
 @pay
-@cashpoint @pay
+@agent_order @pay
 ```
 
 Validation:
@@ -619,13 +619,13 @@ All members có thể xem shared Room messages.
 Nhưng chỉ mentioned agents được wake.
 
 ```text
-@cashpoint
-→ wake cashpoint
+@agent_order
+→ wake agent_order
 
 @pay
 → wake pay
 
-@cashpoint @pay
+@agent_order @pay
 → wake both
 
 no mention
@@ -689,25 +689,25 @@ Primary UX:
 
 ```text
 VNA
-cashpoint · pay
+agent_order · pay
 
 ────────────────────────────────────
 
 you
-@cashpoint @pay kiểm tra refund flow.
+@agent_order @pay kiểm tra refund flow.
 
-cashpoint
+agent_order
 Tôi sẽ kiểm tra callback integration.
 
 pay
 Tôi kiểm tra refund/payment state.
 
-cashpoint
+agent_order
 @pay bên tôi đang gửi payment_ref.
 Bên pay expect field nào?
 
 pay
-@cashpoint bên tôi expect reference_id.
+@agent_order bên tôi expect reference_id.
 
 ────────────────────────────────────
 [vna] > _
@@ -738,7 +738,7 @@ mention
 Ví dụ:
 
 ```text
-cashpoint:
+agent_order:
 @pay API đang dùng status nào?
 ```
 
@@ -749,7 +749,7 @@ Structured Work chỉ được tạo khi thực sự có work lifecycle.
 Ví dụ:
 
 ```text
-cashpoint:
+agent_order:
 @pay implement signature validation and add contract tests.
 ```
 
@@ -758,7 +758,7 @@ Có thể tạo:
 ```text
 Work {
     room_id = VNA
-    requester = cashpoint
+    requester = agent_order
     owner = pay
 }
 ```
@@ -788,8 +788,8 @@ short collaboration
 Ví dụ:
 
 ```text
-cashpoint → pay:
-Which refund status should cashpoint consume?
+agent_order → pay:
+Which refund status should agent_order consume?
 ```
 
 ## Task
@@ -799,7 +799,7 @@ Dùng khi target cần thực hiện work có lifecycle.
 Ví dụ:
 
 ```text
-cashpoint → pay:
+agent_order → pay:
 Implement signature verification and return test evidence.
 ```
 
@@ -824,7 +824,7 @@ Ví dụ:
 ```text
 Work #43
 room = VNA
-requester = cashpoint
+requester = agent_order
 owner = pay
 status = working
 
@@ -927,14 +927,14 @@ send_room_message(sender, target, room):
 Required case:
 
 ```text
-cashpoint ∈ VNA
+agent_order ∈ VNA
 pay ∈ VNA
 infra ∉ VNA
 
-cashpoint → @pay
+agent_order → @pay
 PASS
 
-cashpoint → @infra
+agent_order → @infra
 REJECT
 ```
 
@@ -1025,7 +1025,7 @@ Normal collaboration:
 ```text
 /room vna
 
-@cashpoint @pay check refund flow
+@agent_order @pay check refund flow
 ```
 
 sau đó agents tự trao đổi bằng mentions.
@@ -1384,7 +1384,7 @@ from the Room flow and are not removed by this phase.
 The deterministic acceptance test is
 `tests/cli_repl.rs::room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room`.
 It runs the July CLI with ACP/MCP subprocess fixtures: both mentioned agents
-publish initial replies, cashpoint asks pay, pay replies to cashpoint, and a
+publish initial replies, agent_order asks pay, pay replies to agent_order, and a
 final untargeted publication ends the exchange. It checks shared output,
 session reuse, idle-member isolation and no Conversation/Work creation.
 This verifies local protocol integration, not a live Codex/Claude provider run.
@@ -1396,16 +1396,16 @@ This verifies local protocol integration, not a live Codex/Claude provider run.
 ## Test 1 — User mentions one agent
 
 ```text
-user → @cashpoint
+user → @agent_order
 ```
 
 Verify:
 
 ```text
 RoomMessage persisted
-cashpoint activated
+agent_order activated
 pay not activated
-cashpoint reply visible in Room
+agent_order reply visible in Room
 ```
 
 ---
@@ -1413,14 +1413,14 @@ cashpoint reply visible in Room
 ## Test 2 — User mentions multiple agents
 
 ```text
-user → @cashpoint @pay
+user → @agent_order @pay
 ```
 
 Verify:
 
 ```text
 one RoomMessage persisted
-cashpoint activated
+agent_order activated
 pay activated
 both replies visible
 no mandatory Work creation
@@ -1431,7 +1431,7 @@ no mandatory Work creation
 ## Test 3 — Agent mentions another member
 
 ```text
-cashpoint → @pay
+agent_order → @pay
 ```
 
 Verify:
@@ -1450,7 +1450,7 @@ pay response appears in Room
 ## Test 4 — Target is not Room member
 
 ```text
-cashpoint → @infra
+agent_order → @infra
 ```
 
 Verify:
@@ -1496,7 +1496,7 @@ Verify mentioned agent receives bounded new Room context, not entire Room histor
 ## Test 8 — Structured delegation
 
 ```text
-cashpoint:
+agent_order:
 @pay implement X
 ```
 
@@ -1573,28 +1573,28 @@ Room VNA
 
 Members:
 - user
-- cashpoint
+- agent_order
 - pay
 ```
 
 User:
 
 ```text
-@cashpoint @pay kiểm tra refund flow.
+@agent_order @pay kiểm tra refund flow.
 ```
 
 Expected:
 
 ```text
-cashpoint activated
+agent_order activated
 pay activated
 both replies appear in VNA Room chat
 ```
 
-Sau đó cashpoint:
+Sau đó agent_order:
 
 ```text
-@pay bên cashpoint đang gửi payment_ref.
+@pay bên agent_order đang gửi payment_ref.
 Bên pay expect field nào?
 ```
 
@@ -1602,7 +1602,7 @@ Expected internal flow:
 
 ```text
 persist RoomMessage
-validate cashpoint membership
+validate agent_order membership
 validate pay membership
 route interaction through A2A
 activate/resume pay through ACP
@@ -1611,7 +1611,7 @@ activate/resume pay through ACP
 Pay:
 
 ```text
-@cashpoint bên tôi expect reference_id.
+@agent_order bên tôi expect reference_id.
 ```
 
 Response phải xuất hiện trong cùng Room.

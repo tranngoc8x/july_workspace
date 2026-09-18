@@ -44,40 +44,40 @@ mod tests {
 
     #[test]
     fn a_single_mention_splits_into_agent_and_prompt() {
-        let parsed = parse("@cashpoint fix callback retry").unwrap();
-        assert_eq!(parsed.agents, ["cashpoint"]);
+        let parsed = parse("@agent_order fix callback retry").unwrap();
+        assert_eq!(parsed.agents, ["agent_order"]);
         assert_eq!(parsed.prompt, "fix callback retry");
     }
 
     #[test]
     fn several_mentions_are_collected_and_deduplicated_in_order() {
-        let parsed = parse("  @cashpoint @pay @cashpoint implement refund flow").unwrap();
-        assert_eq!(parsed.agents, ["cashpoint", "pay"]);
+        let parsed = parse("  @agent_order @pay @agent_order implement refund flow").unwrap();
+        assert_eq!(parsed.agents, ["agent_order", "pay"]);
         assert_eq!(parsed.prompt, "implement refund flow");
     }
 
     #[test]
     fn a_bare_mention_carries_an_empty_prompt() {
-        let parsed = parse("@cashpoint").unwrap();
-        assert_eq!(parsed.agents, ["cashpoint"]);
+        let parsed = parse("@agent_order").unwrap();
+        assert_eq!(parsed.agents, ["agent_order"]);
         assert_eq!(parsed.prompt, "");
     }
 
     #[test]
     fn only_leading_mentions_count_and_the_rest_stays_verbatim() {
-        assert_eq!(parse("ping @cashpoint"), None);
-        assert_eq!(parse("/dm cashpoint"), None);
-        assert_eq!(parse("@ cashpoint"), None);
+        assert_eq!(parse("ping @agent_order"), None);
+        assert_eq!(parse("/dm agent_order"), None);
+        assert_eq!(parse("@ agent_order"), None);
         assert!(parse("").is_none());
-        let parsed = parse("@cashpoint ask @pay about it").unwrap();
-        assert_eq!(parsed.agents, ["cashpoint"]);
+        let parsed = parse("@agent_order ask @pay about it").unwrap();
+        assert_eq!(parsed.agents, ["agent_order"]);
         assert_eq!(parsed.prompt, "ask @pay about it");
     }
 
     #[test]
     fn punctuation_terminates_a_name_without_swallowing_it() {
-        let parsed = parse("@cashpoint, then retry").unwrap();
-        assert_eq!(parsed.agents, ["cashpoint"]);
+        let parsed = parse("@agent_order, then retry").unwrap();
+        assert_eq!(parsed.agents, ["agent_order"]);
         assert_eq!(parsed.prompt, ", then retry");
     }
 }

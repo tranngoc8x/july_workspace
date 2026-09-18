@@ -1364,16 +1364,16 @@ mod tests {
     #[test]
     fn two_agents_stream_side_by_side() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
+        let agent_order = agent(1);
         let pay = agent(2);
 
-        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, agent_order, "agent_order");
         start(&mut app, pay, "pay");
-        delta(&mut app, cashpoint, "Checking callback handler...");
+        delta(&mut app, agent_order, "Checking callback handler...");
         delta(&mut app, pay, "Inspecting refund state...");
 
         let transcript = app.transcript_text_for_tests();
-        assert!(transcript.contains("cashpoint"), "{transcript}");
+        assert!(transcript.contains("agent_order"), "{transcript}");
         assert!(
             transcript.contains("Checking callback handler..."),
             "{transcript}"
@@ -1388,26 +1388,26 @@ mod tests {
     #[test]
     fn a_delta_only_reaches_the_agent_it_names() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
+        let agent_order = agent(1);
         let pay = agent(2);
-        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, agent_order, "agent_order");
         start(&mut app, pay, "pay");
 
-        delta(&mut app, cashpoint, "only mine");
+        delta(&mut app, agent_order, "only mine");
 
-        assert_eq!(app.live_cell_body(&cashpoint), Some("only mine"));
+        assert_eq!(app.live_cell_body(&agent_order), Some("only mine"));
         assert_eq!(app.live_cell_body(&pay), Some(""));
     }
 
     #[test]
     fn a_delta_for_an_agent_with_no_open_cell_is_dropped() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
-        start(&mut app, cashpoint, "cashpoint");
+        let agent_order = agent(1);
+        start(&mut app, agent_order, "agent_order");
 
         delta(&mut app, agent(99), "from nowhere");
 
-        assert_eq!(app.live_cell_body(&cashpoint), Some(""));
+        assert_eq!(app.live_cell_body(&agent_order), Some(""));
         assert_eq!(app.live_cell_body(&agent(99)), None);
         assert!(!app.transcript_text_for_tests().contains("from nowhere"));
     }
@@ -1415,16 +1415,16 @@ mod tests {
     #[test]
     fn finishing_one_agent_closes_its_cell_and_leaves_the_other_streaming() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
+        let agent_order = agent(1);
         let pay = agent(2);
-        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, agent_order, "agent_order");
         start(&mut app, pay, "pay");
-        delta(&mut app, cashpoint, "done looking");
+        delta(&mut app, agent_order, "done looking");
         delta(&mut app, pay, "still looking");
 
-        app.reduce(AppEvent::AgentStreamFinished { agent: cashpoint });
+        app.reduce(AppEvent::AgentStreamFinished { agent: agent_order });
 
-        assert_eq!(app.live_cell_body(&cashpoint), None, "its cell is closed");
+        assert_eq!(app.live_cell_body(&agent_order), None, "its cell is closed");
         assert_eq!(
             app.live_cell_body(&pay),
             Some("still looking"),
@@ -1485,9 +1485,9 @@ mod tests {
     #[test]
     fn a_live_preview_is_styled_as_markdown_like_the_message_it_becomes() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
-        start(&mut app, cashpoint, "cashpoint");
-        delta(&mut app, cashpoint, "run `cargo test`");
+        let agent_order = agent(1);
+        start(&mut app, agent_order, "agent_order");
+        delta(&mut app, agent_order, "run `cargo test`");
 
         let foreground = app
             .transcript_text()
@@ -1503,18 +1503,18 @@ mod tests {
     #[test]
     fn a_failing_agent_reports_why_and_drops_its_preview() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
+        let agent_order = agent(1);
         let pay = agent(2);
-        start(&mut app, cashpoint, "cashpoint");
+        start(&mut app, agent_order, "agent_order");
         start(&mut app, pay, "pay");
-        delta(&mut app, cashpoint, "partial answer");
+        delta(&mut app, agent_order, "partial answer");
 
         app.reduce(AppEvent::AgentStreamFailed {
-            agent: cashpoint,
+            agent: agent_order,
             reason: "failed: transport closed".into(),
         });
 
-        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert_eq!(app.live_cell_body(&agent_order), None);
         assert_eq!(app.live_cell_body(&pay), Some(""));
         let transcript = app.transcript_text_for_tests();
         assert!(
@@ -1522,7 +1522,7 @@ mod tests {
             "the preview goes with the cell:\n{transcript}"
         );
         assert!(
-            transcript.contains("cashpoint: failed: transport closed"),
+            transcript.contains("agent_order: failed: transport closed"),
             "the reason is reported against the agent that failed:\n{transcript}"
         );
     }
@@ -1533,37 +1533,37 @@ mod tests {
 
         app.reduce(AppEvent::AgentStreamFailed {
             agent: agent(1),
-            reason: "cashpoint: failed: transport closed".into(),
+            reason: "agent_order: failed: transport closed".into(),
         });
 
         assert!(
             app.transcript_text_for_tests()
-                .contains("cashpoint: failed: transport closed")
+                .contains("agent_order: failed: transport closed")
         );
     }
 
     #[test]
     fn an_agent_that_streamed_nothing_closes_without_leaving_a_row() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
-        start(&mut app, cashpoint, "cashpoint");
+        let agent_order = agent(1);
+        start(&mut app, agent_order, "agent_order");
 
-        app.reduce(AppEvent::AgentStreamFinished { agent: cashpoint });
+        app.reduce(AppEvent::AgentStreamFinished { agent: agent_order });
 
-        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert_eq!(app.live_cell_body(&agent_order), None);
         assert!(app.transcript().trim().is_empty(), "{:?}", app.transcript());
     }
 
     #[test]
     fn switching_rooms_drops_live_cells_from_the_room_being_left() {
         let mut app = App::new(room("alpha"));
-        let cashpoint = agent(1);
-        start(&mut app, cashpoint, "cashpoint");
-        delta(&mut app, cashpoint, "mid flight");
+        let agent_order = agent(1);
+        start(&mut app, agent_order, "agent_order");
+        delta(&mut app, agent_order, "mid flight");
 
         switch_to_with_history(&mut app, room("beta"), Vec::new());
 
-        assert_eq!(app.live_cell_body(&cashpoint), None);
+        assert_eq!(app.live_cell_body(&agent_order), None);
         assert!(!app.transcript_text_for_tests().contains("mid flight"));
     }
 
@@ -2151,7 +2151,7 @@ curl --request POST 'https://example.com/v1/orders' \
     #[test]
     fn leading_blanks_still_execute_a_command_and_failures_surface_as_an_error() {
         let mut app = App::new(Context::root());
-        for character in "  /thread 01 --agent cashpoint".chars() {
+        for character in "  /thread 01 --agent agent_order".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
         }
 
@@ -2159,7 +2159,7 @@ curl --request POST 'https://example.com/v1/orders' \
             app.reduce(AppEvent::Key(key(KeyCode::Enter))),
             vec![AppCommand::Execute {
                 context: ContextId::root(),
-                input: "/thread 01 --agent cashpoint".into(),
+                input: "/thread 01 --agent agent_order".into(),
             }]
         );
 

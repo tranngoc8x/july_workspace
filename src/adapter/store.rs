@@ -569,7 +569,7 @@ mod tests {
         let store = AdapterStore::new(scratch());
 
         assert!(matches!(
-            store.config_for("nope", "cashpoint"),
+            store.config_for("nope", "agent_order"),
             Err(AdapterError::UnknownAdapter(id)) if id == "nope"
         ));
     }
@@ -579,7 +579,7 @@ mod tests {
         let store = AdapterStore::new(scratch());
 
         assert!(matches!(
-            store.config_for("codex", "cashpoint"),
+            store.config_for("codex", "agent_order"),
             Err(AdapterError::NotVerified { id }) if id == "codex"
         ));
     }
@@ -590,7 +590,7 @@ mod tests {
         store.record_identity("codex", identity()).expect("record");
 
         assert!(matches!(
-            store.config_for("codex", "cashpoint"),
+            store.config_for("codex", "agent_order"),
             Err(AdapterError::NotInstalled { id }) if id == "codex"
         ));
     }
@@ -610,7 +610,7 @@ mod tests {
         store.record_identity("codex", identity).expect("record");
 
         let config = store
-            .config_for("codex", "cashpoint")
+            .config_for("codex", "agent_order")
             .expect("config generated");
 
         // Đây là hợp đồng bị vỡ trước đây: nơi ghi và nơi đọc phải khớp nhau.
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(parsed.executable, bin);
         assert_eq!(parsed.expected_agent_name, "codex-acp");
         assert_eq!(parsed.expected_agent_version, "1.6.2");
-        assert_eq!(parsed.state_directory, home.join("state/cashpoint"));
+        assert_eq!(parsed.state_directory, home.join("state/agent_order"));
         assert!(parsed.arguments.is_empty());
         assert!(parsed.environment.is_empty());
         assert!(

@@ -7,25 +7,26 @@ Use real capability boundaries instead of large prose guardrails where possible.
 ## Agent codebase ownership
 
 Each agent has:
+
 - `project_root`;
 - allowed write roots;
 - optional read-only roots;
 - optional network/tool policy.
 
-Cashpoint must not silently gain write access to Pay.
+AgentOrder must not silently gain write access to Pay.
 
 ## Cross-project collaboration
 
 Preferred path:
 
 ```text
-cashpoint asks pay agent
+agent_order asks pay agent
 ```
 
 rather than:
 
 ```text
-cashpoint reads/writes pay repo directly
+agent_order reads/writes pay repo directly
 ```
 
 Explicit read-only cross-project access may be allowed where justified.
@@ -42,6 +43,7 @@ agent request
 ## High-risk actions
 
 Do not silently auto-approve:
+
 - production deployment;
 - destructive DB migration;
 - credentials/secrets mutation;
@@ -60,9 +62,11 @@ Result + evidence
 ## Room membership vs filesystem permission
 
 Room membership means:
+
 - can be invited/communicate.
 
 It does not mean:
+
 - can read/write every room member's codebase.
 
 Thread delivery and session opening require an active Agent membership in both
@@ -82,6 +86,7 @@ membership transition.
 ## Audit
 
 Persist at least:
+
 - agent/session creation;
 - permission decisions;
 - membership changes;

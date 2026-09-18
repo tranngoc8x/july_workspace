@@ -41,6 +41,7 @@
 ## 2. Hard boundaries
 
 ### Workspace domain knows
+
 - agents;
 - rooms;
 - conversations;
@@ -52,6 +53,7 @@
 - logical status.
 
 ### Workspace domain does not know
+
 - Claude/Codex-specific APIs;
 - ACP wire details;
 - terminal panes/tabs;
@@ -59,6 +61,7 @@
 - stdout parsing.
 
 ### Agent Runtime knows
+
 - agent identity;
 - project root;
 - session bindings;
@@ -66,16 +69,19 @@
 - transport instance.
 
 ### AgentTransport knows
+
 - how to create/resume/send/cancel/close a remote agent session.
 
 ### Presentation knows
+
 - how to show workspace state and submit commands.
 - It does not own canonical state.
 
 ## 3. LLM vs deterministic runtime
 
 ### No LLM needed
-- explicit `@cashpoint`;
+
+- explicit `@agent_order`;
 - DM delivery;
 - thread membership;
 - session lookup;
@@ -87,6 +93,7 @@
 - permission enforcement.
 
 ### Semantic reasoning may be useful
+
 - ambiguous target;
 - cross-project synthesis;
 - architecture disagreement;
@@ -96,17 +103,17 @@
 
 ## 4. Source of truth
 
-| Concern | Owner |
-|---|---|
-| agent identity | SQLite |
-| room membership | SQLite |
-| conversations/messages | SQLite |
-| work/dependencies/results | SQLite |
-| session bindings | SQLite |
-| active LLM context | Claude/Codex harness |
-| code state | filesystem/Git |
-| project/room human knowledge | Markdown |
-| optional terminal view | external integration |
+| Concern                      | Owner                |
+| ---------------------------- | -------------------- |
+| agent identity               | SQLite               |
+| room membership              | SQLite               |
+| conversations/messages       | SQLite               |
+| work/dependencies/results    | SQLite               |
+| session bindings             | SQLite               |
+| active LLM context           | Claude/Codex harness |
+| code state                   | filesystem/Git       |
+| project/room human knowledge | Markdown             |
+| optional terminal view       | external integration |
 
 ## 5. Failure rule
 
