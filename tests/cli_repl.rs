@@ -3734,7 +3734,7 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
         final_reply.body,
         "Confirmed: agent_order will use reference_id."
     );
-    assert_eq!(final_reply.sender_id, cashpoint.id.to_string());
+    assert_eq!(final_reply.sender_id, agent_order.id.to_string());
     assert_eq!(final_reply.reply_to, Some(answer.id));
     assert!(final_reply.mentions.is_empty());
     assert!(!workspace.root.join("idle.prompts").exists());

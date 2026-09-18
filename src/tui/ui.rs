@@ -212,7 +212,8 @@ mod tests {
         assert!(slash.contains("/start"), "slash popup:\n{slash}");
 
         clear(&mut app);
-        type_text(&mut app, "@cash");
+        // A bare `@` asks for every agent; a narrower query would only prove one of them renders.
+        type_text(&mut app, "@");
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let mention = screen(&terminal);
         assert!(mention.contains("agent_order"), "mention popup:\n{mention}");

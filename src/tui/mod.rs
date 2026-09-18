@@ -451,10 +451,14 @@ fn draw<W: Write>(
         terminal.resize(band)?;
     }
     let band = terminal.get_frame().area();
+    let mut pending = Vec::new();
     while let Some(block) = app.take_finished_block() {
-        scrollback::write_above(terminal.backend_mut(), band, block)?;
-        // The rows above the band moved up, so nothing ratatui remembers about the band is true
-        // any more. Resizing to the same rect is how a fixed viewport is told to repaint in full.
+        pending.extend(block.lines);
+    }
+    if !pending.is_empty() {
+        scrollback::write_above(terminal.backend_mut(), band, pending)?;
+        // The screen scrolled, so nothing ratatui remembers about the band is true any more.
+        // Resizing to the same rect is how a fixed viewport is told to repaint in full.
         terminal.resize(band)?;
     }
     draw_inactive(terminal, app)

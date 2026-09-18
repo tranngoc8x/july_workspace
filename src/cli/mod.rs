@@ -4971,7 +4971,7 @@ mod tests {
                     ["AgentOrder".into(), "idle".into()],
                 ],
             ),
-            "NAME       STATUS\n---------  ------\n支付       active\nCashpoint  idle"
+            "NAME        STATUS\n----------  ------\n支付        active\nAgentOrder  idle"
         );
     }
 

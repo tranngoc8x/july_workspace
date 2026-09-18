@@ -850,8 +850,19 @@ impl App {
         }
     }
 
+    /// Replays a scope's stored history, but only when the scope actually changed.
+    ///
+    /// Rows that have already been written to the terminal's scrollback cannot be taken back, so
+    /// replaying the same scope's history would print it a second time. A result that merely
+    /// refreshes the current scope - the answer to a prompt sent from inside it - keeps the
+    /// transcript that is already on screen.
     fn apply_snapshot(&mut self, snapshot: ContextSnapshot) -> Option<String> {
-        let restored = self.set_context(snapshot.context);
+        let Some(restored) = self.set_context(snapshot.context) else {
+            return match snapshot.history {
+                Ok(_) => None,
+                Err(error) => Some(error.trim_end().to_owned()),
+            };
+        };
         self.markdown = MarkdownStream::default();
         self.live_cells.clear();
 
@@ -873,10 +884,7 @@ impl App {
                 Some(error.trim_end().to_owned())
             }
         };
-        // Only now is the transcript the one the restored scroll offset was measured against.
-        if let Some(restored) = restored {
-            self.restore_room_ui(restored);
-        }
+        self.restore_room_ui(restored);
         error
     }
 
@@ -1438,6 +1446,35 @@ mod tests {
         assert!(
             transcript.contains("still looking"),
             "the other agent's preview is still on screen:\n{transcript}"
+        );
+    }
+
+    #[test]
+    fn a_result_that_refreshes_the_same_scope_does_not_replay_its_history() {
+        let mut app = App::new(room("alpha"));
+        app.reduce(AppEvent::Resize {
+            width: 40,
+            height: 12,
+        });
+        // Whatever is already on screen has been written to the terminal's scrollback and cannot
+        // be taken back, so a refresh of the same scope must not hand it over a second time.
+        switch_to_with_history(
+            &mut app,
+            room("alpha"),
+            vec![HistoryEntry {
+                author: HistoryAuthor::Agent,
+                body: "already printed".into(),
+            }],
+        );
+
+        let mut blocks = Vec::new();
+        while let Some(block) = app.take_finished_block() {
+            blocks.push(block.to_string());
+        }
+
+        assert!(
+            blocks.iter().all(|block| !block.contains("already printed")),
+            "{blocks:?}"
         );
     }
 

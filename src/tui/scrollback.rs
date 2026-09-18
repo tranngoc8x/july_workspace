@@ -27,28 +27,36 @@ use super::support::wrapping::word_wrap_lines;
 /// ponytail: `ClearType::Purge` is ANSI-only; on Windows crossterm clears just the visible screen,
 /// so a scope switch there leaves the previous scope's rows in scrollback.
 pub(super) fn purge<W: Write>(backend: &mut CrosstermBackend<W>) -> io::Result<()> {
+    // Order matters: several terminals push what `Clear(All)` erases into the scrollback, so the
+    // scrollback has to be dropped after the screen, not before it.
     queue!(
         backend,
         MoveTo(0, 0),
+        Clear(ClearType::All),
         Clear(ClearType::Purge),
-        Clear(ClearType::All)
+        MoveTo(0, 0)
     )?;
     backend.flush()
 }
 
-/// Writes `text` above `band`, letting the terminal scroll the older rows into its scrollback.
+/// Writes `lines` above `band`, letting the terminal scroll the older rows into its scrollback.
 ///
-/// The band is erased first and repainted by the caller's next draw: a row printed while the band
-/// is still on screen would be overwritten by it.
+/// Takes every pending row in one call on purpose: each call erases the band before printing, so
+/// two calls would have the second one erase what the first just wrote.
+///
+/// The band is erased first and repainted by the caller's next draw - a row printed while the band
+/// is still on screen would be overwritten by it - and the printing ends with one blank row per
+/// band row, which is what pushes the new rows clear of the band instead of leaving them under it.
 pub(super) fn write_above<W: Write>(
     backend: &mut CrosstermBackend<W>,
     band: Rect,
-    text: Text<'static>,
+    lines: Vec<Line<'static>>,
 ) -> io::Result<()> {
     let width = band.width.max(1);
-    // The terminal wraps for us, but then we could not tell how many rows we used, and a wrapped
-    // row would break the band's position. Wrapping here keeps one printed line to one screen row.
-    let rows = word_wrap_lines(text.lines.iter(), usize::from(width));
+    // The terminal would wrap for us, but then we could not tell how many rows we used, and a
+    // wrapped row would push the band out of place. Wrapping here keeps one printed line to one
+    // screen row.
+    let rows = word_wrap_lines(lines.iter(), usize::from(width));
     if rows.is_empty() {
         return Ok(());
     }
@@ -56,6 +64,9 @@ pub(super) fn write_above<W: Write>(
     queue!(backend, MoveTo(0, band.y), Clear(ClearType::FromCursorDown))?;
     for row in &rows {
         write_row(backend, row)?;
+        queue!(backend, Print("\r\n"))?;
+    }
+    for _ in 0..band.height {
         queue!(backend, Print("\r\n"))?;
     }
     backend.flush()
@@ -116,12 +127,12 @@ mod tests {
     fn rows_are_written_above_the_band_with_their_colour_and_one_newline_each() {
         let writer = SharedWriter::default();
         let mut backend = CrosstermBackend::new(writer.clone());
-        let text = Text::from(vec![
+        let lines = vec![
             Line::from(Span::styled("first", Style::default().fg(Color::Red))),
             Line::from("second"),
-        ]);
+        ];
 
-        write_above(&mut backend, Rect::new(0, 8, 40, 4), text).unwrap();
+        write_above(&mut backend, Rect::new(0, 8, 40, 4), lines).unwrap();
 
         let written = written(&writer);
         // Row 9 in one-based ANSI terms is the band's top row: the rows land there and push the
@@ -129,7 +140,9 @@ mod tests {
         assert!(written.contains("\x1b[9;1H"), "{written:?}");
         assert!(written.contains("first"), "{written:?}");
         assert!(written.contains("second"), "{written:?}");
-        assert_eq!(written.matches("\r\n").count(), 2, "{written:?}");
+        // Two content rows plus one blank row per band row: the blanks are what push the content
+        // clear of the band instead of leaving it underneath.
+        assert_eq!(written.matches("\r\n").count(), 2 + 4, "{written:?}");
         assert!(written.contains("\x1b[38;5;1m"), "{written:?}");
     }
 
@@ -137,11 +150,13 @@ mod tests {
     fn a_long_row_is_wrapped_so_one_printed_line_is_one_screen_row() {
         let writer = SharedWriter::default();
         let mut backend = CrosstermBackend::new(writer.clone());
-        let text = Text::from(Line::from("alpha beta gamma delta epsilon"));
+        let lines = vec![Line::from("alpha beta gamma delta epsilon")];
 
-        write_above(&mut backend, Rect::new(0, 4, 12, 2), text).unwrap();
+        write_above(&mut backend, Rect::new(0, 4, 12, 2), lines).unwrap();
 
+        // One printed line per screen row: 30 characters at width 12 cannot be one row, and the
+        // band's own two blank rows are on top of that.
         let written = written(&writer);
-        assert!(written.matches("\r\n").count() > 1, "{written:?}");
+        assert!(written.matches("\r\n").count() > 2 + 2, "{written:?}");
     }
 }
