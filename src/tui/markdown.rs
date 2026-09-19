@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 
 use pulldown_cmark::{Event, Options as MarkdownOptions, Parser};
 use ratatui::style::{Color, Style};
@@ -42,10 +43,67 @@ pub(super) fn render(markdown: &str) -> Text<'static> {
                         content: Cow::Owned(span.content.into_owned()),
                         style: span.style,
                     })
+                    .flat_map(style_bare_document_paths)
                     .collect(),
             })
             .collect(),
     }
+}
+
+/// Colour bare workspace Markdown document paths using the inline-code palette.
+///
+/// Agent replies commonly name `plans/...md` without Markdown link syntax. Terminals may still
+/// make such paths hoverable, but the Markdown renderer leaves them in the body colour.
+fn style_bare_document_paths(span: Span<'static>) -> Vec<Span<'static>> {
+    if span.style.fg.is_some() {
+        return vec![span];
+    }
+
+    let content = span.content.into_owned();
+    let ranges = document_path_ranges(&content);
+    if ranges.is_empty() {
+        return vec![Span::styled(content, span.style)];
+    }
+
+    let mut styled = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut cursor = 0;
+    for range in ranges {
+        if cursor < range.start {
+            styled.push(Span::styled(
+                content[cursor..range.start].to_owned(),
+                span.style,
+            ));
+        }
+        styled.push(Span::styled(
+            content[range.clone()].to_owned(),
+            span.style.fg(CODE_COLOR),
+        ));
+        cursor = range.end;
+    }
+    if cursor < content.len() {
+        styled.push(Span::styled(content[cursor..].to_owned(), span.style));
+    }
+    styled
+}
+
+fn document_path_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut search_from = 0;
+    for token in text.split_whitespace() {
+        let Some(relative_start) = text[search_from..].find(token) else {
+            continue;
+        };
+        let start = search_from + relative_start;
+        search_from = start + token.len();
+        let candidate = token
+            .trim_start_matches(['(', '[', '{', '<', '\'', '"'])
+            .trim_end_matches([')', ']', '}', '>', ',', '.', ';', ':', '!', '?', '\'', '"']);
+        if candidate.contains('/') && candidate.ends_with(".md") && !candidate.contains("://") {
+            let offset = token.find(candidate).unwrap_or_default();
+            ranges.push(start + offset..start + offset + candidate.len());
+        }
+    }
+    ranges
 }
 
 #[derive(Default)]
@@ -190,6 +248,8 @@ fn markdown_options() -> MarkdownOptions {
 mod tests {
     use ratatui::style::Color;
 
+    use crate::tui::CODE_COLOR;
+
     use super::MarkdownStream;
 
     fn completed(chunks: impl IntoIterator<Item = String>) -> ratatui::text::Text<'static> {
@@ -217,6 +277,32 @@ mod tests {
         assert_eq!(foreground("result "), Some(Color::Rgb(208, 215, 222)));
         assert_eq!(foreground("code"), Some(Color::Rgb(13, 205, 205)));
         assert_eq!(foreground("quote"), Some(Color::Green));
+    }
+
+    #[test]
+    fn bare_workspace_document_paths_are_coloured_like_file_mentions() {
+        let rendered = super::render("Mở plans/đề-án.md, còn https://example.com/design.md.");
+        let path = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "plans/đề-án.md")
+            .expect("workspace document path is its own span");
+
+        assert_eq!(path.style.fg, Some(CODE_COLOR));
+    }
+
+    #[test]
+    fn document_path_ranges_skip_web_urls() {
+        let text = "plans/đề-án.md, (../docs/design.md). https://example.com/design.md";
+
+        assert_eq!(
+            super::document_path_ranges(text)
+                .into_iter()
+                .map(|range| &text[range])
+                .collect::<Vec<_>>(),
+            ["plans/đề-án.md", "../docs/design.md"]
+        );
     }
 
     #[test]

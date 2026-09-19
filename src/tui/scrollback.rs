@@ -229,6 +229,36 @@ mod tests {
     }
 
     #[test]
+    fn room_document_path_has_its_own_colour_in_final_and_hydrated_output() {
+        use crate::tui::app::{App, AppEvent, Context, HistoryAuthor, HistoryEntry};
+
+        let body = "Sếp chốt thì em sửa docs/tach-cartpayvoucher-theo-campaign.md mục 4 (bỏ bảng order_transaction, thay bằng ALTER order_detail).";
+        for hydrated in [false, true] {
+            let mut app = App::new(Context::root());
+            if hydrated {
+                app.apply_history_for_tests(&[HistoryEntry {
+                    author: HistoryAuthor::Agent,
+                    body: body.into(),
+                }]);
+            } else {
+                app.reduce(AppEvent::RoomMessage(body.into()));
+            }
+            let mut rows = Vec::new();
+            while let Some(block) = app.take_finished_block() {
+                rows.extend(block.lines);
+            }
+            let writer = SharedWriter::default();
+            let mut backend = CrosstermBackend::new(writer.clone());
+            write_above(&mut backend, Rect::new(0, 16, 80, 4), rows).unwrap();
+            let output = written(&writer);
+            assert!(
+                output.contains("\x1b[38;2;13;205;205mdocs/tach-cartpayvoucher-theo-campaign.md"),
+                "document path needs a distinct foreground (hydrated={hydrated}): {output:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_span_keeps_its_own_colour_when_the_row_carries_the_body_colour() {
         let writer = SharedWriter::default();
         let mut backend = CrosstermBackend::new(writer.clone());
