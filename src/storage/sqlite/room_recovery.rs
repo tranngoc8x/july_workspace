@@ -35,6 +35,68 @@ pub(super) fn replacement_binding(
 }
 
 impl SqliteStore {
+    /// Start a new current session without erasing shared history or other agents' sessions.
+    pub(crate) fn new_room_session(
+        &mut self,
+        room: RoomId,
+        agent: AgentId,
+        at: &str,
+    ) -> Result<RoomSessionBinding, StoreError> {
+        require_work_timestamp(at)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_room(&tx, room)?;
+        let agent_record = require_active_agent_record(&tx, agent)?;
+        require_active_room_membership(&tx, room, agent)?;
+        let current = query_optional(&tx,
+            "SELECT id,room_id,agent_id,transport_type,remote_session_id,generation,status,created_at,last_used_at
+             FROM session_bindings WHERE room_id=?1 AND agent_id=?2 ORDER BY generation DESC LIMIT 1",
+            params![room.to_string(), agent.to_string()], records::room_session_binding)?;
+        let busy: Option<String> = query_optional(
+            &tx,
+            "SELECT b.id FROM session_bindings b WHERE b.room_id=?1 AND b.agent_id=?2
+             AND (b.status='active' OR EXISTS(SELECT 1 FROM room_message_activations a
+                 WHERE a.session_binding_id=b.id AND a.status IN ('claimed','sent'))) LIMIT 1",
+            params![room.to_string(), agent.to_string()],
+            |row| Ok(row.get(0)?),
+        )?;
+        if let Some(binding) = busy {
+            return Err(StoreError::RoomSessionUnavailable(binding.parse()?));
+        }
+        let generation = current
+            .as_ref()
+            .map_or(0, |binding| binding.generation)
+            .checked_add(1)
+            .ok_or(StoreError::InvalidStoredValue(
+                "Room binding generation overflow",
+            ))?;
+        let generation_sql = i64::try_from(generation)
+            .map_err(|_| StoreError::InvalidStoredValue("Room binding generation overflow"))?;
+        if let Some(current) = current {
+            tx.execute(
+                "UPDATE session_bindings SET status='closed',last_used_at=?2 WHERE id=?1",
+                params![current.id.to_string(), at],
+            )?;
+        }
+        let binding = RoomSessionBinding {
+            id: SessionBindingId::new(),
+            room_id: room,
+            agent_id: agent,
+            transport_type: agent_record.transport_type,
+            remote_session_id: None,
+            generation,
+            status: SessionBindingStatus::Disconnected,
+            created_at: at.into(),
+            last_used_at: at.into(),
+        };
+        tx.execute("INSERT INTO session_bindings(id,room_id,agent_id,transport_type,generation,status,created_at,last_used_at)
+            VALUES (?1,?2,?3,?4,?5,'disconnected',?6,?6)",
+            params![binding.id.to_string(),room.to_string(),agent.to_string(),binding.transport_type,generation_sql,at])?;
+        tx.commit()?;
+        Ok(binding)
+    }
+
     /// Replace only a claimed, unsent turn after ACP definitively reports SessionLost.
     pub(crate) fn replace_room_activation_binding(
         &mut self,
@@ -175,6 +237,100 @@ mod tests {
             })
             .unwrap();
         id
+    }
+
+    #[test]
+    fn explicit_new_room_session_preserves_ledger_and_advances_durably() {
+        let path =
+            std::env::temp_dir().join(format!("july-new-room-{}.db", ulid::Ulid::generate()));
+        let (mut store, room, agent) = fixture(&path);
+        let trigger = message(&mut store, room, agent);
+        let source = store
+            .claim_room_activation(trigger, agent, NOW)
+            .unwrap()
+            .unwrap()
+            .binding;
+        assert!(store.new_room_session(room, agent, RESTART).is_err());
+        store
+            .set_room_activation_status(trigger, agent, "sent", NOW)
+            .unwrap();
+        assert!(store.new_room_session(room, agent, RESTART).is_err());
+        store
+            .set_room_activation_status(trigger, agent, "completed", NOW)
+            .unwrap();
+        let fresh = store.new_room_session(room, agent, RESTART).unwrap();
+        assert_eq!(fresh.generation, 2);
+        assert_eq!(fresh.remote_session_id, None);
+        let old_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM session_bindings WHERE id=?1",
+                [source.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_status, "closed");
+        assert_eq!(
+            store.list_recent_room_messages(room, 10).unwrap().0[0].id,
+            trigger
+        );
+        drop(store);
+        let mut store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_room_session_binding(room, agent).unwrap(),
+            Some(fresh.clone())
+        );
+        let next = message(&mut store, room, agent);
+        let claim = store
+            .claim_room_activation(next, agent, RESTART)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.binding.id, fresh.id);
+        assert!(!claim.recovering);
+        store
+            .set_room_activation_status(next, agent, "completed", RESTART)
+            .unwrap();
+        store.remove_room_member(room, agent, RESTART).unwrap();
+        assert!(store.new_room_session(room, agent, RESTART).is_err());
+        assert_eq!(
+            store.get_room_session_binding(room, agent).unwrap(),
+            Some(fresh)
+        );
+    }
+
+    #[test]
+    fn explicit_new_room_session_validates_scope_and_preserves_other_agents() {
+        let (mut store, room, agent) = fixture(Path::new(":memory:"));
+        let fresh = store.new_room_session(room, agent, NOW).unwrap();
+        assert_eq!(fresh.generation, 1);
+        let mut other = store.get_agent(agent).unwrap().unwrap();
+        other.id = AgentId::new();
+        other.name = "other".into();
+        store.insert_agent(&other).unwrap();
+        assert!(store.new_room_session(room, other.id, NOW).is_err());
+        store.add_room_member(room, other.id, None, NOW).unwrap();
+        let untouched = store.new_room_session(room, other.id, NOW).unwrap();
+        store.new_room_session(room, agent, RESTART).unwrap();
+        assert_eq!(
+            store.get_room_session_binding(room, other.id).unwrap(),
+            Some(untouched)
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET status='disabled' WHERE id=?1",
+                [agent.to_string()],
+            )
+            .unwrap();
+        assert!(store.new_room_session(room, agent, RESTART).is_err());
+        store
+            .connection
+            .execute(
+                "UPDATE rooms SET status='archived' WHERE id=?1",
+                [room.to_string()],
+            )
+            .unwrap();
+        assert!(store.new_room_session(room, other.id, RESTART).is_err());
     }
 
     #[test]

@@ -72,6 +72,7 @@ impl<T: AgentTransport> SessionManager<T> {
             mut binding,
             mut context,
             mut truncated,
+            mut recovering,
         } = claim;
         if self.owned_bindings.contains_key(&binding.id) {
             self.storage
@@ -113,6 +114,7 @@ impl<T: AgentTransport> SessionManager<T> {
                             at.clone(),
                         )
                         .await?;
+                    recovering = true;
                     self.open_room_session(&binding, project_root, at.clone(), config)
                         .await
                 }
@@ -134,7 +136,7 @@ impl<T: AgentTransport> SessionManager<T> {
         self.room_messaging.insert(binding.id, scope);
         let sent = async {
             let mut recovery_summary = String::new();
-            if binding.generation > 1 && binding.remote_session_id.is_none() {
+            if recovering {
                 let recovery = self.storage
                     .room_recovery_context(message_id, self.agent_id)
                     .await?;

@@ -3,7 +3,8 @@ use super::{
     StorageWorker, timestamp,
 };
 use crate::domain::{
-    Agent, AgentId, PermissionOutcome, RoomMessage, RoomMessageId, SessionBinding, SessionBindingId,
+    Agent, AgentId, PermissionOutcome, RoomId, RoomMessage, RoomMessageId, RoomSessionBinding,
+    SessionBinding, SessionBindingId,
 };
 use crate::transport::{
     AgentConnection, AgentTransport, PermissionRequestId, PermissionResponse, SendMessage,
@@ -24,6 +25,7 @@ const SESSION_EVENT_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, RuntimeError>>;
 
 enum WorkspaceCommand<T> {
+    NewRoomSession(RoomId, AgentId, String, Reply<RoomSessionBinding>),
     RegisterAgent(AgentConnection, T, Reply<()>),
     ActivateRoom(
         RoomMessageId,
@@ -278,7 +280,19 @@ impl<T: AgentTransport + Send + 'static> WorkspaceRuntime<T> {
         self.handle.register_agent(connection, transport).await
     }
 
-    /// Activate only a persisted, explicitly mentioned Room recipient, at most once.
+    /// Start fresh for one Room member; ACP opens lazily on the next message.
+    pub async fn new_room_session(
+        &self,
+        room: RoomId,
+        agent: AgentId,
+        at: String,
+    ) -> Result<RoomSessionBinding, RuntimeError> {
+        self.handle
+            .request(|reply| WorkspaceCommand::NewRoomSession(room, agent, at, reply))
+            .await
+    }
+
+    /// Activate only a persisted Room recipient, at most once.
     pub async fn activate_room_message(
         &self,
         message_id: RoomMessageId,
@@ -391,6 +405,9 @@ async fn run_workspace<T: AgentTransport + Send + 'static>(
                         let _ = reply.send(Err(error));
                     }
                 }
+            }
+            WorkspaceCommand::NewRoomSession(room, agent, at, reply) => {
+                let _ = reply.send(storage.new_room_session(room, agent, at).await);
             }
             WorkspaceCommand::ActivateRoom(message, agent, at, alive, reply) => {
                 let (publications, published) = mpsc::channel(SESSION_EVENT_CAPACITY);

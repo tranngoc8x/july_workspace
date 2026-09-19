@@ -127,6 +127,7 @@ pub(crate) struct RoomActivationClaim {
     pub binding: RoomSessionBinding,
     pub context: Vec<RoomMessage>,
     pub truncated: bool,
+    pub recovering: bool,
 }
 
 /// Durable SQLite access which keeps Work Result lifecycle and Publish writes guarded.
@@ -2515,6 +2516,11 @@ impl SqliteStore {
                 binding
             }
         };
+        // A generation created by /new follows a closed binding, not a lost one.
+        let recovering = binding.remote_session_id.is_none() && transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_bindings WHERE room_id=?1 AND agent_id=?2 AND generation=?3 AND status='lost')",
+            params![binding.room_id.to_string(), agent_id.to_string(), (binding.generation - 1) as i64],
+            |row| row.get::<_, bool>(0))?;
         let unfinished: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM room_message_activations WHERE session_binding_id = ?1 AND status IN ('claimed', 'sent'))",
             params![binding.id.to_string()], |row| row.get(0))?;
@@ -2545,6 +2551,7 @@ impl SqliteStore {
             binding,
             context,
             truncated,
+            recovering,
         }))
     }
 

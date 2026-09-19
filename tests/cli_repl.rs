@@ -1145,6 +1145,7 @@ async fn inactive_tui_bridge_projects_visible_commands_for_root_room_dm_and_work
         "/members",
         "/work",
         "/status",
+        "/new",
         "/delivery retry",
         "/help",
         "/exit",
@@ -1245,7 +1246,7 @@ async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permissio
     let mut app = App::new(Context::root());
 
     for (input, expected_label) in [
-        ("/room vna", "room::vna"),
+        ("/room vna", "room::vna → no agent selected"),
         ("/dm codex", "room::vna > dm::codex"),
     ] {
         let event = bridge.execute(tui_command(&mut app, input)).await.unwrap();
@@ -1269,7 +1270,7 @@ async fn inactive_tui_bridge_reuses_repl_navigation_exact_chat_and_raw_permissio
     assert_eq!(app.context(), &active_dm);
 
     for (input, expected_label) in [
-        ("/back".to_owned(), "room::vna"),
+        ("/back".to_owned(), "room::vna → no agent selected"),
         (
             format!("/thread {thread} --agent codex"),
             "room::vna > thread::work > codex",
@@ -3255,7 +3256,10 @@ async fn room_a2a_publication_waits_for_busy_recipient_and_survives_sender_compl
         .unwrap();
     app.reduce(opened);
     bridge
-        .dispatch(tui_command(&mut app, "@agent_order @pay investigate refund"))
+        .dispatch(tui_command(
+            &mut app,
+            "@agent_order @pay investigate refund",
+        ))
         .unwrap();
     let mut publications = 0;
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -3757,4 +3761,232 @@ fn room_a2a_complete_demo_keeps_two_agent_question_and_answer_in_shared_room() {
             .unwrap();
         assert_eq!(count, 0, "Q&A must not create {table}");
     }
+}
+
+#[test]
+fn repl_room_recipient_focus_survives_followups_and_agent_switches() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let order = workspace.seed_acp_agent("order", &["--no-permission"]);
+    for agent in [&pay, &order] {
+        workspace.add_member(&room, agent);
+    }
+    let output = workspace.repl(
+        "/room vna\ninitial note\n@pay refund\nfollow refund\n@order callback\n@pay continue refund\n@pay @order both\nboth followup\n@order only order\norder followup\n/back\nunselected note\n/back\n/room vna\nreentered note\n@pay resume refund\n/quit\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let connection = Connection::open(&workspace.database).unwrap();
+    for (agent, expected) in [(&pay, 6), (&order, 5)] {
+        let activations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM room_message_activations WHERE agent_id = ?1",
+                [agent.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(activations, expected, "{} recipient continuity", agent.name);
+        let bindings: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), MAX(generation) FROM session_bindings WHERE agent_id = ?1",
+                [agent.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            bindings,
+            (1, 1),
+            "{} must reuse its Room session",
+            agent.name
+        );
+    }
+    let messages: i64 = connection
+        .query_row("SELECT COUNT(*) FROM room_messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(messages, 12, "unselected notes remain in Room history");
+}
+
+#[test]
+fn repl_room_new_rotates_only_named_agent_and_invalid_requests_preserve_focus() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    let order = workspace.seed_acp_agent("order", &["--no-permission"]);
+    workspace.seed_acp_agent("outsider", &["--no-permission"]);
+    for agent in [&pay, &order] {
+        workspace.add_member(&room, agent);
+    }
+    let prompt_log = workspace.root.join("pay-prompts.jsonl");
+    let mut config = pay.transport_config.clone();
+    config["environment"] = json!({"ACP_PROMPT_LOG": prompt_log});
+    Connection::open(&workspace.database)
+        .unwrap()
+        .execute(
+            "UPDATE agents SET transport_config_json=?1 WHERE id=?2",
+            [config.to_string(), pay.id.to_string()],
+        )
+        .unwrap();
+    let output = workspace.repl(
+        "/new @pay\n/room vna\n@pay old refund\n@order callback\n/new @pay\nfresh refund\n/new\n/new pay\n/new @pay @order\n/new @pay@pay\n/new @outsider\n/new @missing\n@missing invalid mention\n@outsider invalid member\nstill fresh refund\n@order continue callback\n@pay continue new refund\n/quit\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).is_empty(),
+        "invalid requests must report errors"
+    );
+    let connection = Connection::open(&workspace.database).unwrap();
+    let bindings: Vec<(String, i64, String)> = connection.prepare(
+        "SELECT agent_id, generation, status FROM session_bindings ORDER BY agent_id, generation",
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    let pay_bindings: Vec<_> = bindings
+        .iter()
+        .filter(|row| row.0 == pay.id.to_string())
+        .collect();
+    assert_eq!(
+        pay_bindings.len(),
+        2,
+        "one explicit new session only: {bindings:?}"
+    );
+    assert_eq!(pay_bindings[0].1, 1);
+    assert_eq!(pay_bindings[0].2, "closed");
+    assert_eq!(pay_bindings[1].1, 2);
+    let order_bindings: Vec<_> = bindings
+        .iter()
+        .filter(|row| row.0 == order.id.to_string())
+        .collect();
+    assert_eq!(order_bindings.len(), 1);
+    assert_eq!(order_bindings[0].1, 1);
+    assert_eq!(bindings.len(), 3, "invalid names must not create sessions");
+    let messages = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 20)
+        .unwrap()
+        .0;
+    assert_eq!(
+        messages.len(),
+        6,
+        "commands and invalid mentions must not append messages"
+    );
+    for (body, target) in [
+        ("fresh refund", pay.id),
+        ("still fresh refund", pay.id),
+        ("@order continue callback", order.id),
+        ("@pay continue new refund", pay.id),
+    ] {
+        let message = messages
+            .iter()
+            .find(|message| message.body == body)
+            .unwrap();
+        assert_eq!(message.mentions, vec![target], "{body}");
+    }
+    let current = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .get_room_session_binding(room.id, pay.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.generation, 2);
+    assert!(
+        current.remote_session_id.is_some(),
+        "next chat must open the replacement ACP session"
+    );
+    let fresh_activations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM room_message_activations WHERE session_binding_id = ?1 AND status = 'completed'",
+            [current.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        fresh_activations, 3,
+        "all new pay turns must use generation 2"
+    );
+    assert_eq!(current.remote_session_id.as_deref(), Some("session-2"));
+    let prompts: Vec<String> = std::fs::read_to_string(prompt_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(prompts.len(), 4);
+    assert!(prompts[1].contains("fresh refund"));
+    assert!(
+        prompts[1].contains("@order callback"),
+        "unseen shared context is retained"
+    );
+    assert!(
+        !prompts[1].contains("old refund"),
+        "new is not recovery of old chat"
+    );
+    assert!(!prompts[1].contains("Recovered shared Room context"));
+}
+
+#[tokio::test]
+async fn inactive_tui_room_focus_is_visible_and_back_clears_it_before_leaving() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    for name in ["pay", "order"] {
+        let agent = workspace.seed_acp_agent(name, &["--no-permission"]);
+        workspace.add_member(&room, &agent);
+    }
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    app.reduce(AppEvent::Agents(bridge.agents()));
+    let workspace_context = app.context().id().to_owned();
+    let event = bridge
+        .execute(tui_command(&mut app, "/room vna"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    let room_context = app.context().id().to_owned();
+    assert!(app.context().label().ends_with(" → no agent selected"));
+    for (body, suffix) in [
+        ("@pay @order both", " → @pay @order"),
+        ("follow both", " → @pay @order"),
+        ("@order only order", " → @order"),
+    ] {
+        bridge.dispatch(tui_command(&mut app, body)).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                app.reduce(bridge.next_event().await.unwrap().unwrap());
+                if !app.turn_active() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.context().id(), &room_context);
+        assert!(
+            app.context().label().ends_with(suffix),
+            "{}",
+            app.context().label()
+        );
+    }
+    let event = bridge
+        .execute(tui_command(&mut app, "/new @pay"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert!(app.error().is_none(), "{:?}", app.error());
+    assert!(
+        app.context().label().ends_with(" → @pay"),
+        "event result: {:?}, transcript: {}",
+        app.context(),
+        app.transcript()
+    );
+    let event = bridge
+        .execute(tui_command(&mut app, "/back"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert_eq!(app.context().id(), &room_context);
+    assert!(app.context().label().ends_with(" → no agent selected"));
+    let event = bridge
+        .execute(tui_command(&mut app, "/back"))
+        .await
+        .unwrap();
+    app.reduce(event);
+    assert_eq!(app.context().id(), &workspace_context);
+    bridge.shutdown().await.unwrap();
 }

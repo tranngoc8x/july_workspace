@@ -306,7 +306,10 @@ enum Command {
 #[derive(Clone)]
 enum ReplContext {
     Root,
-    Room(RoomId),
+    Room {
+        room_id: RoomId,
+        recipients: Vec<AgentId>,
+    },
     Dm {
         conversation_id: ConversationId,
         agent_id: AgentId,
@@ -324,7 +327,7 @@ impl ReplContext {
     fn scope(&self) -> CommandScope {
         match self {
             Self::Root => CommandScope::Root,
-            Self::Room(_) => CommandScope::Room,
+            Self::Room { .. } => CommandScope::Room,
             Self::Dm { .. } => CommandScope::Dm,
             Self::Thread { .. } => CommandScope::Thread,
         }
@@ -333,7 +336,7 @@ impl ReplContext {
     /// Publish targets a Conversation; a Room is not one.
     fn conversation_id(&self) -> Option<ConversationId> {
         match self {
-            Self::Root | Self::Room(_) => None,
+            Self::Root | Self::Room { .. } => None,
             Self::Dm {
                 conversation_id, ..
             }
@@ -346,7 +349,7 @@ impl ReplContext {
     /// The Room a Thread is created in; a Thread inherits its parent Room.
     fn room_id(&self) -> Option<RoomId> {
         match self {
-            Self::Room(room_id) | Self::Thread { room_id, .. } => Some(*room_id),
+            Self::Room { room_id, .. } | Self::Thread { room_id, .. } => Some(*room_id),
             Self::Root | Self::Dm { .. } => None,
         }
     }
@@ -1221,7 +1224,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             stdout.clear();
             context_changed = false;
         }
-        repl_write(stdout, format_args!("> "))?;
+        if tui_events.is_none()
+            && let Some(ReplContext::Room { recipients, .. }) = contexts.last()
+        {
+            let label = room_recipient_label(service, recipients).await;
+            repl_write(stdout, format_args!("[{label}] > "))?;
+        } else {
+            repl_write(stdout, format_args!("> "))?;
+        }
         stdout.clear();
         let request = tokio::select! {
             input = input.recv() => match input {
@@ -1265,7 +1275,11 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             if line.trim().is_empty() {
                 continue;
             }
-            if let Some(ReplContext::Room(room_id)) = contexts.last() {
+            if let Some(ReplContext::Room {
+                room_id,
+                recipients,
+            }) = contexts.last_mut()
+            {
                 let names: Vec<String> = mention::parse(&line)
                     .map(|parsed| {
                         parsed
@@ -1275,30 +1289,38 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             .collect()
                     })
                     .unwrap_or_default();
-                let message = match service
-                    .append_room_message_with_mentions(
-                        AppendRoomMessage {
-                            message: RoomMessage {
-                                id: RoomMessageId::new(),
-                                room_id: *room_id,
-                                sender_type: MemberType::User,
-                                sender_id: TRUSTED_LOCAL_USER_ID.into(),
-                                body: line,
-                                mentions: Vec::new(),
-                                reply_to: None,
-                                created_at: timestamp(),
-                            },
-                        },
-                        &names,
-                    )
-                    .await
-                {
+                if names.is_empty() && line.trim_start().starts_with('@') {
+                    repl_write(stderr, format_args!("invalid agent mention\n"))?;
+                    continue;
+                }
+                let command = AppendRoomMessage {
+                    message: RoomMessage {
+                        id: RoomMessageId::new(),
+                        room_id: *room_id,
+                        sender_type: MemberType::User,
+                        sender_id: TRUSTED_LOCAL_USER_ID.into(),
+                        body: line,
+                        mentions: recipients.clone(),
+                        reply_to: None,
+                        created_at: timestamp(),
+                    },
+                };
+                let appended = if names.is_empty() {
+                    service.append_room_message(command).await
+                } else {
+                    service
+                        .append_room_message_with_mentions(command, &names)
+                        .await
+                };
+                let message = match appended {
                     Ok(message) => message,
                     Err(error) => {
                         repl_write(stderr, format_args!("{error}\n"))?;
                         continue;
                     }
                 };
+                // Only a successfully persisted user message changes the selection.
+                *recipients = message.mentions.clone();
                 if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
                     use crate::tui::app::{AppEvent, CommandResult, HistoryAuthor, HistoryEntry};
                     let snapshot = project_context_snapshot(
@@ -1935,6 +1957,49 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
             }
+            "/new" => {
+                let Some(parsed) = mention::parse(arguments).filter(|parsed| {
+                    parsed.agents.len() == 1
+                        && parsed.prompt.is_empty()
+                        && arguments.trim() == format!("@{}", parsed.agents[0])
+                }) else {
+                    repl_write(stderr, format_args!("usage: /new @agent\n"))?;
+                    continue;
+                };
+                let agent = match service
+                    .resolve_agent(AgentRef::Name(parsed.agents[0].into()))
+                    .await
+                {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        repl_write(stderr, format_args!("{error}\n"))?;
+                        continue;
+                    }
+                };
+                let ReplContext::Room {
+                    room_id,
+                    recipients,
+                } = contexts.last_mut().unwrap()
+                else {
+                    unreachable!("registry scopes /new to Room");
+                };
+                match workspace
+                    .new_room_session(*room_id, agent.id, timestamp())
+                    .await
+                {
+                    Ok(_) => {
+                        *recipients = vec![agent.id];
+                        repl_write(
+                            stdout,
+                            format_args!(
+                                "New conversation with @{}. Room history preserved.\n",
+                                agent.name
+                            ),
+                        )?;
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
             "/restart" if arguments.is_empty() => {
                 if let Err(error) = close_repl_context(live).await {
                     repl_write(stderr, format_args!("{error}\n"))?;
@@ -1985,6 +2050,16 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 repl_write(stderr, format_args!("already at root\n"))?
             }
             "/back" if arguments.is_empty() => {
+                if let Some(ReplContext::Room { recipients, .. }) = contexts.last_mut()
+                    && !recipients.is_empty()
+                {
+                    recipients.clear();
+                    repl_write(
+                        stdout,
+                        format_args!("No agent selected. Mention @agent to continue.\n"),
+                    )?;
+                    continue;
+                }
                 let previous = contexts.last().unwrap().clone();
                 if let Err(error) = close_repl_context(live).await {
                     repl_write(stderr, format_args!("{error}\n"))?;
@@ -2004,11 +2079,14 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("{error}\n"))?;
                     continue;
                 }
+                if let Some(ReplContext::Room { recipients, .. }) = contexts.last_mut() {
+                    recipients.clear();
+                }
                 print_repl_status(service, workspace, contexts.last().unwrap(), stdout, stderr)
                     .await?;
             }
             "/members" if arguments.is_empty() => match contexts.last().unwrap() {
-                ReplContext::Room(room_id) => {
+                ReplContext::Room { room_id, .. } => {
                     match service.list_room_members(RoomRef::Id(*room_id)).await {
                         Ok(members) => {
                             let output = render_room_members(
@@ -2054,7 +2132,10 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             continue;
                         }
                         repl_write(stdout, format_args!("room\t{}\t{}\n", room.id, room.name))?;
-                        contexts.push(ReplContext::Room(room.id));
+                        contexts.push(ReplContext::Room {
+                            room_id: room.id,
+                            recipients: Vec::new(),
+                        });
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 },
@@ -2383,7 +2464,7 @@ async fn context_targets<R: crate::application::CollaborationRuntime>(
                 .collect();
             Ok(members == agents.iter().map(|agent| agent.id).collect())
         }
-        Some(ReplContext::Root | ReplContext::Room(_)) | None => Ok(false),
+        Some(ReplContext::Root | ReplContext::Room { .. }) | None => Ok(false),
     }
 }
 
@@ -3268,7 +3349,7 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
         match context {
             // ponytail: root only shows when it is the whole breadcrumb.
             ReplContext::Root => {}
-            ReplContext::Room(room_id) => {
+            ReplContext::Room { room_id, .. } => {
                 let room = service.resolve_room(RoomRef::Id(*room_id)).await?;
                 segments.push(format!("room::{}", room.name));
             }
@@ -3290,9 +3371,16 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
     if segments.is_empty() {
         return Ok(attach_visible_commands(Context::root(), CommandScope::Root));
     }
+    if let ReplContext::Room { recipients, .. } = current {
+        let label = room_recipient_label(service, recipients).await;
+        segments
+            .last_mut()
+            .unwrap()
+            .push_str(&format!(" → {label}"));
+    }
     let id = match current {
         ReplContext::Root => ContextId::root(),
-        ReplContext::Room(room_id) => ContextId::new(format!("room:{room_id}")),
+        ReplContext::Room { room_id, .. } => ContextId::new(format!("room:{room_id}")),
         ReplContext::Dm {
             conversation_id,
             agent_id,
@@ -3310,6 +3398,24 @@ async fn project_repl_context<R: crate::application::CollaborationRuntime>(
     ))
 }
 
+async fn room_recipient_label<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    recipients: &[AgentId],
+) -> String {
+    if recipients.is_empty() {
+        return "no agent selected".into();
+    }
+    let names = agent_names(service).await;
+    recipients
+        .iter()
+        .map(|id| {
+            let id = id.to_string();
+            format!("@{}", names.get(&id).unwrap_or(&id))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
@@ -3321,7 +3427,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
     let context = project_repl_context(service, contexts).await?;
     let names = agent_names(service).await;
     let history = match contexts.last() {
-        Some(ReplContext::Room(room_id)) => service
+        Some(ReplContext::Room { room_id, .. }) => service
             .list_recent_room_messages(*room_id, TUI_HISTORY_LIMIT)
             .await
             .map(|(messages, truncated)| History {
@@ -3409,10 +3515,12 @@ async fn print_repl_status<R: crate::application::CollaborationRuntime>(
 ) -> Result<(), CliError> {
     match context {
         ReplContext::Root => repl_write(stdout, format_args!("root\n"))?,
-        ReplContext::Room(room_id) => match service.resolve_room(RoomRef::Id(*room_id)).await {
-            Ok(room) => repl_write(stdout, format_args!("room\t{}\t{}\n", room.id, room.name))?,
-            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
-        },
+        ReplContext::Room { room_id, .. } => {
+            match service.resolve_room(RoomRef::Id(*room_id)).await {
+                Ok(room) => repl_write(stdout, format_args!("room\t{}\t{}\n", room.id, room.name))?,
+                Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+            }
+        }
         ReplContext::Dm {
             conversation_id,
             agent_id,

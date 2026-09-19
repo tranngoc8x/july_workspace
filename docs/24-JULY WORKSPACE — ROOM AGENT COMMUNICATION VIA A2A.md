@@ -241,7 +241,7 @@ nhưng Room chỉ thấy output agent chủ động chia sẻ.
 
 ---
 
-## 4.4 Mention quyết định activation
+## 4.4 Mention và nhóm người nhận quyết định activation
 
 Phải tách:
 
@@ -255,16 +255,23 @@ khỏi:
 agent activation
 ```
 
-MVP:
-
 ```text
-mentioned agent
-→ activate / wake
-
-not mentioned
-→ message persisted and visible
-→ do not wake by default
+user leading mentions → replace selected recipients → activate that set
+user no mentions + selected recipients → activate selected set
+user no mentions + no selection → persist/display only
+agent mentions → activate explicit targets, leave user selection unchanged
 ```
+
+Vào hoặc quay lại Room bắt đầu với nhóm người nhận trống. `/back` khi có nhóm
+chỉ bỏ chọn và vẫn ở Room; `/back` tiếp theo quay lại context trước. Mention
+không tự thêm thành viên và không tạo Work/Thread.
+
+Mỗi agent có session hiện hành riêng trong từng Room. `@pay` → `@order` → `@pay`
+tiếp tục session pay đang có. `/new @pay` tạo generation mới được lưu bền vững
+và chọn pay; chỉ nhận đúng một target trong Room, từ chối target không hợp lệ
+hoặc đang bận. Runtime session mới được khởi tạo ở prompt tiếp theo. Lịch sử
+Room, session history, cursor và session các agent khác giữ nguyên; context
+chung vẫn tăng dần có giới hạn, không replay toàn bộ lịch sử hoặc transcript riêng.
 
 Không broadcast mọi Room message tới mọi agent runtime.
 
@@ -616,7 +623,7 @@ Không silently reroute.
 
 All members có thể xem shared Room messages.
 
-Nhưng chỉ mentioned agents được wake.
+Chỉ nhóm người nhận được chọn của user hoặc target explicit của agent được wake.
 
 ```text
 @agent_order
@@ -628,7 +635,10 @@ Nhưng chỉ mentioned agents được wake.
 @agent_order @pay
 → wake both
 
-no mention
+user no mention + selection
+→ wake selected recipients
+
+user no mention + no selection
 → persist/display only
 ```
 
@@ -1476,7 +1486,8 @@ Verify:
 ```text
 message persisted
 message displayed
-no agent activated by default
+no agent activated when selection is empty
+selected agents activated when selection is nonempty
 ```
 
 ---

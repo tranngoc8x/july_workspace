@@ -134,7 +134,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         kind: Navigation,
         scopes: CommandScope::ALL,
-        summary: "pop the navigation history and restore the previous context",
+        summary: "clear Room recipients, or return to the previous context",
         usage: "/back",
         examples: &["/back"],
     },
@@ -292,6 +292,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         examples: &["/restart"],
     },
     CommandSpec {
+        name: "/new",
+        aliases: &[],
+        kind: Control,
+        scopes: &[Room],
+        summary: "start a new conversation with one Room agent and select it; keep Room history",
+        usage: "/new @agent",
+        examples: &["/new @pay"],
+    },
+    CommandSpec {
         name: "/delivery retry",
         aliases: &[],
         kind: Control,
@@ -393,6 +402,9 @@ Work with several agents (inside a room)
 /// Context-aware `/help`, grouped by command kind.
 pub fn help(scope: CommandScope) -> String {
     let mut rendered = String::from(HELP_PREAMBLE);
+    if scope == Room {
+        rendered.push_str("Room follow-ups keep the selected agents. New mentions replace the selection.\n/back clears it; /new @agent starts a fresh conversation and selects that agent.\n\n");
+    }
     for kind in CommandKind::ORDER {
         let mut group: Vec<_> = visible_for_scope(scope)
             .filter(|spec| spec.kind == *kind)
@@ -558,6 +570,7 @@ mod tests {
                 "/members",
                 "/work",
                 "/status",
+                "/new",
                 "/delivery retry",
                 "/help",
                 "/exit"

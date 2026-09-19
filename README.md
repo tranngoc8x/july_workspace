@@ -375,6 +375,7 @@ July keeps the interactive command surface intentionally small.
 /room <room>
 /thread <thread>
 /thread new <title>
+/new @agent  # Room: start a new session for one agent
 /back
 ```
 
@@ -550,7 +551,20 @@ RoomMessage → July Room bridge → A2A → target logical Agent
                                      coding-agent runtime
 ```
 
-Explicit mentions activate only Room members. Agents publish shared replies
+Leading user mentions select Room members; later unmentioned messages activate
+the same selected recipients. A new mention replaces that selection. Entering
+a Room starts unselected: messages are saved without waking an agent. `/back`
+clears a selection first, then returns to the previous context. Agent A2A
+mentions never change the user selection.
+
+Each agent keeps its current session in that Room across recipient switches.
+`/new @pay` starts a durable new session generation for pay and selects it;
+it accepts exactly one Room member and rejects invalid or busy targets. The
+runtime session is created lazily on the next prompt. Room history, cursors,
+and other agents’ sessions remain intact; shared context stays bounded and
+incremental.
+
+Agents publish shared replies
 through the Room messaging tool; private runtime transcripts stay isolated.
 Plain conversation requires no Thread or Work. Structured requests can attach
 canonical Work and Results, with A2A Task IDs stored as bindings.

@@ -297,34 +297,36 @@ july
 Nếu stdin và stdout đều là TTY, July mở full-screen TUI. Nếu một trong hai bị
 pipe hoặc redirect, July dùng line REPL tương thích script.
 
-### Bước 6: Tạo Work nhiều agent
+### Bước 6: Chat với agent trong Room
 
-Vào Room rồi gọi tên các agent cần làm việc cùng nhau:
+Thêm các agent vào Room trước khi gọi:
+
+```bash
+july room member add VNA pay
+```
 
 ```text
 /room VNA
 @agent_order @pay implement refund flow
+support partial refund too
+@pay giải thích phần refund
+@agent_order kiểm tra callback
+@pay tiếp tục phần refund
 ```
 
-July tạo Work mới, đưa bạn vào luôn, và gửi prompt:
+Mention đầu dòng chọn lại toàn bộ nhóm người nhận. Các câu không mention sau đó
+vẫn gửi cho nhóm đang chọn. Mỗi agent giữ session riêng trong Room; chuyển từ
+pay sang agent_order rồi quay lại pay tiếp tục session pay đang có.
+Không tự tạo Work/Thread hoặc tự thêm thành viên khi mention.
 
-```text
-work	<work-id>	implement refund flow
-```
+Dùng `/new @pay` để bắt đầu session mới cho pay và chọn pay làm người nhận.
+Lệnh chỉ nhận một agent trong Room, từ chối agent không hợp lệ hoặc đang bận.
+Session mới được tạo ở runtime khi gửi câu hỏi tiếp theo; lịch sử Room và
+session của các agent khác được giữ nguyên.
 
-Gõ tiếp là đi vào cùng Work đó:
-
-```text
-> support partial refund too
-```
-
-Nếu một agent chưa phải thành viên Room, mention sẽ thêm nó và báo:
-
-```text
-member	pay	<room-id>
-```
-
-Không cần tạo Thread thủ công, không cần `/thread` trước khi gõ prompt.
+`/back` lần đầu bỏ chọn nhóm và vẫn ở Room; lần tiếp theo quay về context trước.
+Khi vừa vào hoặc quay lại Room, chưa có người nhận: câu chat vẫn được lưu nhưng
+không kích hoạt agent nào.
 
 ## 6. Quản lý adapter và Agent
 
@@ -568,7 +570,7 @@ july room members Payments --json
 
 Room membership và Work membership là hai trạng thái riêng. Agent ở trong Room
 không tự động trở thành thành viên của mọi Work trong Room. Mention `@agent`
-lo cả hai: agent chưa ở trong Room sẽ được thêm vào Room rồi vào Work.
+trong Room chỉ gọi thành viên đã có; không tự thêm membership hoặc tạo Work.
 
 ## 8. Quản lý Thread (admin surface)
 
@@ -671,8 +673,10 @@ Root
 └── Direct work (một agent)
 ```
 
-`/back` chỉ quay lại context trước trong history. Nó không xóa membership,
-không kết thúc Work và không xóa conversation.
+Trong Room có nhóm người nhận, `/back` bỏ chọn nhóm và vẫn ở Room. Khi chưa
+chọn nhóm, `/back` quay lại context trước trong history. Nó không xóa membership,
+không kết thúc Work và không xóa session. Vào hoặc quay lại Room luôn bắt đầu
+với nhóm người nhận trống.
 
 ### Gọi agent bằng `@`
 
@@ -680,25 +684,23 @@ không kết thúc Work và không xóa conversation.
 
 | Bạn gõ                                    | July làm gì                                                  |
 | ----------------------------------------- | ------------------------------------------------------------ |
-| `@agent_order fix callback retry`         | Mở/nối việc trực tiếp với`agent_order`, vào luôn, gửi prompt |
-| `@agent_order`                            | Vào việc trực tiếp, không gửi gì                             |
-| `@agent_order @pay implement refund flow` | Trong Room: tạo Work mới với cả hai, vào luôn, gửi prompt    |
-| `@pay @codex ...` khi đang ở đúng Work đó | Không tạo gì, prompt đi tiếp vào Work hiện tại               |
-| `@nobody hi`                              | Báo`agent nobody does not exist`, giữ nguyên context         |
+| `@agent_order fix callback retry` | Trong Room: chọn agent_order và gửi prompt; ngoài Room dùng luồng việc trực tiếp hiện có |
+| `@agent_order @pay implement refund flow` | Trong Room: chọn cả hai và kích hoạt cả hai |
+| `support partial refund too` | Trong Room: gửi cho nhóm đang chọn; chưa chọn thì chỉ lưu/hiển thị |
+| `@pay tiếp tục` | Thay nhóm người nhận bằng pay, tiếp tục session pay hiện hành |
+| `/new @pay` | Trong Room: bắt đầu session pay mới và chọn pay |
+| `@nobody hi` | Báo lỗi, không thay nhóm người nhận |
 
 Quy tắc bổ sung:
 
-- Thứ tự mention không quan trọng: `@a @b` và `@b @a` là cùng một tập agent.
-- Mention lại đúng tập agent của context đang mở là **tiếp tục**, không tạo mới.
-- Từ Room, mention luôn tạo Work mới — July không đoán rằng việc mới thuộc
-  Work cũ.
-- Nhiều agent bắt buộc phải ở trong Room. Ở Root sẽ báo
-  `work with several agents needs a room; enter one with /room <room>`.
-- Agent chưa là thành viên Room sẽ được thêm, và July in dòng `member ...`.
-- Agent đầu tiên trong mention nhận turn; các agent còn lại vào Work làm
-  thành viên.
-- Text không bắt đầu bằng `@` hay `/`, khi đang ở trong một việc, được gửi
-  nguyên văn cho agent.
+- `@` chọn người nhận khi đứng đầu dòng. Mention mới **thay** toàn bộ nhóm cũ.
+- Agent phải là thành viên Room; mention không tự thêm thành viên hay tạo Work.
+- Các agent được chọn dùng session riêng, không dùng chung một session nhóm.
+- Mention do agent gửi qua A2A không đổi nhóm người nhận của người dùng.
+- `/new @agent` chỉ nhận đúng một target trong Room, từ chối target không hợp lệ
+  hoặc đang bận. Nó giữ lịch sử Room, cursor và session các agent khác; runtime
+  mới khởi tạo ở prompt tiếp theo, dùng ngữ cảnh chung tăng dần có giới hạn,
+  không replay toàn bộ lịch sử hay chia sẻ transcript riêng.
 
 ### Slash commands
 
@@ -709,7 +711,8 @@ Quy tắc bổ sung:
 | `/work <work-id> [--agent <agent>]` | Room, Work           | Vào một Work                                                                                                |
 | `/work`                             | Work                 | Liệt kê work item bên trong Work hiện tại                                                                   |
 | `/dm <agent> [câu hỏi]`             | mọi context          | Mở việc trực tiếp; có câu hỏi thì gửi luôn (tương đương`@agent [câu hỏi]`). Tên agent nhận cả dạng `@agent` |
-| `/back`                             | mọi context          | Quay lại context trước                                                                                      |
+| `/back`                             | mọi context          | Bỏ chọn nhóm trong Room; nếu chưa chọn thì quay lại context trước                                                                                      |
+| `/new @agent` | Room | Bắt đầu session mới cho một agent và chọn agent đó |
 | `/rooms`                            | mọi context          | Liệt kê Room                                                                                                |
 | `/agents`                           | mọi context          | Liệt kê Agent                                                                                               |
 | `/members`                          | Room, Work           | Liệt kê thành viên active                                                                                   |
@@ -731,15 +734,8 @@ Hai command legacy vẫn chạy nhưng không còn xuất hiện trong `/help`:
 
 - Trong một việc, input không khớp slash command và không mở đầu bằng `@`
   được gửi nguyên văn cho agent.
-- Ở Room, text thường **không** bị từ chối: July liệt kê các agent trong Room
-  kèm chính prompt đó đã gắn `@`, bạn chọn bằng cách gõ lại một dòng.
-
-  ```text
-  [vna] > investigate refund issue
-  who should work on this?
-    @agent_order investigate refund issue
-    @pay investigate refund issue
-  ```
+- Ở Room, câu không mention vẫn lưu vào lịch sử chung. Nếu có nhóm người nhận,
+  July kích hoạt nhóm đó; nếu chưa chọn nhóm thì không ai được kích hoạt.
 
 - Ở Root, text thường vẫn bị từ chối vì chưa có live conversation; hãy dùng
   `@agent` hoặc `/room`.
@@ -1003,10 +999,6 @@ Command surface hiện tại không có:
 Các giới hạn này là chủ ý của phiên bản hiện tại, không phải bước cấu hình còn
 thiếu.
 
-Một giới hạn của giao diện, không phải chủ ý: plain prompt trong Room in ra
-danh sách gợi ý chứ chưa phải selector bấm chọn được; bạn chọn bằng cách gõ
-lại một dòng.
-
 ## 15. Cheat sheet
 
 ```bash
@@ -1043,8 +1035,9 @@ july thread list --room VNA --json
 # Trong TUI/REPL — việc thường ngày
 @agent_order fix callback retry              một agent
 /room VNA
-@agent_order @pay implement refund flow      nhiều agent, tạo Work
-support partial refund too                 gõ tiếp vào Work đó
+@agent_order @pay implement refund flow      chọn hai agent trong Room
+support partial refund too                 tiếp tục với hai agent đã chọn
+/new @pay                                 session pay mới, chọn pay
 
 # Điều hướng và tra cứu
 /help

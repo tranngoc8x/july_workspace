@@ -27,6 +27,7 @@ const STORAGE_CAPACITY: usize = 64;
 type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
 enum Command {
+    NewRoomSession(RoomId, AgentId, String, Reply<RoomSessionBinding>),
     ReplaceRoomActivationBinding(
         RoomMessageId,
         AgentId,
@@ -316,6 +317,15 @@ impl StorageWorker {
 }
 
 impl StorageHandle {
+    pub(crate) async fn new_room_session(
+        &self,
+        room: RoomId,
+        agent: AgentId,
+        at: String,
+    ) -> Result<RoomSessionBinding, RuntimeError> {
+        self.request(|reply| Command::NewRoomSession(room, agent, at, reply))
+            .await
+    }
     pub async fn get_agent(&self, id: AgentId) -> Result<Option<Agent>, RuntimeError> {
         self.request(|reply| Command::GetAgent(id, reply)).await
     }
@@ -1644,6 +1654,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::BuildRecoveryCapsule(command, reply) => {
                 let _ = reply.send(build_recovery_capsule(&store, command));
+            }
+            Command::NewRoomSession(room, agent, at, reply) => {
+                let _ = reply.send(store.new_room_session(room, agent, &at));
             }
             Command::ReplaceRoomActivationBinding(message, agent, source, at, reply) => {
                 let _ =
