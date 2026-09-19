@@ -17,7 +17,8 @@ use crossterm::style::{Print, PrintStyledContent, ResetColor, StyledContent};
 use crossterm::terminal::{Clear, ClearType};
 use ratatui::backend::{CrosstermBackend, IntoCrossterm};
 use ratatui::layout::Rect;
-use ratatui::text::{Line, Text};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::support::wrapping::word_wrap_lines;
@@ -53,6 +54,7 @@ pub(super) fn write_above<W: Write>(
     lines: Vec<Line<'static>>,
 ) -> io::Result<()> {
     let width = band.width.max(1);
+    let lines: Vec<Line<'static>> = lines.into_iter().map(flatten_style).collect();
     // The terminal would wrap for us, but then we could not tell how many rows we used, and a
     // wrapped row would push the band out of place. Wrapping here keeps one printed line to one
     // screen row.
@@ -70,6 +72,29 @@ pub(super) fn write_above<W: Write>(
         queue!(backend, Print("\r\n"))?;
     }
     backend.flush()
+}
+
+/// Folds a row's own style into its spans, so that wrapping cannot overwrite them.
+///
+/// `word_wrap_lines` is the composer's toolkit, where the line style is the outer style and is
+/// meant to win: it applies `span.patch_style(line.style)`, which lets the line's colour replace
+/// the span's. A transcript row is the other way round - the line only carries the default body
+/// colour while each span carries what Markdown decided, so folding the line style in underneath
+/// first and then clearing it keeps inline code, quotes and headings their own colour.
+fn flatten_style(line: Line<'static>) -> Line<'static> {
+    let base = line.style;
+    Line {
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span {
+                style: base.patch(span.style),
+                content: span.content,
+            })
+            .collect(),
+        style: Style::default(),
+        alignment: line.alignment,
+    }
 }
 
 fn write_row<W: Write>(backend: &mut CrosstermBackend<W>, row: &Line<'_>) -> io::Result<()> {
@@ -144,6 +169,76 @@ mod tests {
         // clear of the band instead of leaving it underneath.
         assert_eq!(written.matches("\r\n").count(), 2 + 4, "{written:?}");
         assert!(written.contains("\x1b[38;5;1m"), "{written:?}");
+    }
+
+    /// End to end: a stored Room message becomes coloured bytes on the terminal.
+    ///
+    /// The unit tests above feed hand-built rows, so they cannot catch a break between what
+    /// `MarkdownStream` produces and what this module expects.
+    #[test]
+    fn a_stored_room_message_reaches_the_terminal_with_its_markdown_colours() {
+        use crate::tui::app::{App, Context, HistoryAuthor, HistoryEntry};
+
+        let mut app = App::new(Context::root());
+        app.reduce(crate::tui::app::AppEvent::Resize {
+            width: 60,
+            height: 20,
+        });
+        app.apply_history_for_tests(&[HistoryEntry {
+            author: HistoryAuthor::Agent,
+            body: "[agent:pay]\n\nrun `cargo test` then\n\n> check the quote".into(),
+        }]);
+
+        let mut rows = Vec::new();
+        while let Some(block) = app.take_finished_block() {
+            rows.extend(block.lines);
+        }
+        assert!(!rows.is_empty(), "the message should be ready to write");
+
+        let writer = SharedWriter::default();
+        let mut backend = CrosstermBackend::new(writer.clone());
+        write_above(&mut backend, Rect::new(0, 16, 60, 4), rows).unwrap();
+
+        let written = written(&writer);
+        assert!(
+            written.contains("\x1b[38;2;13;205;205mcargo test"),
+            "inline code keeps CODE_COLOR:\n{written:?}"
+        );
+        assert!(
+            written.contains("\x1b[38;2;208;215;222mrun "),
+            "body text keeps AGENT_COLOR:\n{written:?}"
+        );
+        assert!(
+            written.contains("\x1b[38;5;2m") || written.contains("\x1b[32m"),
+            "the quote keeps its own colour:\n{written:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_keeps_its_own_colour_when_the_row_carries_the_body_colour() {
+        let writer = SharedWriter::default();
+        let mut backend = CrosstermBackend::new(writer.clone());
+        // What `markdown::render` produces: the row carries the body colour, each span carries
+        // what Markdown decided for it.
+        let lines = vec![
+            Line::from(vec![
+                Span::raw("run "),
+                Span::styled("cargo test", Style::default().fg(Color::Rgb(13, 205, 205))),
+            ])
+            .style(Style::default().fg(Color::Rgb(208, 215, 222))),
+        ];
+
+        write_above(&mut backend, Rect::new(0, 8, 40, 2), lines).unwrap();
+
+        let written = written(&writer);
+        assert!(
+            written.contains("\x1b[38;2;13;205;205mcargo test"),
+            "inline code keeps its own colour:\n{written:?}"
+        );
+        assert!(
+            written.contains("\x1b[38;2;208;215;222mrun "),
+            "plain text falls back to the body colour:\n{written:?}"
+        );
     }
 
     #[test]

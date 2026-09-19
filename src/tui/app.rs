@@ -932,6 +932,14 @@ impl App {
             .join("\n")
     }
 
+    /// Replays stored history the way a scope switch does, for tests in sibling modules.
+    #[cfg(test)]
+    pub(crate) fn apply_history_for_tests(&mut self, entries: &[HistoryEntry]) {
+        for entry in entries {
+            self.push_history_entry(entry);
+        }
+    }
+
     /// The rows of one finished block, ready for the terminal's scrollback.
     ///
     /// Returns `None` once nothing is left to write; the live tail and the live cells stay in the
