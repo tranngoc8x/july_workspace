@@ -357,11 +357,12 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
 #[tokio::test]
 async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_completion() {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    const BODY: &str = "- `payment_transaction`: nhật ký\n- `payment`: `cash_status`, `vnaClaimId`\n- `order_detail`: `campaign_code`, `reward_status`";
     async fn publish(config: &july_workspace::transport::RoomMessagingConfig) -> bool {
         let Ok(mut stream) = tokio::net::UnixStream::connect(&config.socket).await else {
             return false;
         };
-        let request = json!({"token":config.token,"arguments":{"targets":["infra"],"body":"shared","request_id":"once"}});
+        let request = json!({"token":config.token,"arguments":{"targets":["infra"],"body":BODY,"request_id":"once"}});
         if stream
             .write_all(format!("{request}\n").as_bytes())
             .await
@@ -410,7 +411,7 @@ async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_complet
         if ending != "complete" {
             let shared = active.next_event(NOW.into()).await.unwrap().unwrap();
             assert!(
-                matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == "shared")
+                matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == BODY)
             );
         }
         match ending {
@@ -439,7 +440,7 @@ async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_complet
                 // message must still be delivered first.
                 let shared = active.next_event(NOW.into()).await.unwrap().unwrap();
                 assert!(
-                    matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == "shared")
+                    matches!(shared, RoomRuntimeEvent::SharedMessage(ref saved) if saved.body == BODY)
                 );
                 assert_eq!(
                     active.next_event(NOW.into()).await.unwrap(),
@@ -450,14 +451,9 @@ async fn room_publication_scope_is_revoked_on_cancel_drop_and_unconsumed_complet
         assert!(!publish(&config).await, "{ending}");
         workspace.shutdown(NOW.into()).await.unwrap();
         let store = SqliteStore::open(database.path()).unwrap();
-        assert_eq!(
-            store
-                .list_recent_room_messages(room.id, 10)
-                .unwrap()
-                .0
-                .len(),
-            2
-        );
+        let history = store.list_recent_room_messages(room.id, 10).unwrap().0;
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|message| message.body == BODY));
     }
 }
 
@@ -1214,6 +1210,10 @@ async fn room_cursor_delivers_bounded_context_and_advances_only_after_completion
     assert!(content.contains("send_room_message"), "{content}");
     assert!(content.contains("targets=[]"), "{content}");
     assert!(
+        content.contains("Markdown") && content.contains("backticks"),
+        "{content}"
+    );
+    assert!(
         content.contains("Private runtime output is not published"),
         "{content}"
     );
@@ -1264,6 +1264,10 @@ async fn room_cursor_delivers_bounded_context_and_advances_only_after_completion
         .unwrap();
     let content = observed.lock().unwrap().messages[0].content.clone();
     assert!(content.contains("incremental-only"));
+    assert!(
+        content.contains("Markdown") && content.contains("backticks"),
+        "{content}"
+    );
     assert!(!content.contains("shared-context"));
     assert!(!content.contains("current-trigger"));
     active.cancel(NOW.into()).await.unwrap();

@@ -179,7 +179,7 @@ mod tests {
     fn final_and_hydrated_room_messages_reach_the_terminal_with_markdown_colours() {
         use crate::tui::app::{App, AppEvent, Context, HistoryAuthor, HistoryEntry};
 
-        let body = "[agent:pay]\n\nrun `cargo test` then\n\n> check the quote";
+        let body = "[agent:pay]\n\nrun `cargo test` then\n\n> check the quote\n\n- `payment_transaction`: nhật ký\n- `payment`: `cash_status`, `point_status`, `vnaClaimId`\n- `order_detail`: `cart id`, `campaign_code`, `reward_status`";
         for source in ["final", "hydrated"] {
             let mut app = App::new(Context::root());
             app.reduce(AppEvent::Resize {
@@ -213,6 +213,22 @@ mod tests {
             write_above(&mut backend, Rect::new(0, 16, 60, 4), rows).unwrap();
 
             let written = written(&writer);
+            for identifier in [
+                "payment_transaction",
+                "payment",
+                "order_detail",
+                "cash_status",
+                "point_status",
+                "vnaClaimId",
+                "cart id",
+                "campaign_code",
+                "reward_status",
+            ] {
+                assert!(
+                    written.contains(&format!("\x1b[38;2;13;205;205m{identifier}")),
+                    "{source}: missing code colour for {identifier}: {written:?}"
+                );
+            }
             assert!(
                 written.contains("\x1b[38;2;13;205;205mcargo test"),
                 "{source} inline code keeps CODE_COLOR:\n{written:?}"

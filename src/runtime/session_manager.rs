@@ -154,7 +154,9 @@ impl<T: AgentTransport> SessionManager<T> {
                 "Publish answers intended for this Room with send_room_message before finishing the turn. \
                  Use targets=[] for a shared answer without waking agents; name Room agents only when requesting their attention. \
                  Set reply_to to the Current message ID and reuse request_id when retrying the same publication. \
-                 Private runtime output is not published; do not include reasoning or tool traces in shared messages.\n",
+                 Private runtime output is not published; do not include reasoning or tool traces in shared messages. \
+                 Write the shared body as Markdown. Wrap table, column, field, function, command, and path identifiers in backticks; \
+                 use fenced code blocks for multi-line snippets. Preserve Markdown formatting when publishing with send_room_message.\n",
             );
             content.push_str("For explicit lifecycle-bearing delegation, add work={action:create,title:...,goal:...} to send_room_message with one owner target and request_id. Omit work for questions and ordinary answers. Existing delegation can be referenced with work={action:bind,work_id:...}.\n");
             if truncated {
