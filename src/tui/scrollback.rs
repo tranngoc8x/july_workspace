@@ -176,42 +176,56 @@ mod tests {
     /// The unit tests above feed hand-built rows, so they cannot catch a break between what
     /// `MarkdownStream` produces and what this module expects.
     #[test]
-    fn a_stored_room_message_reaches_the_terminal_with_its_markdown_colours() {
-        use crate::tui::app::{App, Context, HistoryAuthor, HistoryEntry};
+    fn final_and_hydrated_room_messages_reach_the_terminal_with_markdown_colours() {
+        use crate::tui::app::{App, AppEvent, Context, HistoryAuthor, HistoryEntry};
 
-        let mut app = App::new(Context::root());
-        app.reduce(crate::tui::app::AppEvent::Resize {
-            width: 60,
-            height: 20,
-        });
-        app.apply_history_for_tests(&[HistoryEntry {
-            author: HistoryAuthor::Agent,
-            body: "[agent:pay]\n\nrun `cargo test` then\n\n> check the quote".into(),
-        }]);
+        let body = "[agent:pay]\n\nrun `cargo test` then\n\n> check the quote";
+        for source in ["final", "hydrated"] {
+            let mut app = App::new(Context::root());
+            app.reduce(AppEvent::Resize {
+                width: 60,
+                height: 20,
+            });
+            match source {
+                "final" => {
+                    app.reduce(AppEvent::RoomMessage(body.into()));
+                }
+                "hydrated" => {
+                    app.apply_history_for_tests(&[HistoryEntry {
+                        author: HistoryAuthor::Agent,
+                        body: body.into(),
+                    }]);
+                }
+                _ => unreachable!(),
+            };
 
-        let mut rows = Vec::new();
-        while let Some(block) = app.take_finished_block() {
-            rows.extend(block.lines);
+            let mut rows = Vec::new();
+            while let Some(block) = app.take_finished_block() {
+                rows.extend(block.lines);
+            }
+            assert!(
+                !rows.is_empty(),
+                "{source} message should be ready to write"
+            );
+
+            let writer = SharedWriter::default();
+            let mut backend = CrosstermBackend::new(writer.clone());
+            write_above(&mut backend, Rect::new(0, 16, 60, 4), rows).unwrap();
+
+            let written = written(&writer);
+            assert!(
+                written.contains("\x1b[38;2;13;205;205mcargo test"),
+                "{source} inline code keeps CODE_COLOR:\n{written:?}"
+            );
+            assert!(
+                written.contains("\x1b[38;2;208;215;222mrun "),
+                "{source} body text keeps AGENT_COLOR:\n{written:?}"
+            );
+            assert!(
+                written.contains("\x1b[38;5;2m") || written.contains("\x1b[32m"),
+                "{source} quote keeps its own colour:\n{written:?}"
+            );
         }
-        assert!(!rows.is_empty(), "the message should be ready to write");
-
-        let writer = SharedWriter::default();
-        let mut backend = CrosstermBackend::new(writer.clone());
-        write_above(&mut backend, Rect::new(0, 16, 60, 4), rows).unwrap();
-
-        let written = written(&writer);
-        assert!(
-            written.contains("\x1b[38;2;13;205;205mcargo test"),
-            "inline code keeps CODE_COLOR:\n{written:?}"
-        );
-        assert!(
-            written.contains("\x1b[38;2;208;215;222mrun "),
-            "body text keeps AGENT_COLOR:\n{written:?}"
-        );
-        assert!(
-            written.contains("\x1b[38;5;2m") || written.contains("\x1b[32m"),
-            "the quote keeps its own colour:\n{written:?}"
-        );
     }
 
     #[test]
