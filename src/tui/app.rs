@@ -1068,7 +1068,6 @@ impl App {
     fn freeze_stream(&mut self) {
         self.markdown.finish();
     }
-
 }
 
 /// ponytail: terminal cells have no line-height; one spacer row between consecutive non-empty
@@ -1145,8 +1144,6 @@ mod tests {
             })
         })
     }
-
-
 
     /// Commands dispatched one after another must not pile up in the draft.
     ///
