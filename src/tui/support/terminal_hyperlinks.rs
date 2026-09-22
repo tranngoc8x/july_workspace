@@ -5,7 +5,6 @@
 
 mod paragraph;
 
-
 use std::num::NonZeroU16;
 use std::ops::Range;
 
@@ -382,7 +381,9 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
         .rsplit('@')
         .next()
         .unwrap_or_default();
-    let host = authority.rsplit_once(':').map_or(authority, |(host, _)| host);
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
     let host = host.strip_prefix('[').map_or(host, |rest| {
         rest.split_once(']').map_or(rest, |(host, _)| host)
     });
@@ -392,11 +393,7 @@ pub(crate) fn web_destination(destination: &str) -> Option<String> {
 /// Strips a case-insensitive `http://` or `https://` prefix.
 fn strip_web_scheme(destination: &str) -> Option<&str> {
     let (scheme, rest) = destination.split_once("://")?;
-    matches!(
-        scheme.to_ascii_lowercase().as_str(),
-        "http" | "https"
-    )
-    .then_some(rest)
+    matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https").then_some(rest)
 }
 
 fn sanitized_destination(destination: &str) -> Option<String> {
@@ -631,7 +628,6 @@ fn mark_matching_cells(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,7 +775,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn buffer_hyperlinks_follow_wrapped_wide_glyphs() {
         let destination = "https://example.com/wide";
@@ -910,5 +905,4 @@ mod tests {
             ]
         );
     }
-
 }

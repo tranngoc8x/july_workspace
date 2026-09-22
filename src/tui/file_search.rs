@@ -180,7 +180,11 @@ mod tests {
     fn noisy_directories_are_never_offered() {
         let root = workspace(
             "skipped",
-            &["target/debug/build.rs", "node_modules/pkg/build.rs", "build.rs"],
+            &[
+                "target/debug/build.rs",
+                "node_modules/pkg/build.rs",
+                "build.rs",
+            ],
         );
 
         let found = paths(&root, "build.rs");
@@ -194,7 +198,10 @@ mod tests {
 
         let migrations = search(&root, "migrations", 20);
 
-        assert_eq!(migrations.first().map(|found| found.match_type), Some(MatchType::Directory));
+        assert_eq!(
+            migrations.first().map(|found| found.match_type),
+            Some(MatchType::Directory)
+        );
     }
 
     #[test]

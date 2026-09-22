@@ -22,13 +22,13 @@ pub(crate) fn answered_question_framing(question: &str) -> String {
     format!("> {}\n\n", question.replace(['\n', '\r'], " "))
 }
 
-use crate::tui::bottom_pane::events::PaneEventSender;
 use crate::tui::bottom_pane::CancellationEvent;
 use crate::tui::bottom_pane::ChatComposer;
 use crate::tui::bottom_pane::ChatComposerConfig;
 use crate::tui::bottom_pane::InputResult;
 use crate::tui::bottom_pane::bottom_pane_view::BottomPaneView;
 use crate::tui::bottom_pane::chat_composer::ComposerDraft;
+use crate::tui::bottom_pane::events::PaneEventSender;
 use crate::tui::bottom_pane::scroll_state::ScrollState;
 use crate::tui::bottom_pane::selection_popup_common::GenericDisplayRow;
 use crate::tui::bottom_pane::selection_popup_common::measure_rows_height;
@@ -276,4 +276,3 @@ impl AsyncQuestions {
         self.state.pending.len()
     }
 }
-

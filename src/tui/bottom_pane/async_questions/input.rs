@@ -19,7 +19,11 @@ impl AsyncQuestions {
             .map(|answer| answer.draft.text.trim())
             .filter(|text| !text.is_empty())
             .map(|text| &text[..text.floor_char_boundary(512)])
-            .map(|text| crate::tui::support::text_formatting::truncate_text(text, /*max_graphemes*/ 128))
+            .map(|text| {
+                crate::tui::support::text_formatting::truncate_text(
+                    text, /*max_graphemes*/ 128,
+                )
+            })
             .unwrap_or_else(|| self.other_placeholder().to_string())
     }
 
@@ -141,7 +145,8 @@ impl BottomPaneView for AsyncQuestions {
         if self.focus_is_notes() {
             self.composer.keymap_contexts().with(KeymapContext::Chat)
         } else {
-            crate::tui::support::keymap::KeymapContextSet::new(KeymapContext::List).with(KeymapContext::Chat)
+            crate::tui::support::keymap::KeymapContextSet::new(KeymapContext::List)
+                .with(KeymapContext::Chat)
         }
     }
 

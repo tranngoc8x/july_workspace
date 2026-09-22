@@ -201,7 +201,6 @@ impl WidgetRef for CommandPopup {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{CommandPopup, SlashCommand};

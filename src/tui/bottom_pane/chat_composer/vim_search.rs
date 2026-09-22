@@ -21,4 +21,3 @@ impl ChatComposer {
         query.cursor_pos(inset_footer_hint_area(footer))
     }
 }
-

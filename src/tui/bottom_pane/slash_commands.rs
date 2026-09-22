@@ -105,7 +105,9 @@ mod tests {
     #[test]
     fn lookup_is_exact_not_prefix() {
         assert_eq!(
-            find_slash_command("dm", &commands()).as_ref().map(SlashCommand::command),
+            find_slash_command("dm", &commands())
+                .as_ref()
+                .map(SlashCommand::command),
             Some("dm")
         );
         assert_eq!(find_slash_command("d", &commands()), None);

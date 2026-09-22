@@ -152,7 +152,6 @@ impl CustomPromptView {
                 self.paste_burst.clear_after_explicit_paste();
             }
         }
-
     }
 }
 
@@ -192,7 +191,6 @@ impl BottomPaneView for CustomPromptView {
         true
     }
 }
-
 
 impl Renderable for CustomPromptView {
     fn desired_height(&self, width: u16) -> u16 {

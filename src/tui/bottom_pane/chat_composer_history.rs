@@ -302,7 +302,6 @@ impl ChatComposerHistory {
         }
     }
 
-
     /// Updates persistent history metadata when a new session is configured.
     ///
     /// Startup-local entries survive the first session configuration because they were recorded
@@ -757,7 +756,9 @@ impl ChatComposerHistory {
                         app_event_tx,
                     );
                 }
-                if let (Some(context), Some(log_id)) = (self.context.clone(), self.persistent_log_id) {
+                if let (Some(context), Some(log_id)) =
+                    (self.context.clone(), self.persistent_log_id)
+                {
                     if let Some(search) = self.search.as_mut() {
                         search.awaiting = Some(PendingHistorySearch::Entry {
                             offset,
@@ -995,5 +996,3 @@ impl HistorySearchState {
         self.exhausted_newer = false;
     }
 }
-
-

@@ -528,7 +528,10 @@ fn assert_restored(child: PtyChild, context: Option<String>) {
         !contains(&output, ENTER_SCREEN),
         "{context} entered the alternate screen"
     );
-    assert!(contains(&output, PURGE), "{context} never cleared the screen");
+    assert!(
+        contains(&output, PURGE),
+        "{context} never cleared the screen"
+    );
     assert!(contains(&output, HIDE_CURSOR), "{context} never hid cursor");
     assert!(
         contains(&output, PUSH_KEYBOARD),

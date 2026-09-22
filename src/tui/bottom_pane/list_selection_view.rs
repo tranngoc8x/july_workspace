@@ -128,8 +128,7 @@ pub(crate) struct SelectionToggle {
 /// Callback invoked whenever the highlighted item changes (arrow keys, search
 /// filter, number-key jump).  Receives the *actual* index into the unfiltered
 /// `items` list and the event sender.  Used by the theme picker for live preview.
-pub(crate) type OnSelectionChangedCallback =
-    Option<Box<dyn Fn(usize, &PaneEventSender)>>;
+pub(crate) type OnSelectionChangedCallback = Option<Box<dyn Fn(usize, &PaneEventSender)>>;
 
 /// Callback invoked when the picker is dismissed without accepting (Esc or
 /// Ctrl+C).  Used by the theme picker to restore the pre-open theme.
@@ -999,7 +998,9 @@ impl ListSelectionView {
 
 impl BottomPaneView for ListSelectionView {
     fn keymap_contexts(&self) -> crate::tui::support::keymap::KeymapContextSet {
-        crate::tui::support::keymap::KeymapContextSet::new(crate::tui::support::keymap::KeymapContext::List)
+        crate::tui::support::keymap::KeymapContextSet::new(
+            crate::tui::support::keymap::KeymapContext::List,
+        )
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) {
@@ -1480,5 +1481,3 @@ impl ListSelectionView {
         self.rendered_item_count.get()
     }
 }
-
-

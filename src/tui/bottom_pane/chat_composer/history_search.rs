@@ -513,6 +513,3 @@ impl ChatComposer {
         Some((desired_x.min(max_x), area.y))
     }
 }
-
-
-

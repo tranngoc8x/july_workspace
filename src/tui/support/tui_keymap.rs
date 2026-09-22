@@ -635,4 +635,3 @@ mod tests {
         assert!(normalize_keybinding_spec("f25").is_err());
     }
 }
-

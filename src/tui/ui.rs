@@ -4,9 +4,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use super::SYSTEM_COLOR;
 use super::app::{App, TurnState};
 use super::support::render::renderable::Renderable;
-use super::SYSTEM_COLOR;
 
 pub fn render(frame: &mut Frame, app: &App) {
     // The frame is the bottom band july owns, not the whole screen: finished transcript rows live
@@ -63,7 +63,6 @@ pub fn render(frame: &mut Frame, app: &App) {
     {
         frame.set_cursor_position((x, y));
     }
-
 }
 
 #[cfg(test)]
@@ -141,7 +140,10 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
 
         let line = footer(&terminal, &app, 12);
-        assert!(line.contains("! boom"), "an error replaces the hint: {line:?}");
+        assert!(
+            line.contains("! boom"),
+            "an error replaces the hint: {line:?}"
+        );
     }
 
     /// Renders the whole composer surface end to end: draft, slash popup, mention popup.
@@ -178,9 +180,8 @@ mod tests {
             app.reduce(AppEvent::Tick);
         }
 
-        let mut app = App::new(
-            Context::root().with_commands(vec!["/status".into(), "/start".into()]),
-        );
+        let mut app =
+            App::new(Context::root().with_commands(vec!["/status".into(), "/start".into()]));
         app.reduce(AppEvent::Resize {
             width: 72,
             height: 16,
@@ -218,12 +219,8 @@ mod tests {
         let mention = screen(&terminal);
         assert!(mention.contains("agent_order"), "mention popup:\n{mention}");
         assert!(mention.contains("cashflow"), "mention popup:\n{mention}");
-        assert!(
-            mention.contains("Agent"),
-            "agents are labelled:\n{mention}"
-        );
+        assert!(mention.contains("Agent"), "agents are labelled:\n{mention}");
     }
-
 
     /// Two agents streaming at once each get their own labelled block with a cursor.
     #[test]

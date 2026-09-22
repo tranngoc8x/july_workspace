@@ -19,12 +19,12 @@ use crossterm::event::KeyModifiers;
 mod layout;
 pub(super) mod render;
 
-use crate::tui::bottom_pane::events::{NoticeLevel, PaneEvent, PaneEventSender};
 use crate::tui::bottom_pane::CancellationEvent;
 use crate::tui::bottom_pane::ChatComposer;
 use crate::tui::bottom_pane::ChatComposerConfig;
 use crate::tui::bottom_pane::InputResult;
 use crate::tui::bottom_pane::bottom_pane_view::BottomPaneView;
+use crate::tui::bottom_pane::events::{NoticeLevel, PaneEvent, PaneEventSender};
 use crate::tui::bottom_pane::scroll_state::ScrollState;
 use crate::tui::bottom_pane::selection_popup_common::GenericDisplayRow;
 use crate::tui::bottom_pane::selection_popup_common::measure_rows_height;
@@ -658,7 +658,8 @@ impl RequestUserInputOverlay {
         if let Some(interrupt_key) = self.interrupt_turn_hint
             && !(self.has_options()
                 && notes_visible
-                && interrupt_key == ShortcutHint::Single(crate::tui::support::key_hint::plain(KeyCode::Esc)))
+                && interrupt_key
+                    == ShortcutHint::Single(crate::tui::support::key_hint::plain(KeyCode::Esc)))
         {
             tips.push(FooterTip::new(format!(
                 "{} to interrupt",
@@ -769,10 +770,7 @@ impl RequestUserInputOverlay {
                 .is_some_and(|options| !options.is_empty())
     }
 
-    fn option_label_for_index(
-        question: &UserInputQuestion,
-        idx: usize,
-    ) -> Option<String> {
+    fn option_label_for_index(question: &UserInputQuestion, idx: usize) -> Option<String> {
         let options = question.options.as_ref()?;
         if idx < options.len() {
             return options.get(idx).map(|opt| opt.label.clone());
@@ -1188,8 +1186,10 @@ impl BottomPaneView for RequestUserInputOverlay {
             return crate::tui::support::keymap::KeymapContextSet::default();
         }
         if matches!(self.focus, Focus::Options) {
-            return crate::tui::support::keymap::KeymapContextSet::new(crate::tui::support::keymap::KeymapContext::List)
-                .with(crate::tui::support::keymap::KeymapContext::Chat);
+            return crate::tui::support::keymap::KeymapContextSet::new(
+                crate::tui::support::keymap::KeymapContext::List,
+            )
+            .with(crate::tui::support::keymap::KeymapContext::Chat);
         }
         self.composer
             .keymap_contexts()
@@ -1505,7 +1505,4 @@ impl BottomPaneView for RequestUserInputOverlay {
             .chain(self.composer.footer_flash_delay())
             .min()
     }
-
 }
-
-

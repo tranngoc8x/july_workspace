@@ -1347,5 +1347,3 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
         label: " reasoning up",
     },
 ];
-
-

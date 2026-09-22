@@ -99,4 +99,3 @@ pub(crate) fn truncate_line_with_ellipsis_if_overflow(
         spans,
     }
 }
-

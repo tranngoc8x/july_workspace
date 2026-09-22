@@ -210,13 +210,13 @@
 //! overall state machine, since it affects which transitions are even possible from a given UI
 //! state.
 //!
+use super::chat_composer_history::HistoryBatchCursor;
 use crate::tui::support::key_hint;
 use crate::tui::support::key_hint::KeyBinding;
 use crate::tui::support::key_hint::ShortcutHint;
 use crate::tui::support::key_hint::has_ctrl_or_alt;
 use crate::tui::support::line_truncation::truncate_line_with_ellipsis_if_overflow;
 use crate::tui::support::ui_consts::FOOTER_INDENT_COLS;
-use super::chat_composer_history::HistoryBatchCursor;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
@@ -237,12 +237,10 @@ use ratatui::widgets::StatefulWidgetRef;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
-
 use super::chat_composer_history::ChatComposerHistory;
 use super::chat_composer_history::HistoryEntry;
 use super::chat_composer_history::HistoryEntryResponse;
 use super::chat_composer_history::HistorySearchResult;
-use super::slash_commands::SlashCommand;
 use super::file_search_popup::FileSearchPopup;
 use super::footer::CollaborationModeIndicator;
 use super::footer::FooterKeyHints;
@@ -274,6 +272,8 @@ use super::mentions_v2::MentionV2Selection;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use super::prompt_args::parse_slash_name;
+use super::slash_commands::SlashCommand;
+use crate::tui::app::ContextId;
 use crate::tui::bottom_pane::paste_burst::FlushResult;
 use crate::tui::support::key_hint::KeyBindingListExt;
 use crate::tui::support::keymap::EditorKeymap;
@@ -282,12 +282,11 @@ use crate::tui::support::keymap::KeymapContextSet;
 use crate::tui::support::keymap::RuntimeKeymap;
 use crate::tui::support::keymap::VimNormalKeymap;
 use crate::tui::support::keymap::user_bindings;
-use crate::tui::support::terminal_hyperlinks::mark_underlined_hyperlink;
 use crate::tui::support::render::Insets;
 use crate::tui::support::render::RectExt;
 use crate::tui::support::render::renderable::Renderable;
 use crate::tui::support::style::user_message_style;
-use crate::tui::app::ContextId;
+use crate::tui::support::terminal_hyperlinks::mark_underlined_hyperlink;
 use crate::tui::user_input::ByteRange;
 use crate::tui::user_input::MAX_USER_INPUT_TEXT_CHARS;
 use crate::tui::user_input::TextElement;
@@ -318,14 +317,14 @@ use self::slash_input::SlashInput;
 use self::slash_input::SlashValidation;
 use self::slash_input::SubmissionValidation;
 use self::vim_history::VimHistory;
-use crate::tui::bottom_pane::events::{NoticeLevel, PaneEvent};
-use crate::tui::bottom_pane::events::PaneEventSender;
 use crate::tui::bottom_pane::LocalImageAttachment;
 use crate::tui::bottom_pane::MentionBinding;
+use crate::tui::bottom_pane::events::PaneEventSender;
+use crate::tui::bottom_pane::events::{NoticeLevel, PaneEvent};
 use crate::tui::bottom_pane::textarea::KillBufferSnapshot;
 use crate::tui::bottom_pane::textarea::TextArea;
-use crate::tui::support::ui_consts::LIVE_PREFIX_COLS;
 use crate::tui::file_search::FileMatch;
+use crate::tui::support::ui_consts::LIVE_PREFIX_COLS;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -374,7 +373,6 @@ pub enum InputResult {
     CommandWithArgs(SlashCommand, String, Vec<TextElement>),
     None,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedInputAction {
@@ -2740,8 +2738,7 @@ impl ChatComposer {
             let defer_slash_validation = self.slash_input().should_parse_on_dequeue(raw_text);
             let preserve_pending_pastes = defer_slash_validation
                 && !self.draft.pending_pastes.is_empty()
-                && parse_slash_name(raw_text)
-                    .is_some_and(|(name, _, _)| name == "goal");
+                && parse_slash_name(raw_text).is_some_and(|(name, _, _)| name == "goal");
             let pending_pastes = if preserve_pending_pastes {
                 self.draft.pending_pastes.clone()
             } else {
@@ -3374,7 +3371,8 @@ impl ChatComposer {
         let is_wsl = {
             #[cfg(target_os = "linux")]
             {
-                mode == FooterMode::ShortcutOverlay && crate::tui::support::clipboard_paste::is_probably_wsl()
+                mode == FooterMode::ShortcutOverlay
+                    && crate::tui::support::clipboard_paste::is_probably_wsl()
             }
             #[cfg(not(target_os = "linux"))]
             {
@@ -4231,7 +4229,9 @@ impl ChatComposer {
                 } else if self.luna_reserve_active {
                     // Reserve keeps one arrow at every reasoning effort; only its foreground changes.
                     "›"
-                        .fg(crate::tui::support::terminal_palette::best_color((246, 197, 67)))
+                        .fg(crate::tui::support::terminal_palette::best_color((
+                            246, 197, 67,
+                        )))
                         .bold()
                 } else {
                     "›".bold()
@@ -4300,10 +4300,3 @@ impl ChatComposer {
         drop(state);
     }
 }
-
-
-
-
-
-
-

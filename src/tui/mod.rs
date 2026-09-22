@@ -22,13 +22,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub mod app;
-mod markdown;
-/// Writing finished transcript rows into the terminal's scrollback.
-mod scrollback;
 /// The composer and everything that can take the bottom of the screen from it.
 pub(crate) mod bottom_pane;
 /// Finding workspace files for the composer's `@` popup.
 pub mod file_search;
+mod markdown;
+/// Writing finished transcript rows into the terminal's scrollback.
+mod scrollback;
 /// Rendering, wrapping, and key-binding primitives the composer is built on.
 pub(crate) mod support;
 pub mod ui;
@@ -157,7 +157,10 @@ impl<W: Write, R: RawMode> TerminalGuard<W, R> {
         // whatever july left on screen.
         let leave = execute!(
             self.writer,
-            MoveTo(0, size().map(|(_, rows)| rows.saturating_sub(1)).unwrap_or(0)),
+            MoveTo(
+                0,
+                size().map(|(_, rows)| rows.saturating_sub(1)).unwrap_or(0)
+            ),
             Print("\r\n"),
             DisableBracketedPaste
         );
@@ -385,8 +388,12 @@ fn handle_event<B: Backend>(
 /// The live region is capped at half the screen so a long unfinished block cannot push the
 /// scrollback off; the band then shows its tail, which is where the new text is.
 fn viewport_band(screen: Size, app: &App) -> Rect {
-    let live = scrollback::rendered_rows(app.transcript_text(), screen.width)
-        .min(screen.height.saturating_sub(app.input_height().saturating_add(1)) / 2);
+    let live = scrollback::rendered_rows(app.transcript_text(), screen.width).min(
+        screen
+            .height
+            .saturating_sub(app.input_height().saturating_add(1))
+            / 2,
+    );
     let height = live
         .saturating_add(app.input_height())
         .saturating_add(1)
@@ -437,10 +444,7 @@ fn draw_inactive<B: Backend>(terminal: &mut Terminal<B>, app: &App) -> Result<()
 ///
 /// Writing above the band scrolls the screen, so the band has to be repainted afterwards - which
 /// this does by ending in the ordinary draw.
-fn draw<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    app: &mut App,
-) -> io::Result<()> {
+fn draw<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>, app: &mut App) -> io::Result<()> {
     if app.take_scope_changed() {
         // Everything on screen and in scrollback belongs to the scope being left. The new scope's
         // history is already rebuilt in the app, so the loop below writes it into a clean terminal.
@@ -704,8 +708,15 @@ mod tests {
         let idle = viewport_band(screen, &app);
         assert_eq!(idle.x, 0);
         assert_eq!(idle.width, screen.width);
-        assert_eq!(idle.bottom(), screen.height, "the band is pinned to the bottom");
-        assert!(idle.height < screen.height, "scrollback keeps the rows above");
+        assert_eq!(
+            idle.bottom(),
+            screen.height,
+            "the band is pinned to the bottom"
+        );
+        assert!(
+            idle.height < screen.height,
+            "scrollback keeps the rows above"
+        );
 
         // A block still being streamed grows the band, because it has nowhere else to be drawn.
         app.reduce(app::AppEvent::Chat(ChatEvent::TextDelta(

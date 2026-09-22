@@ -559,7 +559,9 @@ fn url_host(rest: &str) -> &str {
         .rsplit('@')
         .next()
         .unwrap_or_default();
-    let host = authority.rsplit_once(':').map_or(authority, |(host, _)| host);
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host);
     host.strip_prefix('[').map_or(host, |rest| {
         rest.split_once(']').map_or(rest, |(host, _)| host)
     })
@@ -1841,7 +1843,10 @@ them."#
         for grapheme in ["ｶﾞﾞ", "界ﾞ"] {
             for width in [1, 2] {
                 let ranges = wrap_ranges(grapheme, Options::new(width));
-                assert_eq!(ranges, std::iter::once(0..grapheme.len() + 1).collect::<Vec<_>>());
+                assert_eq!(
+                    ranges,
+                    std::iter::once(0..grapheme.len() + 1).collect::<Vec<_>>()
+                );
             }
         }
     }

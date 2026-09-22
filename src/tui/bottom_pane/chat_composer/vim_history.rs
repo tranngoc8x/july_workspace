@@ -27,8 +27,7 @@ pub(super) struct VimHistory {
 impl ComposerDraft {
     fn vim_history_bytes(&self) -> usize {
         let mut bytes = self.text.len()
-            + self.text_elements.len()
-                * std::mem::size_of::<crate::tui::user_input::TextElement>();
+            + self.text_elements.len() * std::mem::size_of::<crate::tui::user_input::TextElement>();
         for path in &self.local_image_paths {
             bytes += path.as_os_str().len();
         }
@@ -214,4 +213,3 @@ impl ChatComposer {
         self.vim_history.trim();
     }
 }
-

@@ -219,4 +219,3 @@ pub(super) fn cursor_position(
         Some((row, col.min(width.saturating_sub(1))))
     }
 }
-

@@ -805,5 +805,3 @@ fn measure_rows_height_inner(
     }
     total.max(1)
 }
-
-

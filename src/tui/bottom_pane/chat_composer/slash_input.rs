@@ -6,9 +6,9 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 
-use crate::tui::bottom_pane::slash_commands::SlashCommand;
 use crate::tui::bottom_pane::command_popup::CommandPopup;
 use crate::tui::bottom_pane::prompt_args::parse_slash_name;
+use crate::tui::bottom_pane::slash_commands::SlashCommand;
 use crate::tui::bottom_pane::slash_commands::find_slash_command;
 use crate::tui::bottom_pane::slash_commands::has_slash_command_prefix;
 use crate::tui::user_input::ByteRange;
@@ -44,11 +44,7 @@ pub(super) struct SlashInput<'a> {
 }
 
 impl<'a> SlashInput<'a> {
-    pub(super) fn new(
-        enabled: bool,
-        is_bash_mode: bool,
-        commands: &'a [SlashCommand],
-    ) -> Self {
+    pub(super) fn new(enabled: bool, is_bash_mode: bool, commands: &'a [SlashCommand]) -> Self {
         Self {
             enabled,
             is_bash_mode,
@@ -339,8 +335,7 @@ impl ChatComposer {
         selected_cmd: &SlashCommand,
     ) -> bool {
         let cmd = selected_cmd;
-        {
-        };
+        {};
         if !cmd.supports_inline_args() {
             return false;
         }
@@ -525,5 +520,3 @@ fn command_under_cursor(first_line: &str, cursor: usize) -> Option<(&str, &str)>
 
     Some((name, rest))
 }
-
-

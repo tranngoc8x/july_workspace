@@ -206,10 +206,12 @@ or a two-stroke chord such as `ctrl-x ctrl-t`.",
                 self.bindings
                     .iter()
                     .find(|binding| binding.action == action)
-                    .map(|binding| crate::tui::support::key_hint::ShortcutHint::Chord {
-                        prefix: binding.chord.prefix,
-                        completion: binding.chord.completion,
-                    })
+                    .map(
+                        |binding| crate::tui::support::key_hint::ShortcutHint::Chord {
+                            prefix: binding.chord.prefix,
+                            completion: binding.chord.completion,
+                        },
+                    )
             })
     }
 }
@@ -540,4 +542,3 @@ Choose a different chord and retry.",
 
     Ok(())
 }
-

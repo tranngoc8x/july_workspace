@@ -85,8 +85,8 @@ pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use events::PaneEvent;
-pub(crate) use slash_commands::SlashCommand;
 pub(crate) use list_selection_view::{ListSelectionView, SelectionItem, SelectionViewParams};
+pub(crate) use slash_commands::SlashCommand;
 
 /// How long the "press again to quit" hint stays visible.
 pub(crate) const QUIT_SHORTCUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -192,7 +192,8 @@ impl BottomPane {
                 .view_stack
                 .last_mut()
                 .expect("view stack checked non-empty");
-            let prefer_esc = key_event.code == KeyCode::Esc && view.prefer_esc_to_handle_key_event();
+            let prefer_esc =
+                key_event.code == KeyCode::Esc && view.prefer_esc_to_handle_key_event();
             let completed_by_escape = key_event.code == KeyCode::Esc
                 && !prefer_esc
                 && matches!(view.on_ctrl_c(), CancellationEvent::Handled)
@@ -254,7 +255,6 @@ impl BottomPane {
     pub(crate) fn insert_str(&mut self, text: &str) {
         self.composer.insert_str(text);
     }
-
 
     /// Which keymap contexts can consume the next key, for rendering shortcut hints.
     pub(crate) fn keymap_contexts(&self) -> KeymapContextSet {
@@ -489,8 +489,6 @@ impl BottomPane {
         self.show_view(Box::new(view));
     }
 
-
-
     /// Removes the top view if it carries `view_id`.
     pub(crate) fn dismiss_active_view_if_id(&mut self, view_id: &'static str) -> bool {
         if self.active_view_id() != Some(view_id) {
@@ -654,13 +652,6 @@ mod tests {
         })
     }
 
-
-
-
-
-
-
-
     #[test]
     fn dismissing_by_id_only_matches_that_view() {
         let mut pane = pane();
@@ -683,5 +674,4 @@ mod tests {
         assert!(pane.dismiss_view_by_id("parent"));
         assert_eq!(pane.active_view_id(), Some("child"));
     }
-
 }

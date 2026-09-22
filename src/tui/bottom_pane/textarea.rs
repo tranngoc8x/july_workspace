@@ -2259,5 +2259,3 @@ impl TextArea {
         }
     }
 }
-
-

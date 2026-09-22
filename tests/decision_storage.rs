@@ -311,7 +311,8 @@ fn escalate(store: &mut SqliteStore, seeded: &Seeded, owner: DecisionOwner) -> (
     store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.agent_order, vec!["log:timeout".into()]).decided_by(owner),
+            &HandoffChallenge::new(seeded.agent_order, vec!["log:timeout".into()])
+                .decided_by(owner),
             ROUND_ONE,
         )
         .unwrap();
@@ -325,7 +326,8 @@ fn escalate(store: &mut SqliteStore, seeded: &Seeded, owner: DecisionOwner) -> (
     let (handoff, decision) = store
         .challenge_handoff(
             handoff.id,
-            &HandoffChallenge::new(seeded.agent_order, vec!["commit:9f21a".into()]).decided_by(owner),
+            &HandoffChallenge::new(seeded.agent_order, vec!["commit:9f21a".into()])
+                .decided_by(owner),
             ROUND_TWO,
         )
         .unwrap();

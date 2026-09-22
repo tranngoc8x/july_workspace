@@ -1151,9 +1151,11 @@ mod tests {
     /// so without clearing it the next command is typed onto the end of the last one.
     #[test]
     fn a_dispatched_command_leaves_the_draft_empty_for_the_next_one() {
-        let mut app = App::new(
-            Context::root().with_commands(vec!["/room".into(), "/dm".into(), "/back".into()]),
-        );
+        let mut app = App::new(Context::root().with_commands(vec![
+            "/room".into(),
+            "/dm".into(),
+            "/back".into(),
+        ]));
 
         for character in "/room vna".chars() {
             app.reduce(AppEvent::Key(key(KeyCode::Char(character))));
@@ -1207,7 +1209,6 @@ mod tests {
         assert!(refused.is_empty());
         assert_eq!(app.input(), "/room other");
     }
-
 
     /// Ctrl+C must still quit once a cancel is under way, even with a prompt open.
     ///
@@ -1478,7 +1479,9 @@ mod tests {
         }
 
         assert!(
-            blocks.iter().all(|block| !block.contains("already printed")),
+            blocks
+                .iter()
+                .all(|block| !block.contains("already printed")),
             "{blocks:?}"
         );
     }
@@ -1490,7 +1493,10 @@ mod tests {
 
         switch_to(&mut app, room("beta"));
         assert!(app.take_scope_changed());
-        assert!(!app.take_scope_changed(), "asking twice does not erase twice");
+        assert!(
+            !app.take_scope_changed(),
+            "asking twice does not erase twice"
+        );
 
         // A refresh of the same scope - a new label or command list - is not a switch.
         switch_to(&mut app, room("beta"));

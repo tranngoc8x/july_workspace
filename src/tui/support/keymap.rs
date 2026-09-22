@@ -36,8 +36,6 @@ mod chords;
 mod vim_search;
 pub(crate) use vim_search::VimSearchKeymap;
 
-
-
 pub(crate) use bindings::KeymapContext;
 pub(crate) use bindings::bindings_for_action;
 pub(crate) use bindings::keymap_action_id;
@@ -1863,8 +1861,10 @@ impl RuntimeKeymap {
         ] {
             if bindings.iter().any(|binding| {
                 let (code, modifiers) = binding.parts();
-                crate::tui::support::key_hint::is_plain_text_key_event(KeyEvent::new(code, modifiers))
-                    || matches!(code, KeyCode::Char(_)) && crate::tui::support::key_hint::is_altgr(modifiers)
+                crate::tui::support::key_hint::is_plain_text_key_event(KeyEvent::new(
+                    code, modifiers,
+                )) || matches!(code, KeyCode::Char(_))
+                    && crate::tui::support::key_hint::is_altgr(modifiers)
             }) {
                 return Err(format!(
                     "tui.keymap.chat.{action}: printable keys are reserved for text input"
@@ -2200,7 +2200,8 @@ impl RuntimeKeymap {
             if bindings.iter().any(|binding| {
                 let (code, modifiers) = binding.normalized_parts();
                 (code == KeyCode::Backspace && modifiers == KeyModifiers::NONE)
-                    || (matches!(code, KeyCode::Char(_)) && crate::tui::support::key_hint::is_altgr(modifiers))
+                    || (matches!(code, KeyCode::Char(_))
+                        && crate::tui::support::key_hint::is_altgr(modifiers))
             }) {
                 return Err(format!(
                     "tui.keymap.agents.{action}: AltGr and backspace are reserved for editing"

@@ -565,4 +565,3 @@ where
         RenderableItem::Owned(Box::new(InsetRenderable { child, insets }))
     }
 }
-

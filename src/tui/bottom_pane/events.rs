@@ -28,10 +28,7 @@ pub(crate) enum PaneEvent {
     /// Cancel the running turn.
     Interrupt,
     /// Put a line in the transcript.
-    Notice {
-        level: NoticeLevel,
-        message: String,
-    },
+    Notice { level: NoticeLevel, message: String },
     /// Search the workspace for files matching the composer's `@` query.
     StartFileSearch(String),
     /// Fetch one entry from the persistent prompt log.

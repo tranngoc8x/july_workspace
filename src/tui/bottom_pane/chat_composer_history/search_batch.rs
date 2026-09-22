@@ -1,11 +1,11 @@
 use super::ChatComposerHistory;
+use super::HistoryBatchCursor;
+use super::HistoryBatchEntryResponse;
 use super::HistoryEntry;
 use super::HistorySearchDirection;
 use super::HistorySearchResult;
 use super::MAX_BATCH_READ_RETRIES;
 use super::PendingHistorySearch;
-use super::HistoryBatchCursor;
-use super::HistoryBatchEntryResponse;
 use crate::tui::bottom_pane::events::{PaneEvent, PaneEventSender};
 
 impl ChatComposerHistory {
@@ -26,9 +26,7 @@ impl ChatComposerHistory {
         let entries: Vec<_> = entries
             .into_iter()
             .map(|response| {
-                let entry = response.entry.map(|text| {
-                    HistoryEntry::new(text)
-                });
+                let entry = response.entry.map(|text| HistoryEntry::new(text));
                 if entry.is_some() {
                     self.fetched_history.insert(response.offset, entry.clone());
                 } else {

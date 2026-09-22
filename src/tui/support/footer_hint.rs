@@ -34,4 +34,3 @@ pub(crate) fn wrap_hint_rows<T>(
     rows.push(row);
     rows
 }
-

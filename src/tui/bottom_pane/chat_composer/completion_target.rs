@@ -10,7 +10,16 @@ use std::ops::Range;
 fn is_common_env_var(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "PATH" | "HOME" | "USER" | "SHELL" | "PWD" | "TMPDIR" | "TEMP" | "TMP" | "LANG" | "TERM"
+        "PATH"
+            | "HOME"
+            | "USER"
+            | "SHELL"
+            | "PWD"
+            | "TMPDIR"
+            | "TEMP"
+            | "TMP"
+            | "LANG"
+            | "TERM"
             | "XDG_CONFIG_HOME"
     )
 }
@@ -360,4 +369,3 @@ pub(super) fn dollar_query_kind(query: &str) -> DollarQueryKind {
         DollarQueryKind::Completable
     }
 }
-

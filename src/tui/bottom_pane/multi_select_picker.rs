@@ -54,9 +54,9 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Widget;
 
 use super::selection_popup_common::GenericDisplayRow;
-use crate::tui::bottom_pane::events::PaneEventSender;
 use crate::tui::bottom_pane::CancellationEvent;
 use crate::tui::bottom_pane::bottom_pane_view::BottomPaneView;
+use crate::tui::bottom_pane::events::PaneEventSender;
 use crate::tui::bottom_pane::popup_consts::MAX_POPUP_ROWS;
 use crate::tui::bottom_pane::scroll_state::ScrollState;
 use crate::tui::bottom_pane::selection_popup_common::render_rows_single_line;
@@ -516,7 +516,9 @@ impl MultiSelectPicker {
 
 impl BottomPaneView for MultiSelectPicker {
     fn keymap_contexts(&self) -> crate::tui::support::keymap::KeymapContextSet {
-        crate::tui::support::keymap::KeymapContextSet::new(crate::tui::support::keymap::KeymapContext::List)
+        crate::tui::support::keymap::KeymapContextSet::new(
+            crate::tui::support::keymap::KeymapContext::List,
+        )
     }
 
     fn is_complete(&self) -> bool {
@@ -917,7 +919,7 @@ mod tests {
     use super::*;
 
     fn test_picker(items: Vec<MultiSelectItem>) -> MultiSelectPicker {
-                MultiSelectPicker::builder(
+        MultiSelectPicker::builder(
             "Test".to_string(),
             /*subtitle*/ None,
             PaneEventSender::new(),
@@ -1052,7 +1054,7 @@ mod tests {
 
     #[test]
     fn page_and_jump_navigation_use_list_keymap() {
-                let mut keymap = RuntimeKeymap::defaults().list;
+        let mut keymap = RuntimeKeymap::defaults().list;
         keymap.page_down = vec![key_hint::ctrl(KeyCode::Char('d'))];
         keymap.page_up = vec![key_hint::ctrl(KeyCode::Char('u'))];
         keymap.jump_bottom = vec![key_hint::ctrl(KeyCode::Char('e'))];
