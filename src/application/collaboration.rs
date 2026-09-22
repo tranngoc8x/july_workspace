@@ -74,6 +74,9 @@ pub struct AddAgent {
     pub transport_type: String,
     pub transport_config: serde_json::Value,
     pub runtime: Option<String>,
+    /// What this agent is for, in the operator's own words. Routing reads it,
+    /// so an agent that declares nothing can only be matched on its name.
+    pub description: Option<String>,
     pub created_at: String,
 }
 
@@ -538,10 +541,19 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
         {
             return Err(CollaborationError::AgentNameConflict(command.name));
         }
-        let metadata = match &command.runtime {
-            Some(runtime) => serde_json::json!({ "runtime": runtime }),
-            None => serde_json::json!({}),
-        };
+        let mut fields = serde_json::Map::new();
+        if let Some(runtime) = &command.runtime {
+            fields.insert("runtime".to_owned(), serde_json::json!(runtime));
+        }
+        if let Some(description) = command
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            fields.insert("description".to_owned(), serde_json::json!(description));
+        }
+        let metadata = serde_json::Value::Object(fields);
         let agent = Agent {
             id: command.agent_id,
             name: command.name,

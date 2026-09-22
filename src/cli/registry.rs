@@ -215,6 +215,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         examples: &["/members"],
     },
     CommandSpec {
+        name: "/route",
+        aliases: &[],
+        kind: Inspection,
+        scopes: &[Room],
+        summary: "preview which agent a task would be routed to",
+        usage: "/route <task>",
+        examples: &["/route implement Redis caching"],
+    },
+    CommandSpec {
         name: "/work assign",
         aliases: &[],
         kind: Control,
@@ -568,6 +577,7 @@ mod tests {
                 "/decision reject",
                 "/decision work",
                 "/members",
+                "/route",
                 "/work",
                 "/status",
                 "/new",

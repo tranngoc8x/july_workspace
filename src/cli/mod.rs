@@ -36,6 +36,7 @@ mod keys;
 mod mention;
 mod reconcile;
 pub mod registry;
+mod route;
 mod setup;
 mod update;
 
@@ -46,8 +47,8 @@ const USAGE: &str = "usage: july dm <agent>";
 const PROJECT_INIT_USAGE: &str = "usage: july init";
 const SETUP_USAGE: &str = "usage: july setup [--adapters <ids>]      cài ACP adapter";
 const UPDATE_USAGE: &str = "usage: july update";
-const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]\n\
-                          usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]\n\
+const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>] [--description <text>]\n\
+                          usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>] [--description <text>]\n\
                           usage: july agent update <agent> --adapter <id>\n\
                           usage: july agent update <agent> --config <file>";
 const NO_AGENTS: &str = "no agents configured; add one with: \
@@ -502,6 +503,7 @@ enum AgentOperation {
         transport: String,
         adapter: Option<String>,
         config: Option<PathBuf>,
+        description: Option<String>,
     },
     List,
     Show(AgentRef),
@@ -519,6 +521,7 @@ struct AgentAddArgs {
     transport: String,
     adapter: Option<String>,
     config: Option<PathBuf>,
+    description: Option<String>,
 }
 
 enum RoomOperation {
@@ -751,6 +754,7 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
                 transport,
                 adapter,
                 config,
+                description,
             } = parse_agent_add(rest)?;
             AgentOperation::Add {
                 name: positional(name).map_err(|_| CliError::AgentUsage)?,
@@ -759,6 +763,7 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
                 transport,
                 adapter,
                 config,
+                description,
             }
         }
         _ if matches!(
@@ -782,6 +787,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
     let mut transport = None;
     let mut adapter = None;
     let mut config = None;
+    let mut description = None;
     let mut index = 0;
     while index < args.len() {
         let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
@@ -793,6 +799,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
             "--transport" if transport.is_none() => transport = Some(value.clone()),
             "--adapter" if adapter.is_none() => adapter = Some(value.clone()),
             "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            "--description" if description.is_none() => description = Some(value.clone()),
             _ => return Err(CliError::AgentUsage),
         }
         index += 2;
@@ -807,6 +814,7 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
         transport: transport.unwrap_or_else(|| "acp".into()),
         adapter,
         config,
+        description,
     })
 }
 
@@ -2124,6 +2132,26 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     unreachable!("registry scopes /members to room and thread")
                 }
             },
+            "/route" if !arguments.is_empty() => {
+                let ReplContext::Room { room_id, .. } = contexts.last().unwrap() else {
+                    unreachable!("registry scopes /route to room")
+                };
+                match route_candidates(service, *room_id).await {
+                    Ok(candidates) => {
+                        let mut engine = crate::adapter::JevDecisionEngine::from_env();
+                        let policy = crate::application::AgentSelectionPolicy::from_env();
+                        match route::preview(&mut engine, &policy, arguments.to_owned(), candidates)
+                            .await
+                        {
+                            Ok(preview) => {
+                                repl_write(stdout, format_args!("{}", route::render(&preview)))?
+                            }
+                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                        }
+                    }
+                    Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
+                }
+            }
             "/room" if !arguments.is_empty() => match room_ref(arguments) {
                 Ok(reference) => match service.resolve_room(reference).await {
                     Ok(room) => {
@@ -3922,6 +3950,16 @@ async fn run_project_init() -> Result<(), CliError> {
         input.to_owned()
     };
 
+    // Routing has nothing but the name to go on unless the operator says what
+    // the agent is for, so `init` asks once, here, where the agent is created.
+    println!("Mô tả agent làm nhiệm vụ gì, phụ trách phần nào (enter để bỏ qua).");
+    print!("Mô tả: ");
+    io::stdout().flush()?;
+    let mut described = String::new();
+    io::stdin().read_line(&mut described)?;
+    let description = described.trim().to_owned();
+    let description = (!description.is_empty()).then_some(description);
+
     let store = AdapterStore::open_default()?;
     let adapters = installed_adapters(&store)?;
     let Some(adapter) = select_adapter(&adapters)? else {
@@ -3935,6 +3973,7 @@ async fn run_project_init() -> Result<(), CliError> {
             transport: "acp".into(),
             adapter: Some(adapter.into()),
             config: None,
+            description,
         },
         false,
     )
@@ -4031,6 +4070,7 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 transport,
                 adapter,
                 config,
+                description,
             } => {
                 let transport_config = match (adapter, config) {
                     (Some(id), None) => AdapterStore::open_default()?.config_for(&id, &name)?,
@@ -4056,6 +4096,7 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                         transport_type: transport,
                         transport_config,
                         runtime,
+                        description,
                         created_at: timestamp(),
                     })
                     .await?;
@@ -4204,6 +4245,25 @@ fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
         agent_runtime_display(agent),
         agent.status,
     )
+}
+
+/// Room members a task could go to.
+///
+/// Workload is left at zero: Room work is reachable only through its A2A
+/// bindings, and `/route` is a preview, so this stays a read of membership and
+/// declared capability.
+// ponytail: count Room work here once `@auto` needs the workload signal.
+async fn route_candidates<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+) -> Result<Vec<crate::application::AgentCandidate>, crate::application::CollaborationError> {
+    let agents = service.list_agents().await?;
+    let members = service.list_room_members(RoomRef::Id(room_id)).await?;
+    Ok(crate::application::resolve_room_candidates(
+        &agents,
+        &members,
+        &[],
+    ))
 }
 
 fn render_table<const N: usize>(headers: [&str; N], rows: Vec<[String; N]>) -> String {

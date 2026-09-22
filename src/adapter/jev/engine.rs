@@ -75,6 +75,7 @@ mod tests {
                 candidates: vec![AgentCandidate {
                     agent_id: AgentId::new(),
                     name: "infra".into(),
+                    description: None,
                     capabilities: AgentCapabilities::default(),
                     active_work_count: 0,
                 }],

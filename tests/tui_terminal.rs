@@ -191,6 +191,8 @@ fn project_init_uses_the_folder_default_and_an_installed_adapter() {
     let mut child = spawn_pty_command(command);
     child.wait_for("Tên agent [Du_an_Thanh_Toan]:".as_bytes());
     child.master.write_all(b"\r").unwrap();
+    child.wait_for("Mô tả:".as_bytes());
+    child.master.write_all(b"\r").unwrap();
     child.wait_for(b"codex");
     child.master.write_all(b"\r").unwrap();
 
@@ -208,12 +210,18 @@ fn project_init_uses_the_folder_default_and_an_installed_adapter() {
     assert_eq!(restored.c_lflag, initial.c_lflag, "terminal local flags");
 
     let connection = Connection::open(&database).unwrap();
-    let (name, project_root): (String, String) = connection
-        .query_row("SELECT name, project_root FROM agents", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
+    let (name, project_root, metadata): (String, String, String) = connection
+        .query_row(
+            "SELECT name, project_root, metadata_json FROM agents",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .unwrap();
     assert_eq!(name, "Du_an_Thanh_Toan");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&metadata).unwrap()["description"].is_null(),
+        "a skipped description stores nothing: {metadata}"
+    );
     assert_eq!(
         project_root,
         project.canonicalize().unwrap().to_string_lossy()
@@ -252,6 +260,11 @@ fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
     let mut child = spawn_pty_command(command);
     child.wait_for("Tên agent [project]:".as_bytes());
     child.master.write_all("Sếp Agent\r".as_bytes()).unwrap();
+    child.wait_for("Mô tả:".as_bytes());
+    child
+        .master
+        .write_all("Phụ trách thanh toán và hoàn tiền\r".as_bytes())
+        .unwrap();
     child.wait_for(b"claude");
     child.master.write_all(b"\x1b[B\r").unwrap();
 
@@ -262,14 +275,18 @@ fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
         String::from_utf8_lossy(&output)
     );
     let connection = Connection::open(&database).unwrap();
-    let (name, config): (String, String) = connection
+    let (name, config, metadata): (String, String, String) = connection
         .query_row(
-            "SELECT name, transport_config_json FROM agents",
+            "SELECT name, transport_config_json, metadata_json FROM agents",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(name, "Sếp Agent");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&metadata).unwrap()["description"],
+        "Phụ trách thanh toán và hoàn tiền"
+    );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&config).unwrap()["expected_agent_name"],
         "claude-agent-acp"

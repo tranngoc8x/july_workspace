@@ -72,6 +72,7 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
             transport_type: "acp".into(),
             transport_config: json!({ "executable": "/old/bin" }),
             runtime: Some("codex".into()),
+            description: Some("runs the cashpoint service".into()),
             created_at: CREATED.into(),
         })
         .await
@@ -92,7 +93,11 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
     assert_eq!(updated.updated_at, LEFT);
     assert_eq!(updated.project_root, "/workspace/cashpoint");
     assert_eq!(updated.status, "active");
-    assert_eq!(updated.metadata, json!({ "runtime": "codex" }));
+    assert_eq!(
+        updated.metadata,
+        json!({ "runtime": "codex", "description": "runs the cashpoint service" }),
+        "a transport change preserves the routing description"
+    );
     assert_eq!(updated.created_at, CREATED);
 
     let reloaded = service
@@ -104,7 +109,11 @@ async fn setting_the_transport_replaces_the_stored_config_in_place() {
     assert_eq!(reloaded.updated_at, LEFT);
     assert_eq!(reloaded.project_root, "/workspace/cashpoint");
     assert_eq!(reloaded.status, "active");
-    assert_eq!(reloaded.metadata, json!({ "runtime": "codex" }));
+    assert_eq!(
+        reloaded.metadata,
+        json!({ "runtime": "codex", "description": "runs the cashpoint service" }),
+        "the description survives a reload from storage"
+    );
     assert_eq!(reloaded.created_at, CREATED);
     assert_eq!(
         service.list_agents().await.expect("agents listed").len(),

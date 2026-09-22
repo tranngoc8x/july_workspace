@@ -7,8 +7,8 @@ use serde_json::{Map, Value, json};
 const QUESTION: &str = "which";
 
 const INSTRUCTIONS: &str = "Exactly one of these agents is the best fit for `task`. \
-Which one? Judge the capabilities each agent declares - skills, domains, languages and tools - \
-against what the task actually needs, not the agent's name.";
+Which one? Judge what each agent declares it is for - its description, skills, domains, \
+languages and tools - against what the task actually needs, not the agent's name.";
 
 /// Build the `/v1/systemone` body: a choice question over the candidates.
 ///
@@ -52,6 +52,7 @@ pub(super) fn request_body(request: &AgentSelectionRequest, model: &str) -> Valu
 fn capabilities_of(candidate: &AgentCandidate) -> Map<String, Value> {
     let capabilities = &candidate.capabilities;
     let mut described = Map::new();
+    described.insert("description".to_owned(), json!(candidate.description));
     described.insert("skills".to_owned(), json!(capabilities.skills));
     described.insert("domains".to_owned(), json!(capabilities.domains));
     described.insert("languages".to_owned(), json!(capabilities.languages));
@@ -130,6 +131,7 @@ mod tests {
         AgentCandidate {
             agent_id: AgentId::new(),
             name: name.to_owned(),
+            description: Some(format!("the {name} agent")),
             capabilities: AgentCapabilities {
                 tools: tools.iter().map(|tool| (*tool).to_owned()).collect(),
                 ..AgentCapabilities::default()
@@ -152,6 +154,10 @@ mod tests {
         assert_eq!(body["state"]["task"], json!("fix Redis timeout"));
         assert_eq!(body["state"]["agents"][0]["id"], json!("infra"));
         assert_eq!(
+            body["state"]["agents"][0]["description"],
+            json!("the infra agent")
+        );
+        assert_eq!(
             body["state"]["agents"][0]["tools"],
             json!(["redis", "docker"])
         );
@@ -161,6 +167,10 @@ mod tests {
         assert_eq!(
             body["questions"]["which"]["criteria"]["infra"]["tools"],
             json!(["redis", "docker"])
+        );
+        assert_eq!(
+            body["questions"]["which"]["criteria"]["infra"]["description"],
+            json!("the infra agent")
         );
     }
 

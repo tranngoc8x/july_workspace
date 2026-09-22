@@ -1143,6 +1143,7 @@ async fn inactive_tui_bridge_projects_visible_commands_for_root_room_dm_and_work
         "/decision reject",
         "/decision work",
         "/members",
+        "/route",
         "/work",
         "/status",
         "/new",
@@ -3989,4 +3990,29 @@ async fn inactive_tui_room_focus_is_visible_and_back_clears_it_before_leaving() 
     app.reduce(event);
     assert_eq!(app.context().id(), &workspace_context);
     bridge.shutdown().await.unwrap();
+}
+
+#[test]
+fn route_previews_the_lone_room_candidate_without_asking_a_judgment_engine() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("Operations");
+    let codex = workspace.seed_acp_agent("codex", &[]);
+    workspace.add_member(&room, &codex);
+
+    let output = workspace.repl("/route\n/room Operations\n/route fix Redis timeout\n/quit\n");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    // One candidate is a deterministic answer, so no provider is consulted and
+    // the command works with no API key configured.
+    assert!(
+        stdout(&output).contains("route\tauto\tcodex\t1.00\n"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    assert!(stdout(&output).contains("codex  1.00"));
+    assert!(
+        stderr(&output).contains("/route is unavailable in root context (available in: room)\n"),
+        "stderr: {}",
+        stderr(&output)
+    );
 }

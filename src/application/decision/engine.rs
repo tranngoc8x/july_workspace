@@ -103,6 +103,7 @@ mod tests {
         AgentCandidate {
             agent_id: AgentId::new(),
             name: name.to_owned(),
+            description: None,
             capabilities: AgentCapabilities::default(),
             active_work_count: 0,
         }

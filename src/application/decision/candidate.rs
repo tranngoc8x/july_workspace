@@ -59,6 +59,9 @@ pub struct AgentCandidate {
     pub agent_id: AgentId,
     /// The `@name` a caller would have typed; also the id a judgment returns.
     pub name: String,
+    /// What the agent is for, declared at registration. The main signal a
+    /// judgment has, since a name alone says nothing reliable.
+    pub description: Option<String>,
     pub capabilities: AgentCapabilities,
     pub active_work_count: usize,
 }
@@ -85,10 +88,20 @@ pub fn resolve_room_candidates(
         .map(|agent| AgentCandidate {
             agent_id: agent.id,
             name: agent.name.clone(),
+            description: declared_description(&agent.metadata),
             capabilities: AgentCapabilities::from_metadata(&agent.metadata),
             active_work_count: active_work_count(agent.id, work),
         })
         .collect()
+}
+
+/// `metadata.description`, written at registration. Blank reads as absent.
+fn declared_description(metadata: &Value) -> Option<String> {
+    metadata["description"]
+        .as_str()
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_owned)
 }
 
 fn active_work_count(agent_id: AgentId, work: &[WorkItem]) -> usize {
@@ -173,6 +186,32 @@ mod tests {
         }));
         assert!(partial.skills.is_empty());
         assert_eq!(partial.domains, ["infra"]);
+    }
+
+    #[test]
+    fn a_declared_description_reaches_the_candidate_and_a_blank_one_does_not() {
+        let room_id = RoomId::new();
+        let described = agent(
+            "infra",
+            "active",
+            json!({ "description": "  keeps Redis and Docker running  " }),
+        );
+        let blank = agent("backend", "active", json!({ "description": "   " }));
+        let silent = agent("pay", "active", json!({}));
+        let members = vec![
+            member(room_id, described.id, None),
+            member(room_id, blank.id, None),
+            member(room_id, silent.id, None),
+        ];
+
+        let candidates = resolve_room_candidates(&[described, blank, silent], &members, &[]);
+
+        assert_eq!(
+            candidates[0].description.as_deref(),
+            Some("keeps Redis and Docker running")
+        );
+        assert_eq!(candidates[1].description, None);
+        assert_eq!(candidates[2].description, None);
     }
 
     #[test]
