@@ -50,7 +50,8 @@ const UPDATE_USAGE: &str = "usage: july update";
 const AGENT_USAGE: &str = "usage: july agent add <name> --project <path> --adapter <id> [--runtime <runtime>] [--description <text>]\n\
                           usage: july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>] [--description <text>]\n\
                           usage: july agent update <agent> --adapter <id>\n\
-                          usage: july agent update <agent> --config <file>";
+                          usage: july agent update <agent> --config <file>\n\
+                          usage: july agent update <agent> --description <text>";
 const NO_AGENTS: &str = "no agents configured; add one with: \
                          july agent add <name> --project <path> --adapter <id>";
 
@@ -512,6 +513,7 @@ enum AgentOperation {
         agent: AgentRef,
         adapter: Option<String>,
         config: Option<PathBuf>,
+        description: Option<String>,
     },
 }
 
@@ -740,11 +742,12 @@ fn parse_agent(args: Vec<String>, json: bool) -> Result<Command, CliError> {
             AgentOperation::Remove(agent_ref(agent).map_err(|_| CliError::AgentUsage)?)
         }
         [_, command, agent, rest @ ..] if command == "update" => {
-            let (adapter, config) = parse_agent_update(rest)?;
+            let (adapter, config, description) = parse_agent_update(rest)?;
             AgentOperation::Update {
                 agent: agent_ref(agent).map_err(|_| CliError::AgentUsage)?,
                 adapter,
                 config,
+                description,
             }
         }
         [_, command, name, rest @ ..] if command == "add" => {
@@ -818,9 +821,12 @@ fn parse_agent_add(args: &[String]) -> Result<AgentAddArgs, CliError> {
     })
 }
 
-fn parse_agent_update(args: &[String]) -> Result<(Option<String>, Option<PathBuf>), CliError> {
+type AgentUpdateArgs = (Option<String>, Option<PathBuf>, Option<String>);
+
+fn parse_agent_update(args: &[String]) -> Result<AgentUpdateArgs, CliError> {
     let mut adapter = None;
     let mut config = None;
+    let mut description = None;
     let mut index = 0;
     while index < args.len() {
         let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
@@ -829,14 +835,20 @@ fn parse_agent_update(args: &[String]) -> Result<(Option<String>, Option<PathBuf
         match args[index].as_str() {
             "--adapter" if adapter.is_none() => adapter = Some(value.clone()),
             "--config" if config.is_none() => config = Some(PathBuf::from(value)),
+            "--description" if description.is_none() => description = Some(value.clone()),
             _ => return Err(CliError::AgentUsage),
         }
         index += 2;
     }
-    match (&adapter, &config) {
-        (None, None) | (Some(_), Some(_)) => Err(CliError::AgentUsage),
-        _ => Ok((adapter, config)),
+    // Transport is still one way or the other, but a description alone is a
+    // complete update: it is the only agent field an operator edits by hand.
+    if adapter.is_some() && config.is_some() {
+        return Err(CliError::AgentUsage);
     }
+    if adapter.is_none() && config.is_none() && description.is_none() {
+        return Err(CliError::AgentUsage);
+    }
+    Ok((adapter, config, description))
 }
 
 fn parse_room(args: Vec<String>, json: bool) -> Result<Command, CliError> {
@@ -4145,14 +4157,15 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                 agent,
                 adapter,
                 config,
+                description,
             } => {
                 let resolved = service.resolve_agent(agent.clone()).await?;
-                let name = resolved.name;
-                let (transport_type, transport_config) = match (adapter, config) {
-                    (Some(id), None) => (
+                let mut latest = resolved.clone();
+                let transport = match (adapter, config) {
+                    (Some(id), None) => Some((
                         "acp".to_string(),
-                        AdapterStore::open_default()?.config_for(&id, &name)?,
-                    ),
+                        AdapterStore::open_default()?.config_for(&id, &resolved.name)?,
+                    )),
                     (None, Some(path)) => {
                         let value: serde_json::Value =
                             serde_json::from_str(&std::fs::read_to_string(path)?)
@@ -4160,14 +4173,27 @@ async fn run_agent(operation: AgentOperation, json_output: bool) -> Result<(), C
                         if resolved.transport_type == "acp" {
                             parse_acp_config(&value)?;
                         }
-                        (resolved.transport_type, value)
+                        Some((resolved.transport_type.clone(), value))
                     }
-                    _ => return Err(CliError::AgentUsage),
+                    (None, None) => None,
+                    (Some(_), Some(_)) => return Err(CliError::AgentUsage),
                 };
-                let agent = service
-                    .set_agent_transport(agent, transport_type, transport_config, timestamp())
-                    .await?;
-                Some(render_agent(&agent, json_output))
+                if let Some((transport_type, transport_config)) = transport {
+                    latest = service
+                        .set_agent_transport(
+                            agent.clone(),
+                            transport_type,
+                            transport_config,
+                            timestamp(),
+                        )
+                        .await?;
+                }
+                if let Some(description) = description {
+                    latest = service
+                        .set_agent_description(agent, description, timestamp())
+                        .await?;
+                }
+                Some(render_agent(&latest, json_output))
             }
         };
         Ok::<_, CliError>(output)

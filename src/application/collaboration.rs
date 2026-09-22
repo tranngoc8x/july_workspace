@@ -587,6 +587,32 @@ impl<R: CollaborationRuntime> CollaborationService<R> {
     }
 
     /// Replace an existing agent's transport without changing its identity.
+    /// Rewrite what the agent says it is for, leaving the rest of its metadata
+    /// alone. A blank description clears the field rather than storing "".
+    pub async fn set_agent_description(
+        &mut self,
+        reference: AgentRef,
+        description: String,
+        changed_at: String,
+    ) -> Result<Agent, CollaborationError> {
+        let mut agent = self.resolve_agent(reference).await?;
+        let description = description.trim();
+        let fields = agent.metadata.as_object_mut().ok_or_else(|| {
+            CollaborationError::InvalidCommand("agent metadata is not an object".into())
+        })?;
+        if description.is_empty() {
+            fields.remove("description");
+        } else {
+            fields.insert("description".to_owned(), serde_json::json!(description));
+        }
+        agent.updated_at = changed_at;
+        agent
+            .validate()
+            .map_err(|error| CollaborationError::InvalidCommand(error.to_string()))?;
+        self.runtime.update_agent(agent.clone()).await?;
+        Ok(agent)
+    }
+
     pub async fn set_agent_transport(
         &mut self,
         reference: AgentRef,

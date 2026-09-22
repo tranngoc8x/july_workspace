@@ -412,6 +412,76 @@ fn agent_update_requires_an_adapter_or_a_config_with_agent_usage() {
     assert!(stderr(&output).contains("\"code\":\"usage\""));
     assert!(stderr(&output).contains("usage: july agent update <agent> --adapter <id>"));
     assert!(stderr(&output).contains("usage: july agent update <agent> --config <file>"));
+    assert!(stderr(&output).contains("usage: july agent update <agent> --description <text>"));
+}
+
+#[test]
+fn agent_update_rewrites_the_routing_description_without_touching_the_transport() {
+    let workspace = TestWorkspace::new();
+    let executable = workspace.verify_adapter("codex", "Codex", "1.0.0");
+    let added = workspace.run(&[
+        "agent",
+        "add",
+        "cashpoint",
+        "--project",
+        "/work/cashpoint",
+        "--runtime",
+        "codex",
+        "--adapter",
+        "codex",
+        "--description",
+        "handles payments",
+    ]);
+    assert!(added.status.success(), "stderr: {}", stderr(&added));
+
+    let metadata = |workspace: &TestWorkspace| -> Value {
+        let stored: String = Connection::open(&workspace.database)
+            .unwrap()
+            .query_row(
+                "SELECT metadata_json FROM agents WHERE name = 'cashpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&stored).unwrap()
+    };
+    assert_eq!(metadata(&workspace)["description"], "handles payments");
+
+    let updated = workspace.run(&[
+        "agent",
+        "update",
+        "cashpoint",
+        "--description",
+        "  owns refunds and settlement  ",
+    ]);
+    assert!(updated.status.success(), "stderr: {}", stderr(&updated));
+    let stored = metadata(&workspace);
+    assert_eq!(stored["description"], "owns refunds and settlement");
+    assert_eq!(stored["runtime"], "codex", "the rest of metadata survives");
+
+    // The transport is untouched by a description-only update.
+    let transport: String = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT transport_config_json FROM agents WHERE name = 'cashpoint'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transport: Value = serde_json::from_str(&transport).unwrap();
+    assert_eq!(
+        transport["executable"],
+        executable.to_string_lossy().as_ref()
+    );
+
+    let cleared = workspace.run(&["agent", "update", "cashpoint", "--description", ""]);
+    assert!(cleared.status.success(), "stderr: {}", stderr(&cleared));
+    let stored = metadata(&workspace);
+    assert!(
+        stored["description"].is_null(),
+        "a blank description clears the field: {stored}"
+    );
+    assert_eq!(stored["runtime"], "codex");
 }
 
 #[test]
