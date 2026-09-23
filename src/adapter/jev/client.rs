@@ -11,6 +11,8 @@ const TIMEOUT_SECONDS: u32 = 30;
 /// `curl`'s exit code for an operation that ran out of time.
 const CURL_TIMEOUT_EXIT: i32 = 28;
 
+use super::configured;
+
 /// Talks to the TypeSafe `/v1/systemone` endpoint.
 ///
 /// `curl` is spawned with process args rather than a shell, exactly as the
@@ -26,10 +28,12 @@ pub struct JevClient {
 impl JevClient {
     /// `None` when no API key is configured; the engine turns that into
     /// `DecisionError::ProviderNotConfigured` rather than guessing an answer.
+    ///
+    /// Reads the process environment first, then `~/.july/.env`.
     pub fn from_env() -> Option<Self> {
-        let api_key = env_value("TYPESAFE_API_KEY")?;
+        let api_key = configured("TYPESAFE_API_KEY")?;
         Some(Self {
-            base_url: env_value("JULY_JEV_BASE_URL")
+            base_url: configured("JULY_JEV_BASE_URL")
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
@@ -80,13 +84,6 @@ impl JevClient {
             .map_err(|_| DecisionError::InvalidResponse("response is not UTF-8".to_owned()))?;
         parse_response(&response)
     }
-}
-
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }
 
 /// Build the `curl` config document. Only `\` and `"` need escaping inside a

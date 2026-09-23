@@ -1,4 +1,4 @@
-use super::{JevClient, mapper};
+use super::{JevClient, configured, mapper};
 use crate::application::{
     AgentSelectionDecision, AgentSelectionRequest, DecisionEngine, DecisionError,
 };
@@ -15,17 +15,15 @@ pub struct JevDecisionEngine {
 }
 
 impl JevDecisionEngine {
-    /// Reads `TYPESAFE_API_KEY`, `JULY_JEV_BASE_URL` and `JULY_JEV_MODEL`.
+    /// Reads `TYPESAFE_API_KEY`, `JULY_JEV_BASE_URL` and `JULY_JEV_MODEL`,
+    /// from the process environment or from `~/.july/.env`.
+    ///
     /// An unconfigured provider stays constructible and fails per call, so
     /// routing degrades instead of the workspace failing to start.
     pub fn from_env() -> Self {
         Self {
             client: JevClient::from_env(),
-            model: std::env::var("JULY_JEV_MODEL")
-                .ok()
-                .map(|model| model.trim().to_owned())
-                .filter(|model| !model.is_empty())
-                .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+            model: configured("JULY_JEV_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
         }
     }
 

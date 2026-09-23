@@ -37,7 +37,9 @@ impl TestWorkspace {
             .args(args)
             .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
             // Routing decisions never leave the machine during a test, whatever
-            // the developer has configured in their own environment.
+            // the developer has configured in their own environment or left in
+            // their real `~/.july/.env`.
+            .env("JULY_HOME", &self.root)
             .env_remove("TYPESAFE_API_KEY")
             .env_remove("JULY_ROUTING_MODE")
             .current_dir(&self.root)
@@ -4185,4 +4187,47 @@ fn auto_never_offers_an_agent_whose_adapter_binary_is_gone() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(targets, [codex.id.to_string()]);
+}
+
+#[test]
+fn routing_configuration_is_read_from_the_july_home_env_file() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    for agent in [&codex, &pay] {
+        workspace.add_member(&room, agent);
+    }
+    // Nothing is exported: the key and the endpoint exist only in this file.
+    // The endpoint is a closed local port, so the call fails at the transport
+    // instead of leaving the machine.
+    std::fs::write(
+        workspace.root.join(".env"),
+        "# July configuration\nTYPESAFE_API_KEY=apikey_from_file\n\
+         export JULY_JEV_BASE_URL=\"https://127.0.0.1:9\"\n",
+    )
+    .unwrap();
+
+    let output = workspace.repl("/room vna\n@auto fix Redis timeout\n/quit\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(
+        stdout_output.contains("không định tuyến được"),
+        "stdout: {stdout_output}"
+    );
+    // The file was read: July no longer thinks it has no provider at all.
+    assert!(
+        !stdout_output.contains("not configured"),
+        "the key in ~/.july/.env was ignored: {stdout_output}"
+    );
+    // A failed judgment still costs no message.
+    assert_eq!(
+        Connection::open(&workspace.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM room_messages", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
