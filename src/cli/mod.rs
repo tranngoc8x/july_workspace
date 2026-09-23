@@ -3962,16 +3962,6 @@ async fn run_project_init() -> Result<(), CliError> {
         input.to_owned()
     };
 
-    // Routing has nothing but the name to go on unless the operator says what
-    // the agent is for, so `init` asks once, here, where the agent is created.
-    println!("Mô tả agent làm nhiệm vụ gì, phụ trách phần nào (enter để bỏ qua).");
-    print!("Mô tả: ");
-    io::stdout().flush()?;
-    let mut described = String::new();
-    io::stdin().read_line(&mut described)?;
-    let description = described.trim().to_owned();
-    let description = (!description.is_empty()).then_some(description);
-
     let store = AdapterStore::open_default()?;
     let adapters = installed_adapters(&store)?;
     let Some(adapter) = select_adapter(&adapters)? else {
@@ -3979,17 +3969,156 @@ async fn run_project_init() -> Result<(), CliError> {
     };
     run_agent(
         AgentOperation::Add {
-            name,
+            name: name.clone(),
             project: project.to_str().ok_or(CliError::InvalidUtf8)?.to_owned(),
             runtime: None,
             transport: "acp".into(),
             adapter: Some(adapter.into()),
             config: None,
-            description,
+            description: None,
         },
         false,
     )
+    .await?;
+
+    // Routing has nothing but the name to go on unless someone says what the
+    // agent is for. The agent knows its own configuration, so it drafts; the
+    // operator still decides, because the draft is the agent's own claim.
+    let suggested = ask_agent_to_describe_itself(&name).await;
+    match &suggested {
+        Some(suggested) => {
+            println!("Agent tự mô tả: {suggested}");
+            println!("Mô tả agent làm nhiệm vụ gì, phụ trách phần nào (enter để giữ mô tả trên).");
+        }
+        None => {
+            println!("Mô tả agent làm nhiệm vụ gì, phụ trách phần nào (enter để bỏ qua).");
+        }
+    }
+    print!("Mô tả: ");
+    io::stdout().flush()?;
+    let mut typed = String::new();
+    io::stdin().read_line(&mut typed)?;
+    let typed = typed.trim();
+    let description = if typed.is_empty() {
+        suggested
+    } else {
+        Some(typed.to_owned())
+    };
+    match description {
+        Some(description) => record_agent_description(&name, description).await,
+        None => Ok(()),
+    }
+}
+
+/// What `init` asks a new agent about itself.
+///
+/// Deliberately narrow: no reading the project, no tool calls, no shell. Only
+/// what the agent already knows about its own configuration, in a sentence or
+/// two, so the turn stays cheap and `init` stays fast.
+const SELF_DESCRIPTION_PROMPT: &str = "Trả lời ngắn gọn trong 1-2 câu: bạn được cấu hình để làm gì, \
+phụ trách mảng nào? Không đọc source code, không quét thư mục, không chạy lệnh - chỉ dựa trên cấu \
+hình sẵn có của bạn. Chỉ trả lời nội dung mô tả, không thêm lời chào hay giải thích.";
+
+/// A self-description is a sentence or two; more than this is the agent
+/// ignoring the brief, so only the opening is kept.
+const DESCRIPTION_LIMIT: usize = 300;
+
+/// The agent gets one short turn. `init` must finish even when it does not.
+const DESCRIPTION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Ask the freshly registered agent what it is for, in its own words.
+///
+/// Best effort in every direction: a broken adapter, a silent agent or a slow
+/// turn all yield `None` and `init` carries on asking the operator. Any
+/// permission the agent asks for is declined and the turn continues -
+/// describing yourself needs access to nothing, and `init` is no place to be
+/// granting an agent its first privileges.
+async fn ask_agent_to_describe_itself(agent_name: &str) -> Option<String> {
+    let database = database_path().ok()?;
+    let (mut workspace, runtime) = open_acp_direct_message(&database, agent_name).ok()?;
+    let mut service = DirectMessageService::new(runtime);
+    let answered = tokio::time::timeout(
+        DESCRIPTION_PROBE_TIMEOUT,
+        collect_self_description(&mut service, agent_name),
+    )
     .await
+    .ok()
+    .flatten();
+
+    let stopped_at = timestamp();
+    let _ = service.shutdown(stopped_at.clone()).await;
+    let _ = workspace.shutdown(stopped_at).await;
+    answered.as_deref().and_then(tidy_description)
+}
+
+async fn collect_self_description(
+    service: &mut DirectMessageService<AgentDirectMessageRuntime<AcpTransport>>,
+    agent_name: &str,
+) -> Option<String> {
+    service
+        .open(
+            TRUSTED_LOCAL_USER_ID.into(),
+            agent_name.to_owned(),
+            timestamp(),
+        )
+        .await
+        .ok()?;
+    service
+        .send_message(SELF_DESCRIPTION_PROMPT.to_owned(), timestamp())
+        .await
+        .ok()?;
+    let mut spoken = String::new();
+    loop {
+        match service.next_event(timestamp()).await {
+            Ok(Some(ChatEvent::TextDelta(text))) => spoken.push_str(&text),
+            Ok(Some(ChatEvent::MessageCompleted(message))) => spoken = message.body,
+            Ok(Some(ChatEvent::TurnCompleted)) | Ok(None) => return Some(spoken),
+            Ok(Some(ChatEvent::PermissionRequested { request_id, .. })) => {
+                service
+                    .respond_permission(request_id, PermissionOutcome::Cancelled, timestamp())
+                    .await
+                    .ok()?;
+            }
+            Ok(Some(ChatEvent::TurnFailed(_) | ChatEvent::Disconnected(_))) | Err(_) => {
+                return None;
+            }
+        }
+    }
+}
+
+/// Collapse an answer to one line and cut it at the length limit.
+fn tidy_description(answer: &str) -> Option<String> {
+    let answer = answer.split_whitespace().collect::<Vec<_>>().join(" ");
+    if answer.is_empty() {
+        return None;
+    }
+    // Cut on a character boundary: these answers are not ASCII.
+    Some(match answer.char_indices().nth(DESCRIPTION_LIMIT) {
+        Some((index, _)) => format!("{}…", &answer[..index]),
+        None => answer,
+    })
+}
+
+/// Store what `init` settled on, without reprinting the agent row.
+async fn record_agent_description(agent_name: &str, description: String) -> Result<(), CliError> {
+    let database = database_path()?;
+    let worker =
+        StorageWorker::open(&database).map_err(|error| CliError::Runtime(error.to_string()))?;
+    let mut service = CollaborationService::new(worker);
+    let stored = service
+        .set_agent_description(
+            AgentRef::Name(agent_name.to_owned()),
+            description,
+            timestamp(),
+        )
+        .await;
+    let mut worker = service.into_runtime();
+    let shutdown = worker
+        .shutdown()
+        .await
+        .map_err(|error| CliError::Runtime(error.to_string()));
+    stored?;
+    shutdown
 }
 
 fn installed_adapters(store: &AdapterStore) -> Result<Vec<&'static AdapterSpec>, CliError> {
@@ -5154,6 +5283,30 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::CliError;
+
+    #[test]
+    fn a_self_description_is_collapsed_to_one_line_and_kept_short() {
+        assert_eq!(
+            super::tidy_description("  Tôi phụ trách\n  thanh toán\tvà hoàn tiền.  "),
+            Some("Tôi phụ trách thanh toán và hoàn tiền.".to_owned())
+        );
+        assert_eq!(super::tidy_description("   \n\t "), None);
+        assert_eq!(super::tidy_description(""), None);
+    }
+
+    #[test]
+    fn an_overlong_answer_is_cut_on_a_character_boundary() {
+        let answer = "ề".repeat(super::DESCRIPTION_LIMIT + 50);
+
+        let tidied = super::tidy_description(&answer).expect("an answer is kept");
+
+        assert_eq!(tidied.chars().count(), super::DESCRIPTION_LIMIT + 1);
+        assert!(tidied.ends_with('…'));
+        assert!(
+            tidied.starts_with(&"ề".repeat(super::DESCRIPTION_LIMIT)),
+            "the opening survives intact"
+        );
+    }
 
     #[test]
     fn table_aligns_wide_unicode_by_terminal_width() {

@@ -191,9 +191,11 @@ fn project_init_uses_the_folder_default_and_an_installed_adapter() {
     let mut child = spawn_pty_command(command);
     child.wait_for("Tên agent [Du_an_Thanh_Toan]:".as_bytes());
     child.master.write_all(b"\r").unwrap();
-    child.wait_for("Mô tả:".as_bytes());
-    child.master.write_all(b"\r").unwrap();
     child.wait_for(b"codex");
+    child.master.write_all(b"\r").unwrap();
+    // The adapter here is a stub that speaks no ACP, so the self-description
+    // turn fails and `init` falls back to asking; an empty answer stores none.
+    child.wait_for("Mô tả:".as_bytes());
     child.master.write_all(b"\r").unwrap();
 
     let initial = child.initial_termios;
@@ -260,13 +262,13 @@ fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
     let mut child = spawn_pty_command(command);
     child.wait_for("Tên agent [project]:".as_bytes());
     child.master.write_all("Sếp Agent\r".as_bytes()).unwrap();
+    child.wait_for(b"claude");
+    child.master.write_all(b"\x1b[B\r").unwrap();
     child.wait_for("Mô tả:".as_bytes());
     child
         .master
         .write_all("Phụ trách thanh toán và hoàn tiền\r".as_bytes())
         .unwrap();
-    child.wait_for(b"claude");
-    child.master.write_all(b"\x1b[B\r").unwrap();
 
     let (status, output, _) = child.finish();
     assert!(
@@ -290,6 +292,89 @@ fn project_init_preserves_a_typed_name_and_can_choose_another_adapter() {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&config).unwrap()["expected_agent_name"],
         "claude-agent-acp"
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn project_init_offers_the_agents_own_description_and_stores_what_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::env::temp_dir().join(format!("july-init-describe-{}", ulid::Ulid::generate()));
+    let project = base.join("project");
+    let home = base.join("home");
+    let database = base.join("workspace.db");
+    let executable = base.join("codex-acp");
+    let prompt_log = base.join("prompts.jsonl");
+    std::fs::create_dir_all(home.join("adapters")).unwrap();
+    std::fs::create_dir_all(&project).unwrap();
+    let fixture =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp_agent.py");
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/usr/bin/python3\nimport runpy\nrunpy.run_path({}, run_name='__main__')\n",
+            serde_json::to_string(&fixture).unwrap(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        home.join("adapters/identities.json"),
+        json!({
+            "codex": {
+                "name": "test-acp-agent",
+                "version": "1.0.0",
+                "bin": executable,
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_july"));
+    command
+        .arg("init")
+        .env("JULY_HOME", &home)
+        .env("JULY_WORKSPACE_DB", &database)
+        .env("ACP_PROMPT_LOG", &prompt_log)
+        .current_dir(&project);
+    let mut child = spawn_pty_command(command);
+    child.wait_for("Tên agent [project]:".as_bytes());
+    child.master.write_all(b"\r").unwrap();
+    child.wait_for(b"codex");
+    child.master.write_all(b"\r").unwrap();
+    // The agent drafts; an empty answer accepts the draft unchanged.
+    child.wait_for("Agent tự mô tả: fixture reply".as_bytes());
+    child.wait_for("Mô tả:".as_bytes());
+    child.master.write_all(b"\r").unwrap();
+
+    let (status, output, _) = child.finish();
+    assert!(
+        status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let metadata: String = Connection::open(&database)
+        .unwrap()
+        .query_row("SELECT metadata_json FROM agents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&metadata).unwrap()["description"],
+        "fixture reply"
+    );
+
+    // The fixture logs each prompt as a JSON string, so decode before matching.
+    let asked = std::fs::read_to_string(&prompt_log).unwrap_or_default();
+    let asked: String = asked
+        .lines()
+        .map(|line| serde_json::from_str::<String>(line).unwrap_or_default())
+        .collect();
+    assert!(
+        asked.contains("Không đọc source code, không quét thư mục, không chạy lệnh"),
+        "the brief reached the agent: {asked}"
     );
     std::fs::remove_dir_all(base).unwrap();
 }
