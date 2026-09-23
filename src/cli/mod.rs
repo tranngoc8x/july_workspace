@@ -4607,7 +4607,23 @@ async fn route_candidates<R: crate::application::CollaborationRuntime>(
         &agents,
         &members,
         &[],
+        agent_runtime_available,
     ))
+}
+
+/// Whether July could actually start this agent right now.
+///
+/// Deterministic, and therefore never a question for a judgment engine. An
+/// adapter whose binary has been removed or whose launch config no longer
+/// parses cannot take work, so it is not offered as a candidate at all.
+// ponytail: an existing executable is the cheap, honest check. A real probe
+// costs a process spawn per candidate on every routed message.
+fn agent_runtime_available(agent: &crate::domain::Agent) -> bool {
+    if agent.transport_type != "acp" {
+        // July cannot inspect a transport it does not own; assume it works.
+        return true;
+    }
+    parse_acp_config(&agent.transport_config).is_ok_and(|config| config.executable.is_file())
 }
 
 fn render_table<const N: usize>(headers: [&str; N], rows: Vec<[String; N]>) -> String {

@@ -4130,3 +4130,59 @@ fn auto_keeps_the_message_when_no_judgment_is_available() {
         0
     );
 }
+
+#[test]
+fn auto_never_offers_an_agent_whose_adapter_binary_is_gone() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let ghost = workspace.seed_acp_agent("ghost", &["--no-permission"]);
+    for agent in [&codex, &ghost] {
+        workspace.add_member(&room, agent);
+    }
+    // The adapter this agent would launch no longer exists on disk.
+    Connection::open(&workspace.database)
+        .unwrap()
+        .execute(
+            "UPDATE agents
+             SET transport_config_json = json_set(transport_config_json, '$.executable',
+                 '/nonexistent/ghost-acp')
+             WHERE name = 'ghost'",
+            [],
+        )
+        .unwrap();
+
+    let output = workspace.repl("/room vna\n@auto fix Redis timeout\n/quit\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout_output = stdout(&output);
+    // One runnable candidate is left, so no judgment is needed and no provider
+    // is consulted - the unavailable agent never entered the running.
+    assert!(
+        stdout_output.contains("route\tauto\tcodex\t1.00"),
+        "stdout: {stdout_output}"
+    );
+    assert!(!stdout_output.contains("ghost"), "stdout: {stdout_output}");
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let candidates: String = connection
+        .query_row(
+            "SELECT candidate_ids_json FROM agent_routing_records",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&candidates).unwrap(),
+        [codex.id.to_string()],
+        "the audit record shows who was actually in the running"
+    );
+    let targets: Vec<String> = connection
+        .prepare("SELECT agent_id FROM room_message_activations")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(targets, [codex.id.to_string()]);
+}

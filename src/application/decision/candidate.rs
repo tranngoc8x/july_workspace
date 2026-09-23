@@ -68,18 +68,22 @@ pub struct AgentCandidate {
 
 /// Deterministic pre-filter: a judgment never sees an agent code can rule out.
 ///
-/// Keeps agents that are active and are current members of the Room, in the
-/// order `agents` was given, so a decision is reproducible.
-// ponytail: runtime availability is not stored state, so it stays with the
-// caller that owns sessions - add it here once `@auto` needs it.
+/// Keeps agents that are active, whose runtime can actually start, and that are
+/// current members of the Room, in the order `agents` was given, so a decision
+/// is reproducible.
+///
+/// `runtime_available` is supplied by the caller because whether an agent can
+/// run is a fact about the machine, not about stored state.
 pub fn resolve_room_candidates(
     agents: &[Agent],
     members: &[RoomMember],
     work: &[WorkItem],
+    runtime_available: impl Fn(&Agent) -> bool,
 ) -> Vec<AgentCandidate> {
     agents
         .iter()
         .filter(|agent| agent.status == ACTIVE_AGENT_STATUS)
+        .filter(|agent| runtime_available(agent))
         .filter(|agent| {
             members
                 .iter()
@@ -204,7 +208,8 @@ mod tests {
             member(room_id, silent.id, None),
         ];
 
-        let candidates = resolve_room_candidates(&[described, blank, silent], &members, &[]);
+        let candidates =
+            resolve_room_candidates(&[described, blank, silent], &members, &[], |_| true);
 
         assert_eq!(
             candidates[0].description.as_deref(),
@@ -228,11 +233,31 @@ mod tests {
         ];
         let agents = vec![backend.clone(), retired, departed, stranger];
 
-        let candidates = resolve_room_candidates(&agents, &members, &[]);
+        let candidates = resolve_room_candidates(&agents, &members, &[], |_| true);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].agent_id, backend.id);
         assert_eq!(candidates[0].name, "backend");
+    }
+
+    #[test]
+    fn an_agent_whose_runtime_cannot_start_is_excluded() {
+        let room_id = RoomId::new();
+        let runnable = agent("infra", "active", json!({}));
+        let broken = agent("backend", "active", json!({}));
+        let members = vec![
+            member(room_id, runnable.id, None),
+            member(room_id, broken.id, None),
+        ];
+        let broken_id = broken.id;
+
+        let candidates =
+            resolve_room_candidates(&[runnable.clone(), broken], &members, &[], |agent| {
+                agent.id != broken_id
+            });
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].agent_id, runnable.id);
     }
 
     #[test]
@@ -251,7 +276,7 @@ mod tests {
             work(room_id, other.id, WorkStatus::Open),
         ];
 
-        let candidates = resolve_room_candidates(&[backend, other], &members, &work);
+        let candidates = resolve_room_candidates(&[backend, other], &members, &work, |_| true);
 
         assert_eq!(candidates[0].active_work_count, 2);
         assert_eq!(candidates[1].active_work_count, 1);
