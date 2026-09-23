@@ -36,6 +36,10 @@ impl TestWorkspace {
         let mut child = Command::new(env!("CARGO_BIN_EXE_july"))
             .args(args)
             .env("JULY_WORKSPACE_DB", self.database.file_name().unwrap())
+            // Routing decisions never leave the machine during a test, whatever
+            // the developer has configured in their own environment.
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("JULY_ROUTING_MODE")
             .current_dir(&self.root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -4014,5 +4018,101 @@ fn route_previews_the_lone_room_candidate_without_asking_a_judgment_engine() {
         stderr(&output).contains("/route is unavailable in root context (available in: room)\n"),
         "stderr: {}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn auto_needs_a_room_and_a_task() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    workspace.add_member(&room, &codex);
+
+    let output = workspace.repl("@auto fix Redis timeout\n/room vna\n@auto\n/quit\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("@auto chỉ dùng trong room"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("@auto cần nội dung công việc"),
+        "stderr: {}",
+        stderr(&output)
+    );
+    // Neither attempt reached the Room.
+    assert_eq!(
+        Connection::open(&workspace.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM room_messages", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn auto_assigns_the_only_candidate_without_consulting_a_provider() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    workspace.add_member(&room, &codex);
+
+    let output = workspace.repl("/room vna\n@auto fix Redis timeout\n/quit\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout_output = stdout(&output);
+    assert!(
+        stdout_output.contains("route\tauto\tcodex\t1.00"),
+        "stdout: {stdout_output}"
+    );
+
+    let connection = Connection::open(&workspace.database).unwrap();
+    let bodies: Vec<String> = connection
+        .prepare("SELECT body FROM room_messages")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    // The message is recorded as it was typed, not rewritten into a mention.
+    assert_eq!(bodies, ["@auto fix Redis timeout"]);
+    let targets: Vec<String> = connection
+        .prepare("SELECT agent_id FROM room_message_activations")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(targets, [codex.id.to_string()], "the choice was activated");
+}
+
+#[test]
+fn auto_keeps_the_message_when_no_judgment_is_available() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("vna");
+    let codex = workspace.seed_acp_agent("codex", &["--no-permission"]);
+    let pay = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    for agent in [&codex, &pay] {
+        workspace.add_member(&room, agent);
+    }
+
+    let output = workspace.repl("/room vna\n@auto fix Redis timeout\n/quit\n");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("không định tuyến được: decision provider is not configured"),
+        "stdout: {}",
+        stdout(&output)
+    );
+    // A routing miss costs a retry, never an agent's turn.
+    assert_eq!(
+        Connection::open(&workspace.database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM room_messages", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
     );
 }

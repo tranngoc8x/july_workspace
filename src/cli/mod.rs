@@ -1313,6 +1313,26 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     repl_write(stderr, format_args!("invalid agent mention\n"))?;
                     continue;
                 }
+                let mut names = names;
+                if is_auto_mention(&names) {
+                    let room_id = *room_id;
+                    let task = mention::parse(&line)
+                        .map(|parsed| parsed.prompt.trim().to_owned())
+                        .unwrap_or_default();
+                    if task.is_empty() {
+                        repl_write(stderr, format_args!("@auto cần nội dung công việc\n"))?;
+                        continue;
+                    }
+                    match auto_route(service, room_id, &task, stdout).await {
+                        Ok(Some(chosen)) => names = vec![chosen],
+                        // The ranking has already been reported; nothing is sent.
+                        Ok(None) => continue,
+                        Err(error) => {
+                            repl_write(stderr, format_args!("{error}\n"))?;
+                            continue;
+                        }
+                    }
+                }
                 let command = AppendRoomMessage {
                     message: RoomMessage {
                         id: RoomMessageId::new(),
@@ -1433,6 +1453,13 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
             // Rules B and C: `@agent ...` targets work regardless of context.
             if let Some(parsed) = mention::parse(&line) {
                 let names: Vec<String> = parsed.agents.iter().map(|&n| n.to_owned()).collect();
+                if is_auto_mention(&names) {
+                    repl_write(
+                        stderr,
+                        format_args!("@auto chỉ dùng trong room; vào room rồi thử lại\n"),
+                    )?;
+                    continue;
+                }
                 let prompt = parsed.prompt.to_owned();
                 if let Some(error) = route_mentions(
                     service, workspace, contexts, registered, live, &names, &prompt, stdout,
@@ -4400,6 +4427,82 @@ fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
         agent_runtime_display(agent),
         agent.status,
     )
+}
+
+/// The mention that means "you pick": not an agent name, a request to route.
+const AUTO_MENTION: &str = "auto";
+
+fn is_auto_mention(names: &[String]) -> bool {
+    names.len() == 1 && names[0] == AUTO_MENTION
+}
+
+/// Choose who `@auto` hands the task to, or report why nobody was chosen.
+///
+/// `Ok(None)` means July declined to assign and has already said so; the
+/// message is not sent, because a routing miss should cost a retry, not an
+/// agent's turn.
+///
+/// The configured mode still decides whether routing runs at all, but `@auto`
+/// is itself the user asking for an assignment, so a confident judgment
+/// assigns even while the default mode is `suggest`. That default governs
+/// messages that named nobody, which is a different question.
+async fn auto_route<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+    task: &str,
+    stdout: &mut ReplCaptureWriter<impl Write>,
+) -> Result<Option<String>, CliError> {
+    use crate::application::{AgentSelectionPolicy, RoutingDecision, RoutingMode};
+
+    // An agent actually named `auto` outranks the keyword: explicit wins.
+    if service
+        .resolve_agent(AgentRef::Name(AUTO_MENTION.to_owned()))
+        .await
+        .is_ok()
+    {
+        return Ok(Some(AUTO_MENTION.to_owned()));
+    }
+
+    let configured = AgentSelectionPolicy::from_env();
+    if configured.mode == RoutingMode::Disabled {
+        repl_write(
+            stdout,
+            format_args!("routing đang tắt; đặt JULY_ROUTING_MODE=suggest để bật\n"),
+        )?;
+        return Ok(None);
+    }
+    let policy = AgentSelectionPolicy {
+        mode: RoutingMode::Automatic,
+        ..configured
+    };
+
+    let candidates = route_candidates(service, room_id).await?;
+    let mut engine = crate::adapter::JevDecisionEngine::from_env();
+    let preview = match route::preview(&mut engine, &policy, task.to_owned(), candidates).await {
+        Ok(preview) => preview,
+        // A judgment that never arrived is not a reason to lose the message.
+        Err(error) => {
+            repl_write(stdout, format_args!("không định tuyến được: {error}\n"))?;
+            return Ok(None);
+        }
+    };
+    repl_write(stdout, format_args!("{}", route::render(&preview)))?;
+    match preview.verdict {
+        RoutingDecision::AutoSelected { .. } => Ok(preview.selected),
+        RoutingDecision::Suggested { .. } => {
+            if let Some(agent) = &preview.selected {
+                repl_write(
+                    stdout,
+                    format_args!("chưa đủ chắc chắn; gõ @{agent} <việc> nếu đồng ý\n"),
+                )?;
+            }
+            Ok(None)
+        }
+        RoutingDecision::Unresolved | RoutingDecision::Explicit(_) => {
+            repl_write(stdout, format_args!("không chọn được agent\n"))?;
+            Ok(None)
+        }
+    }
 }
 
 /// Room members a task could go to.
