@@ -4,16 +4,16 @@ use super::{StoreError, records};
 use crate::application::FailedMessageDelivery;
 use crate::domain::WorkScope;
 use crate::domain::{
-    Agent, AgentId, Checkpoint, CheckpointId, Conversation, ConversationId, ConversationKind,
-    ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner, DecisionStatus,
-    DecisionType, DecisionWork, DeliveryStatus, Handoff, HandoffChallenge, HandoffDecision,
-    HandoffId, HandoffResponse, HandoffStatus, MemberType, Memory, MemoryId, MemoryKind,
-    MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, PermissionOutcome,
-    Proposal, ProposalId, ProposalResponse, ProposalResponseId, ProposalResponseType,
-    ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, RoomSessionBinding, SendRoomMessage, SessionBinding, SessionBindingId,
-    SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
-    WorkStatus,
+    Agent, AgentId, AgentRoutingRecord, Checkpoint, CheckpointId, Conversation, ConversationId,
+    ConversationKind, ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner,
+    DecisionStatus, DecisionType, DecisionWork, DeliveryStatus, Handoff, HandoffChallenge,
+    HandoffDecision, HandoffId, HandoffResponse, HandoffStatus, MemberType, Memory, MemoryId,
+    MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision,
+    PermissionOutcome, Proposal, ProposalId, ProposalResponse, ProposalResponseId,
+    ProposalResponseType, ProposalStatus, Publish, PublishId, ResultId, Room, RoomId, RoomMember,
+    RoomMessage, RoomMessageId, RoomSessionBinding, SendRoomMessage, SessionBinding,
+    SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
+    WorkResult, WorkStatus,
 };
 pub(crate) use room_recovery::RoomRecoveryContext;
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
@@ -38,7 +38,7 @@ const PROPOSAL_COLUMNS: &str = "SELECT id, thread_id, author_agent_id, title, pr
 const PROPOSAL_RESPONSE_COLUMNS: &str = "SELECT id, proposal_id, agent_id, response_type, reason,
             evidence_json, created_at
      FROM proposal_responses";
-const MIGRATIONS: [Migration; 20] = [
+const MIGRATIONS: [Migration; 21] = [
     Migration {
         version: 1,
         sql: include_str!("migrations/0001_workspace.sql"),
@@ -118,6 +118,10 @@ const MIGRATIONS: [Migration; 20] = [
     Migration {
         version: 20,
         sql: include_str!("migrations/0020_room_work.sql"),
+    },
+    Migration {
+        version: 21,
+        sql: include_str!("migrations/0021_agent_routing_records.sql"),
     },
 ];
 
@@ -316,6 +320,53 @@ impl SqliteStore {
              FROM rooms ORDER BY name, id",
             [],
             records::room,
+        )
+    }
+
+    /// Append one routing judgment. Records are observations, never updated.
+    pub fn insert_agent_routing_record(
+        &self,
+        record: &AgentRoutingRecord,
+    ) -> Result<(), StoreError> {
+        record.validate()?;
+        let candidates = serde_json::to_string(
+            &record
+                .candidate_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        self.connection.execute(
+            "INSERT INTO agent_routing_records(
+                 id, room_id, message_id, task, source,
+                 selected_agent_id, confidence, candidate_ids_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.id.to_string(),
+                record.room_id.to_string(),
+                record.message_id.map(|id| id.to_string()),
+                record.task,
+                record.source.to_string(),
+                record.selected_agent_id.map(|id| id.to_string()),
+                record.confidence.map(f64::from),
+                candidates,
+                record.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agent_routing_records(
+        &self,
+        room_id: RoomId,
+    ) -> Result<Vec<AgentRoutingRecord>, StoreError> {
+        query_all(
+            &self.connection,
+            "SELECT id, room_id, message_id, task, source,
+                    selected_agent_id, confidence, candidate_ids_json, created_at
+             FROM agent_routing_records WHERE room_id = ?1 ORDER BY created_at, id",
+            params![room_id.to_string()],
+            records::agent_routing_record,
         )
     }
 
@@ -4672,6 +4723,76 @@ mod tests {
         assert!(store.connection.execute("INSERT INTO work_items(id,title,status,created_at,updated_at) VALUES ('no-scope','invalid','open','now','now')", []).is_err());
     }
 
+    #[test]
+    fn routing_records_round_trip_and_refuse_a_sent_message_with_no_agent() {
+        use crate::domain::{
+            AgentId, AgentRoutingRecord, DecisionSource, RoomId, RoomMessageId, RoutingRecordId,
+        };
+
+        let db = TestDatabase::new();
+        let store = SqliteStore::open(&db.path).expect("open store");
+        let room_id = RoomId::new();
+        let infra = AgentId::new();
+        let backend = AgentId::new();
+        store
+            .connection
+            .execute_batch(&format!(
+                "INSERT INTO rooms(id,name,status,created_at,updated_at)
+                     VALUES ('{room_id}','ops','active','now','now');
+                 INSERT INTO agents(id,name,project_root,transport_type,transport_config_json,
+                     status,metadata_json,created_at,updated_at)
+                     VALUES ('{infra}','infra','/w','acp','{{}}','active','{{}}','now','now'),
+                            ('{backend}','backend','/w','acp','{{}}','active','{{}}','now','now');"
+            ))
+            .expect("seed room and agents");
+
+        let assigned = AgentRoutingRecord {
+            id: RoutingRecordId::new(),
+            room_id,
+            message_id: None,
+            task: "fix Redis timeout".into(),
+            source: DecisionSource::Jev,
+            selected_agent_id: Some(infra),
+            confidence: Some(0.91),
+            candidate_ids: vec![infra, backend],
+            created_at: "2026-09-23T00:00:00Z".into(),
+        };
+        let refused = AgentRoutingRecord {
+            id: RoutingRecordId::new(),
+            message_id: None,
+            selected_agent_id: None,
+            confidence: None,
+            created_at: "2026-09-23T00:00:01Z".into(),
+            ..assigned.clone()
+        };
+        store
+            .insert_agent_routing_record(&assigned)
+            .expect("record a judgment");
+        store
+            .insert_agent_routing_record(&refused)
+            .expect("a refusal is recorded too");
+
+        let stored = store
+            .list_agent_routing_records(room_id)
+            .expect("list records");
+        assert_eq!(stored, vec![assigned.clone(), refused]);
+        assert_eq!(stored[0].candidate_ids, vec![infra, backend]);
+
+        // A record that claims to have sent a message must name the agent.
+        let invalid = AgentRoutingRecord {
+            id: RoutingRecordId::new(),
+            message_id: Some(RoomMessageId::new()),
+            selected_agent_id: None,
+            ..assigned
+        };
+        assert!(store.insert_agent_routing_record(&invalid).is_err());
+        assert_eq!(
+            store.list_agent_routing_records(room_id).unwrap().len(),
+            2,
+            "the refused write left nothing behind"
+        );
+    }
+
     struct TestDatabase {
         directory: PathBuf,
         path: PathBuf,
@@ -4768,7 +4889,7 @@ mod tests {
         let before = snapshot(&connection);
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
         assert_eq!(snapshot(&connection), before);
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 20);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 21);
         assert!(
             connection
                 .prepare("PRAGMA foreign_key_check")
@@ -4973,7 +5094,7 @@ mod tests {
         let database = TestDatabase::new();
         let store = SqliteStore::open(database.path()).expect("open fresh database");
 
-        assert_eq!(store.schema_version().unwrap(), 20);
+        assert_eq!(store.schema_version().unwrap(), 21);
     }
 
     #[test]
@@ -5348,14 +5469,14 @@ mod tests {
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            20
+            21
         );
         assert_eq!(
             SqliteStore::open(database.path())
                 .unwrap()
                 .schema_version()
                 .unwrap(),
-            20
+            21
         );
     }
 
@@ -6027,7 +6148,7 @@ mod tests {
 
         apply_migrations(&mut connection, &MIGRATIONS).unwrap();
 
-        assert_eq!(super::current_schema_version(&connection).unwrap(), 20);
+        assert_eq!(super::current_schema_version(&connection).unwrap(), 21);
         for (id, expected) in [
             ("valid-result", Some("prior-result")),
             ("self-result", None),
@@ -6521,15 +6642,15 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
-                 INSERT INTO schema_migrations(version) VALUES (21);",
+                 INSERT INTO schema_migrations(version) VALUES (22);",
             )
             .unwrap();
         drop(connection);
 
         match SqliteStore::open(database.path()) {
             Err(StoreError::DatabaseTooNew {
-                found: 21,
-                supported: 20,
+                found: 22,
+                supported: 21,
             }) => {}
             Err(error) => panic!("unexpected error: {error}"),
             Ok(_) => panic!("newer database was accepted"),

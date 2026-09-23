@@ -10,10 +10,10 @@ use crate::application::{
     ThreadChatService, ThreadMentionOutcome, ThreadRuntime, TransitionWork, WorkError, WorkService,
 };
 use crate::domain::{
-    AgentId, ConversationId, ConversationKind, Decision, DecisionId, DecisionOutcome,
-    DecisionOwner, DecisionWork, MemberType, MessageId, PermissionOption, PermissionOutcome,
-    PublishId, ResultId, RoomId, RoomMessage, RoomMessageId, TRUSTED_LOCAL_USER_ID, WorkItemId,
-    WorkResult, WorkStatus,
+    AgentId, AgentRoutingRecord, ConversationId, ConversationKind, Decision, DecisionId,
+    DecisionOutcome, DecisionOwner, DecisionSource, DecisionWork, MemberType, MessageId,
+    PermissionOption, PermissionOutcome, PublishId, ResultId, RoomId, RoomMessage, RoomMessageId,
+    RoutingRecordId, TRUSTED_LOCAL_USER_ID, WorkItemId, WorkResult, WorkStatus,
 };
 use crate::runtime::{
     AgentDirectMessageRuntime, AgentThreadRuntime, DirectMessageBootstrapError, StorageWorker,
@@ -103,6 +103,8 @@ pub enum CliError {
     Deliberation(#[from] DeliberationError),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("{0}")]
+    Decision(#[from] crate::application::DecisionError),
     #[error("agent turn failed: {0}")]
     TurnFailed(&'static str),
     #[error("agent transport disconnected: {0}")]
@@ -200,6 +202,7 @@ impl CliError {
             Self::NoInstalledAdapters => "no_installed_adapters",
             Self::Io(_) => "io_error",
             Self::Runtime(_) | Self::Bootstrap(_) | Self::DirectMessage(_) => "runtime_error",
+            Self::Decision(_) => "routing_failed",
             Self::Collaboration(error) => match error {
                 CollaborationError::RoomNotFound(_) => "room_not_found",
                 CollaborationError::AgentNotFound(_) => "agent_not_found",
@@ -1314,6 +1317,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                     continue;
                 }
                 let mut names = names;
+                let mut routed: Option<AgentRoutingRecord> = None;
                 if is_auto_mention(&names) {
                     let room_id = *room_id;
                     let task = mention::parse(&line)
@@ -1323,8 +1327,11 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         repl_write(stderr, format_args!("@auto cần nội dung công việc\n"))?;
                         continue;
                     }
-                    match auto_route(service, room_id, &task, stdout).await {
-                        Ok(Some(chosen)) => names = vec![chosen],
+                    match auto_route(service, workspace, room_id, &task, stdout, stderr).await {
+                        Ok(Some((chosen, record))) => {
+                            names = vec![chosen];
+                            routed = Some(record);
+                        }
                         // The ranking has already been reported; nothing is sent.
                         Ok(None) => continue,
                         Err(error) => {
@@ -1359,6 +1366,10 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         continue;
                     }
                 };
+                if let Some(mut record) = routed.take() {
+                    record.message_id = Some(message.id);
+                    record_routing(workspace, record, stderr).await?;
+                }
                 // Only a successfully persisted user message changes the selection.
                 *recipients = message.mentions.clone();
                 if let (Some(events), Some(origin)) = (tui_events, pending_origin.take()) {
@@ -2175,18 +2186,11 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                 let ReplContext::Room { room_id, .. } = contexts.last().unwrap() else {
                     unreachable!("registry scopes /route to room")
                 };
-                match route_candidates(service, *room_id).await {
-                    Ok(candidates) => {
-                        let mut engine = crate::adapter::JevDecisionEngine::from_env();
-                        let policy = crate::application::AgentSelectionPolicy::from_env();
-                        match route::preview(&mut engine, &policy, arguments.to_owned(), candidates)
-                            .await
-                        {
-                            Ok(preview) => {
-                                repl_write(stdout, format_args!("{}", route::render(&preview)))?
-                            }
-                            Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
-                        }
+                let policy = crate::application::AgentSelectionPolicy::from_env();
+                match preview_routing(service, *room_id, arguments, &policy).await {
+                    Ok((preview, record)) => {
+                        repl_write(stdout, format_args!("{}", route::render(&preview)))?;
+                        record_routing(workspace, record, stderr).await?;
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 }
@@ -4429,6 +4433,70 @@ fn render_agent(agent: &crate::domain::Agent, json_output: bool) -> String {
     )
 }
 
+/// Judge who should take `task`, and write down what was judged.
+///
+/// The record is built here, for every outcome, because a refusal is the
+/// measurement that matters: assignments alone cannot show a wrong one.
+async fn preview_routing<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    room_id: RoomId,
+    task: &str,
+    policy: &crate::application::AgentSelectionPolicy,
+) -> Result<(route::RoutePreview, AgentRoutingRecord), CliError> {
+    let candidates = route_candidates(service, room_id).await?;
+    let named: Vec<(String, AgentId)> = candidates
+        .iter()
+        .map(|candidate| (candidate.name.clone(), candidate.agent_id))
+        .collect();
+    // Nothing to judge means code decided on its own.
+    let source = if candidates.len() > 1 {
+        DecisionSource::Jev
+    } else {
+        DecisionSource::Rule
+    };
+
+    let mut engine = crate::adapter::JevDecisionEngine::from_env();
+    let preview = route::preview(&mut engine, policy, task.to_owned(), candidates).await?;
+    let selected_agent_id = preview.selected.as_ref().and_then(|chosen| {
+        named
+            .iter()
+            .find(|(name, _)| name == chosen)
+            .map(|(_, agent_id)| *agent_id)
+    });
+    let record = AgentRoutingRecord {
+        id: RoutingRecordId::new(),
+        room_id,
+        message_id: None,
+        task: task.to_owned(),
+        source,
+        selected_agent_id,
+        confidence: selected_agent_id.map(|_| preview.confidence),
+        candidate_ids: named.into_iter().map(|(_, agent_id)| agent_id).collect(),
+        created_at: timestamp(),
+    };
+    Ok((preview, record))
+}
+
+/// Losing an eval case is not worth losing a turn over, so a failed write is
+/// reported and nothing else.
+async fn record_routing(
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    record: AgentRoutingRecord,
+    stderr: &mut ReplCaptureWriter<impl Write>,
+) -> Result<(), CliError> {
+    if let Err(error) = workspace
+        .storage()
+        .insert_agent_routing_record(record)
+        .await
+    {
+        repl_write(
+            stderr,
+            format_args!("không ghi được routing record: {error}\n"),
+        )?;
+    }
+    Ok(())
+}
+
 /// The mention that means "you pick": not an agent name, a request to route.
 const AUTO_MENTION: &str = "auto";
 
@@ -4448,19 +4516,33 @@ fn is_auto_mention(names: &[String]) -> bool {
 /// messages that named nobody, which is a different question.
 async fn auto_route<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
     room_id: RoomId,
     task: &str,
     stdout: &mut ReplCaptureWriter<impl Write>,
-) -> Result<Option<String>, CliError> {
+    stderr: &mut ReplCaptureWriter<impl Write>,
+) -> Result<Option<(String, AgentRoutingRecord)>, CliError> {
     use crate::application::{AgentSelectionPolicy, RoutingDecision, RoutingMode};
 
     // An agent actually named `auto` outranks the keyword: explicit wins.
-    if service
+    if let Ok(agent) = service
         .resolve_agent(AgentRef::Name(AUTO_MENTION.to_owned()))
         .await
-        .is_ok()
     {
-        return Ok(Some(AUTO_MENTION.to_owned()));
+        return Ok(Some((
+            AUTO_MENTION.to_owned(),
+            AgentRoutingRecord {
+                id: RoutingRecordId::new(),
+                room_id,
+                message_id: None,
+                task: task.to_owned(),
+                source: DecisionSource::ExplicitMention,
+                selected_agent_id: Some(agent.id),
+                confidence: None,
+                candidate_ids: vec![agent.id],
+                created_at: timestamp(),
+            },
+        )));
     }
 
     let configured = AgentSelectionPolicy::from_env();
@@ -4476,10 +4558,8 @@ async fn auto_route<R: crate::application::CollaborationRuntime>(
         ..configured
     };
 
-    let candidates = route_candidates(service, room_id).await?;
-    let mut engine = crate::adapter::JevDecisionEngine::from_env();
-    let preview = match route::preview(&mut engine, &policy, task.to_owned(), candidates).await {
-        Ok(preview) => preview,
+    let (preview, record) = match preview_routing(service, room_id, task, &policy).await {
+        Ok(decided) => decided,
         // A judgment that never arrived is not a reason to lose the message.
         Err(error) => {
             repl_write(stdout, format_args!("không định tuyến được: {error}\n"))?;
@@ -4488,7 +4568,11 @@ async fn auto_route<R: crate::application::CollaborationRuntime>(
     };
     repl_write(stdout, format_args!("{}", route::render(&preview)))?;
     match preview.verdict {
-        RoutingDecision::AutoSelected { .. } => Ok(preview.selected),
+        RoutingDecision::AutoSelected { .. } => match preview.selected {
+            // The caller finishes the record once the message has an id.
+            Some(chosen) => Ok(Some((chosen, record))),
+            None => Ok(None),
+        },
         RoutingDecision::Suggested { .. } => {
             if let Some(agent) = &preview.selected {
                 repl_write(
@@ -4496,10 +4580,12 @@ async fn auto_route<R: crate::application::CollaborationRuntime>(
                     format_args!("chưa đủ chắc chắn; gõ @{agent} <việc> nếu đồng ý\n"),
                 )?;
             }
+            record_routing(workspace, record, stderr).await?;
             Ok(None)
         }
         RoutingDecision::Unresolved | RoutingDecision::Explicit(_) => {
             repl_write(stdout, format_args!("không chọn được agent\n"))?;
+            record_routing(workspace, record, stderr).await?;
             Ok(None)
         }
     }

@@ -1427,10 +1427,10 @@ fn room_cursor_migration_preserves_existing_messages_and_stable_append_order() {
     connection.execute("INSERT INTO session_bindings(id, room_id, agent_id, transport_type, status, created_at, last_used_at) VALUES (?1, ?2, ?3, 'acp', 'disconnected', ?4, ?4)", rusqlite::params![binding, room.id.to_string(), pay.id.to_string(), NOW]).unwrap();
     connection.execute("INSERT INTO room_message_activations(message_id, agent_id, session_binding_id, status, updated_at) VALUES (?1, ?2, ?3, 'failed', ?4)", rusqlite::params![first.id.to_string(), pay.id.to_string(), binding, NOW]).unwrap();
     // Reconstruct the previous schema with its existing canonical message intact.
-    connection.execute_batch("DROP TABLE room_message_work; DROP TABLE room_a2a_task_bindings; DROP TRIGGER room_task_work_scope; DROP TABLE room_message_publications; DROP TRIGGER room_message_append_order; DROP TABLE agent_room_cursors; DROP TABLE room_message_order; DELETE FROM schema_migrations WHERE version >= 18;").unwrap();
+    connection.execute_batch("DROP TABLE agent_routing_records; DROP TABLE room_message_work; DROP TABLE room_a2a_task_bindings; DROP TRIGGER room_task_work_scope; DROP TABLE room_message_publications; DROP TRIGGER room_message_append_order; DROP TABLE agent_room_cursors; DROP TABLE room_message_order; DELETE FROM schema_migrations WHERE version >= 18;").unwrap();
     drop(connection);
     let mut store = SqliteStore::open(database.path()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 20);
+    assert_eq!(store.schema_version().unwrap(), 21);
     assert_eq!(
         store.list_recent_room_messages(room.id, 10).unwrap().0,
         vec![first.clone()]

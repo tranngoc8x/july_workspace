@@ -1,10 +1,11 @@
 use super::StoreError;
 use crate::domain::WorkScope;
 use crate::domain::{
-    Agent, Checkpoint, Conversation, ConversationId, ConversationMember, Decision, DomainError,
-    Handoff, Memory, Message, MessageDelivery, PermissionDecision, PermissionOption,
-    PermissionOutcome, Proposal, ProposalResponse, Publish, Room, RoomMember, RoomMessage,
-    SessionBinding, SessionRecovery, WorkDependency, WorkItem, WorkResult,
+    Agent, AgentId, AgentRoutingRecord, Checkpoint, Conversation, ConversationId,
+    ConversationMember, Decision, DomainError, Handoff, Memory, Message, MessageDelivery,
+    PermissionDecision, PermissionOption, PermissionOutcome, Proposal, ProposalResponse, Publish,
+    Room, RoomMember, RoomMessage, SessionBinding, SessionRecovery, WorkDependency, WorkItem,
+    WorkResult,
 };
 use rusqlite::Row;
 use serde_json::Value;
@@ -38,6 +39,30 @@ fn json_value(value: String) -> Result<Value, StoreError> {
 
 fn string_vec(value: String) -> Result<Vec<String>, StoreError> {
     Ok(serde_json::from_str(&value)?)
+}
+
+fn id_vec<T>(value: String) -> Result<Vec<T>, StoreError>
+where
+    T: FromStr<Err = DecodeError>,
+{
+    string_vec(value)?.into_iter().map(id).collect()
+}
+
+pub(super) fn agent_routing_record(row: &Row<'_>) -> Result<AgentRoutingRecord, StoreError> {
+    let confidence: Option<f64> = row.get(6)?;
+    let record = AgentRoutingRecord {
+        id: id(row.get(0)?)?,
+        room_id: id(row.get(1)?)?,
+        message_id: optional_id(row.get(2)?)?,
+        task: row.get(3)?,
+        source: domain_enum(row.get(4)?)?,
+        selected_agent_id: optional_id::<AgentId>(row.get(5)?)?,
+        confidence: confidence.map(|confidence| confidence as f32),
+        candidate_ids: id_vec(row.get(7)?)?,
+        created_at: row.get(8)?,
+    };
+    record.validate()?;
+    Ok(record)
 }
 
 /// A single-column projection of `conversations.id`.

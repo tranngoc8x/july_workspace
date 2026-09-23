@@ -63,6 +63,7 @@ typed_id!(
     DecisionId,
     ProposalId,
     ProposalResponseId,
+    RoutingRecordId,
 );
 
 #[cfg(test)]
@@ -98,6 +99,7 @@ mod tests {
             DecisionId,
             ProposalId,
             ProposalResponseId,
+            RoutingRecordId,
         );
     }
 

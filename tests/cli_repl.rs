@@ -4019,6 +4019,20 @@ fn route_previews_the_lone_room_candidate_without_asking_a_judgment_engine() {
         "stderr: {}",
         stderr(&output)
     );
+
+    // A preview is recorded like any other judgment, but it sent nothing.
+    let (message_id, source, selected): (Option<String>, String, Option<String>) =
+        Connection::open(&workspace.database)
+            .unwrap()
+            .query_row(
+                "SELECT message_id, source, selected_agent_id FROM agent_routing_records",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+    assert_eq!(message_id, None, "a preview never sends a message");
+    assert_eq!(source, "rule");
+    assert_eq!(selected.as_deref(), Some(codex.id.to_string().as_str()));
 }
 
 #[test]

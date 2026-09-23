@@ -1,0 +1,86 @@
+{
+  "agents": [
+    {
+      "name": "backend",
+      "description": "Owns the HTTP API services and their business logic: endpoints, validation, background jobs and the PostgreSQL schema behind them.",
+      "skills": ["api-development", "debugging", "database"],
+      "domains": ["backend"],
+      "languages": ["rust", "typescript"],
+      "tools": ["postgres"]
+    },
+    {
+      "name": "infra",
+      "description": "Runs the platform the services sit on: containers, deploys, CI, caching and message brokers, and the alerts that fire when they break.",
+      "skills": ["deployment", "observability", "caching"],
+      "domains": ["infrastructure"],
+      "languages": ["rust", "bash"],
+      "tools": ["redis", "docker", "kubernetes"]
+    },
+    {
+      "name": "frontend",
+      "description": "Builds what people see and click: the web client, its components, state handling and accessibility.",
+      "skills": ["ui-development", "accessibility"],
+      "domains": ["frontend"],
+      "languages": ["typescript", "css"],
+      "tools": ["react", "vite"]
+    },
+    {
+      "name": "payment",
+      "description": "Owns money movement: charges, refunds, settlement, reconciliation and the payment provider webhooks, including their signature verification.",
+      "skills": ["payments", "reconciliation", "webhooks"],
+      "domains": ["payment"],
+      "languages": ["rust"],
+      "tools": ["stripe", "postgres"]
+    },
+    {
+      "name": "qa",
+      "description": "Owns the test suites and the release gate: integration tests, flaky test triage and reproducing reported defects.",
+      "skills": ["testing", "test-automation"],
+      "domains": ["quality"],
+      "languages": ["rust", "python"],
+      "tools": ["cargo", "pytest"]
+    }
+  ],
+  "cases": [
+    {
+      "task": "fix Redis timeout",
+      "acceptable": ["infra", "backend"],
+      "bad": ["frontend", "payment"]
+    },
+    {
+      "task": "update payment webhook signature verification",
+      "acceptable": ["payment"],
+      "bad": ["frontend", "infra", "qa"]
+    },
+    {
+      "task": "optimize a slow PostgreSQL query on the orders table",
+      "acceptable": ["backend", "payment"],
+      "bad": ["frontend", "infra"]
+    },
+    {
+      "task": "the checkout button is unreadable on a dark background",
+      "acceptable": ["frontend"],
+      "bad": ["infra", "payment", "qa"]
+    },
+    {
+      "task": "debug why the Docker deployment fails on staging",
+      "acceptable": ["infra"],
+      "bad": ["frontend", "payment"]
+    },
+    {
+      "task": "add an integration test for the refund flow",
+      "acceptable": ["qa", "payment"],
+      "bad": ["frontend", "infra"]
+    },
+    {
+      "task": "settlement totals do not match the provider report for yesterday",
+      "acceptable": ["payment"],
+      "bad": ["frontend", "infra", "qa"]
+    },
+    {
+      "task": "an integration test fails only under parallel load",
+      "acceptable": ["qa"],
+      "bad": ["frontend", "payment"]
+    }
+  ]
+}

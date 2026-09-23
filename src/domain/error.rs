@@ -32,6 +32,10 @@ pub enum DomainError {
     WorkCompletionTimestampMismatch,
     #[error("work result cannot supersede itself")]
     ResultSupersedesItself,
+    #[error("a routing record that sent a message must name the agent it chose")]
+    RoutingRecordSentWithoutAgent,
+    #[error("routing confidence must be a probability from 0 to 1")]
+    RoutingRecordConfidenceOutOfRange,
     #[error("proposal cannot supersede itself")]
     ProposalSupersedesItself,
     #[error("a {0} response must carry a reason, and evidence when it disagrees")]

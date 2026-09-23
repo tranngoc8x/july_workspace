@@ -1,7 +1,7 @@
 use super::{
     AgentId, CheckpointId, ConversationId, DecisionId, DomainError, HandoffId, MemoryId, MessageId,
-    ProposalId, ProposalResponseId, PublishId, ResultId, RoomId, RoomMessageId, SessionBindingId,
-    WorkItemId,
+    ProposalId, ProposalResponseId, PublishId, ResultId, RoomId, RoomMessageId, RoutingRecordId,
+    SessionBindingId, WorkItemId,
 };
 use serde_json::Value;
 use std::fmt::{self, Display, Formatter};
@@ -202,6 +202,15 @@ impl FromStr for DecisionOwner {
             })
     }
 }
+
+// Where a routing choice came from. `Human` is the user naming nobody but
+// picking afterwards; `Rule` is a choice code could make on its own.
+string_enum!(DecisionSource {
+    Human => "human",
+    ExplicitMention => "explicit_mention",
+    Rule => "rule",
+    Jev => "jev",
+});
 
 string_enum!(DeliveryStatus {
     Pending => "pending",
@@ -999,6 +1008,41 @@ impl Decision {
         );
         if stated != settled {
             return Err(DomainError::DecisionOutcomeStatusMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// One routing judgment, kept whether or not July acted on it.
+///
+/// The refusals are the point: `wrong-auto-assignment rate` cannot be measured
+/// from the assignments alone. No prompt, no reasoning and no transcript is
+/// stored - only the task line the user typed and who was in the running.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRoutingRecord {
+    pub id: RoutingRecordId,
+    pub room_id: RoomId,
+    /// Set only when the decision actually sent a message.
+    pub message_id: Option<RoomMessageId>,
+    pub task: String,
+    pub source: DecisionSource,
+    pub selected_agent_id: Option<AgentId>,
+    pub confidence: Option<f32>,
+    pub candidate_ids: Vec<AgentId>,
+    pub created_at: String,
+}
+
+impl AgentRoutingRecord {
+    pub fn validate(&self) -> Result<(), DomainError> {
+        require_text(&self.task, "agent_routing_record.task")?;
+        require_text(&self.created_at, "agent_routing_record.created_at")?;
+        if self.message_id.is_some() && self.selected_agent_id.is_none() {
+            return Err(DomainError::RoutingRecordSentWithoutAgent);
+        }
+        if let Some(confidence) = self.confidence
+            && !(0.0..=1.0).contains(&confidence)
+        {
+            return Err(DomainError::RoutingRecordConfidenceOutOfRange);
         }
         Ok(())
     }

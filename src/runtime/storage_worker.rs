@@ -7,14 +7,14 @@ use crate::application::{
     WorkRuntime, format_recovery_capsule,
 };
 use crate::domain::{
-    Agent, AgentId, Checkpoint, Conversation, ConversationId, ConversationMember, Decision,
-    DecisionId, DecisionOutcome, DecisionOwner, DecisionWork, DomainError, Handoff,
-    HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory, MemoryKind, MemoryScopeType,
-    Message, MessageDelivery, MessageId, PermissionDecision, Proposal, ProposalId,
-    ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember, RoomMessage,
-    RoomMessageId, RoomSessionBinding, RoomWork, SendRoomMessage, SessionBinding, SessionBindingId,
-    SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId, WorkResult,
-    WorkStatus,
+    Agent, AgentId, AgentRoutingRecord, Checkpoint, Conversation, ConversationId,
+    ConversationMember, Decision, DecisionId, DecisionOutcome, DecisionOwner, DecisionWork,
+    DomainError, Handoff, HandoffChallenge, HandoffId, HandoffResponse, MemberType, Memory,
+    MemoryKind, MemoryScopeType, Message, MessageDelivery, MessageId, PermissionDecision, Proposal,
+    ProposalId, ProposalResponse, Publish, PublishId, ResultId, Room, RoomId, RoomMember,
+    RoomMessage, RoomMessageId, RoomSessionBinding, RoomWork, SendRoomMessage, SessionBinding,
+    SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
+    WorkResult, WorkStatus,
 };
 use crate::storage::{RoomActivationClaim, RoomRecoveryContext, SqliteStore, StoreError};
 use std::path::{Path, PathBuf};
@@ -167,6 +167,7 @@ enum Command {
         oneshot::Sender<Result<Vec<Message>, StoreError>>,
     ),
     ListRecentMessages(ConversationId, usize, Reply<(Vec<Message>, bool)>),
+    InsertAgentRoutingRecord(AgentRoutingRecord, Reply<()>),
     InsertCheckpoint(Checkpoint, oneshot::Sender<Result<(), StoreError>>),
     GetLatestCheckpoint(
         ConversationId,
@@ -493,6 +494,16 @@ impl StorageHandle {
         limit: usize,
     ) -> Result<(Vec<Message>, bool), RuntimeError> {
         self.request(|reply| Command::ListRecentMessages(conversation_id, limit, reply))
+            .await
+    }
+
+    /// Append one routing judgment. Never on the critical path of a turn: a
+    /// failed write costs an eval case, not the message.
+    pub async fn insert_agent_routing_record(
+        &self,
+        record: AgentRoutingRecord,
+    ) -> Result<(), RuntimeError> {
+        self.request(|reply| Command::InsertAgentRoutingRecord(record, reply))
             .await
     }
 
@@ -1639,6 +1650,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             }
             Command::ListRecentMessages(conversation_id, limit, reply) => {
                 let _ = reply.send(store.list_recent_messages_after(conversation_id, None, limit));
+            }
+            Command::InsertAgentRoutingRecord(record, reply) => {
+                let _ = reply.send(store.insert_agent_routing_record(&record));
             }
             Command::InsertCheckpoint(checkpoint, reply) => {
                 let _ = reply.send(store.insert_checkpoint(&checkpoint));
