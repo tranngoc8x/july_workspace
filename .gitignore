@@ -8,3 +8,5 @@
 /dist
 .worktrees/
 .env.local
+.beads
+.beads.gate.lock
