@@ -16,7 +16,9 @@ use crate::domain::{
     SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
     WorkResult, WorkStatus,
 };
-use crate::storage::{RoomActivationClaim, RoomRecoveryContext, SqliteStore, StoreError};
+use crate::storage::{
+    RoomActivationClaim, RoomOverview, RoomRecoveryContext, SqliteStore, StoreError,
+};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::thread::JoinHandle;
@@ -36,6 +38,7 @@ enum Command {
         Reply<RoomSessionBinding>,
     ),
     RoomRecoveryContext(RoomMessageId, AgentId, Reply<RoomRecoveryContext>),
+    RoomOverview(RoomId, Option<AgentId>, Reply<RoomOverview>),
     GetRoomMessageWork(RoomMessageId, Reply<Option<RoomWork>>),
     LoadRoomRecipientMessage(RoomMessageId, AgentId, Reply<RoomMessage>),
     SendAgentRoomMessage(
@@ -548,6 +551,15 @@ impl StorageHandle {
         })
         .await
     }
+    pub(crate) async fn room_overview(
+        &self,
+        room: RoomId,
+        target: Option<AgentId>,
+    ) -> Result<RoomOverview, RuntimeError> {
+        self.request(|reply| Command::RoomOverview(room, target, reply))
+            .await
+    }
+
     pub(crate) async fn room_recovery_context(
         &self,
         message: RoomMessageId,
@@ -1675,6 +1687,9 @@ fn run(mut store: SqliteStore, mut commands: mpsc::Receiver<Command>) {
             Command::ReplaceRoomActivationBinding(message, agent, source, at, reply) => {
                 let _ =
                     reply.send(store.replace_room_activation_binding(message, agent, source, &at));
+            }
+            Command::RoomOverview(room, target, reply) => {
+                let _ = reply.send(store.room_overview(room, target));
             }
             Command::RoomRecoveryContext(message, agent, reply) => {
                 let _ = reply.send(store.room_recovery_context(message, agent));

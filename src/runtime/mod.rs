@@ -20,7 +20,7 @@ pub use direct_message::{
     AgentDirectMessageRuntime, DirectMessageBootstrapError, open_acp_direct_message,
 };
 pub use error::RuntimeError;
-pub use room::{RoomActivation, RoomRuntimeEvent};
+pub use room::{AgentActivity, RoomActivation, RoomRuntimeEvent};
 pub use room_a2a::{RoomA2aError, RoomA2aRecipient};
 pub(crate) use session_manager::SessionManager;
 pub(crate) use storage_worker::StorageHandle;

@@ -15,7 +15,9 @@ use crate::domain::{
     SessionBindingId, SessionBindingStatus, SessionRecovery, WorkDependency, WorkItem, WorkItemId,
     WorkResult, WorkStatus,
 };
-pub(crate) use room_recovery::RoomRecoveryContext;
+#[cfg(test)]
+pub(crate) use room_recovery::{RoomInterruptedTurn, RoomOverviewWork};
+pub(crate) use room_recovery::{RoomOverview, RoomRecoveryContext};
 use rusqlite::{Connection, Params, Row, TransactionBehavior, params};
 use std::collections::BTreeSet;
 use std::path::Path;

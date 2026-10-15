@@ -7,6 +7,27 @@ pub(crate) struct RoomRecoveryContext {
     pub work_truncated: bool,
 }
 
+/// Bounded durable snapshot; observing it never claims or retries a turn.
+pub(crate) struct RoomOverview {
+    pub work: Vec<RoomOverviewWork>,
+    pub work_truncated: bool,
+    pub interrupted: Vec<RoomInterruptedTurn>,
+    pub interrupted_truncated: bool,
+}
+
+pub(crate) struct RoomOverviewWork {
+    pub work: WorkItem,
+    pub owner_name: Option<String>,
+    pub latest_result_summary: Option<String>,
+}
+
+pub(crate) struct RoomInterruptedTurn {
+    pub message_id: RoomMessageId,
+    pub agent_id: AgentId,
+    pub agent_name: String,
+    pub status: String,
+}
+
 pub(super) fn replacement_binding(
     connection: &Connection,
     source: &RoomSessionBinding,
@@ -35,6 +56,55 @@ pub(super) fn replacement_binding(
 }
 
 impl SqliteStore {
+    pub(crate) fn room_overview(
+        &self,
+        room: RoomId,
+        target: Option<AgentId>,
+    ) -> Result<RoomOverview, StoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        require_active_room(&tx, room)?;
+        let mut work = Vec::new();
+        let mut work_truncated = false;
+        // Bound each group separately so completed history cannot hide unfinished work.
+        for group in [0, 1, 2] {
+            let mut entries = query_all(&tx,
+                "SELECT w.id,w.conversation_id,substr(w.title,1,240),substr(w.goal,1,512),w.status,w.owner_agent_id,w.is_primary,w.created_at,w.updated_at,w.completed_at,w.room_id,
+                 substr(a.name,1,120),(SELECT substr(r.summary,1,512) FROM work_results r WHERE r.work_id=w.id ORDER BY r.created_at DESC,r.id DESC LIMIT 1)
+                 FROM work_items w LEFT JOIN agents a ON a.id=w.owner_agent_id
+                 WHERE w.room_id=?1 AND (?2 IS NULL OR w.owner_agent_id=?2)
+                 AND CASE WHEN w.status='done' THEN 0 WHEN w.status IN ('failed','cancelled') THEN 1 ELSE 2 END=?3
+                 ORDER BY w.updated_at DESC,w.id DESC LIMIT 21",
+                params![room.to_string(),target.map(|id| id.to_string()),group],
+                |row| Ok(RoomOverviewWork { work: records::work_item(row)?, owner_name: row.get(11)?, latest_result_summary: row.get(12)? }))?;
+            work_truncated |= entries.len() > 20;
+            entries.truncate(20);
+            work.extend(entries);
+        }
+        let mut interrupted = query_all(&tx,
+            "SELECT m.id,a.agent_id,substr(owner.name,1,120),a.status
+             FROM room_message_activations a JOIN room_messages m ON m.id=a.message_id
+             JOIN room_message_order o ON o.message_id=m.id JOIN agents owner ON owner.id=a.agent_id
+             WHERE m.room_id=?1 AND (?2 IS NULL OR a.agent_id=?2) AND a.status IN ('failed','cancelled')
+             AND NOT EXISTS (
+                 SELECT 1 FROM room_message_activations newer
+                 JOIN room_messages followup ON followup.id=newer.message_id
+                 JOIN room_message_order next_order ON next_order.message_id=followup.id
+                 WHERE newer.agent_id=a.agent_id AND newer.status='completed'
+                 AND followup.room_id=m.room_id AND followup.reply_to=m.id AND next_order.sequence>o.sequence)
+             ORDER BY o.sequence DESC,a.agent_id LIMIT 21",
+            params![room.to_string(),target.map(|id| id.to_string())],
+            |row| Ok(RoomInterruptedTurn { message_id: row.get::<_,String>(0)?.parse()?, agent_id: row.get::<_,String>(1)?.parse()?, agent_name: row.get(2)?, status: row.get(3)? }))?;
+        let interrupted_truncated = interrupted.len() > 20;
+        interrupted.truncate(20);
+        tx.commit()?;
+        Ok(RoomOverview {
+            work,
+            work_truncated,
+            interrupted,
+            interrupted_truncated,
+        })
+    }
+
     /// Start a new current session without erasing shared history or other agents' sessions.
     pub(crate) fn new_room_session(
         &mut self,
@@ -237,6 +307,210 @@ mod tests {
             })
             .unwrap();
         id
+    }
+
+    #[test]
+    fn room_overview_is_scoped_bounded_read_only_and_keeps_latest_result() {
+        let (mut store, room, agent) = fixture(Path::new(":memory:"));
+        let foreign = RoomId::new();
+        let mut other = store.get_room(room).unwrap().unwrap();
+        other.id = foreign;
+        other.name = "foreign".into();
+        store.create_room(&other).unwrap();
+        for index in 0..25 {
+            let work = WorkItem {
+                id: WorkItemId::new(),
+                scope: WorkScope::Room(room),
+                title: format!("work-{index}"),
+                goal: None,
+                status: WorkStatus::Open,
+                owner_agent_id: None,
+                is_primary: false,
+                created_at: NOW.into(),
+                updated_at: NOW.into(),
+                completed_at: None,
+            };
+            store.insert_work_item(&work).unwrap();
+            store.assign_work_owner(work.id, agent, NOW).unwrap();
+        }
+        let foreign_work = WorkItem {
+            id: WorkItemId::new(),
+            scope: WorkScope::Room(foreign),
+            title: "foreign secret".into(),
+            goal: None,
+            status: WorkStatus::Open,
+            owner_agent_id: None,
+            is_primary: false,
+            created_at: NOW.into(),
+            updated_at: NOW.into(),
+            completed_at: None,
+        };
+        store.insert_work_item(&foreign_work).unwrap();
+        let before = store.connection.total_changes();
+        let overview = store.room_overview(room, Some(agent)).unwrap();
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(overview.work.len(), 20);
+        assert!(overview.work_truncated);
+        assert!(
+            overview
+                .work
+                .iter()
+                .all(|w| w.work.scope == WorkScope::Room(room)
+                    && w.owner_name.as_deref() == Some("owner"))
+        );
+        let work = overview.work[0].work.id;
+        store.connection.execute("INSERT INTO work_results(id,work_id,status,summary,outputs_json,evidence_json,created_at) VALUES (?1,?2,'success','latest verified summary','[]','[]',?3)", params![ResultId::new().to_string(),work.to_string(),RESTART]).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE work_items SET status='done',completed_at=?2 WHERE id=?1",
+                params![work.to_string(), RESTART],
+            )
+            .unwrap();
+        let failed = overview.work[1].work.id;
+        store
+            .connection
+            .execute(
+                "UPDATE work_items SET status='failed',completed_at=?2 WHERE id=?1",
+                params![failed.to_string(), RESTART],
+            )
+            .unwrap();
+        let after_insert = store.connection.total_changes();
+        let overview = store.room_overview(room, Some(agent)).unwrap();
+        assert_eq!(
+            overview.work[0].latest_result_summary.as_deref(),
+            Some("latest verified summary")
+        );
+        assert_eq!(
+            overview
+                .work
+                .iter()
+                .filter(|entry| entry.work.status == WorkStatus::Done)
+                .count(),
+            1
+        );
+        assert_eq!(
+            overview
+                .work
+                .iter()
+                .filter(|entry| entry.work.status == WorkStatus::Failed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            overview
+                .work
+                .iter()
+                .filter(|entry| !entry.work.status.is_terminal())
+                .count(),
+            20
+        );
+        let ids: Vec<_> = overview.work.iter().map(|entry| entry.work.id).collect();
+        store
+            .connection
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        assert_eq!(
+            store
+                .room_overview(room, Some(agent))
+                .unwrap()
+                .work
+                .iter()
+                .map(|entry| entry.work.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(store.connection.total_changes(), after_insert);
+        assert!(after_insert > before);
+        assert!(
+            store
+                .room_overview(room, Some(AgentId::new()))
+                .unwrap()
+                .work
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn room_overview_interruption_requires_linked_success_to_be_superseded() {
+        let (mut store, room, agent) = fixture(Path::new(":memory:"));
+        let interrupted = message(&mut store, room, agent);
+        store
+            .claim_room_activation(interrupted, agent, NOW)
+            .unwrap();
+        store
+            .set_room_activation_status(interrupted, agent, "failed", NOW)
+            .unwrap();
+        assert_eq!(
+            store.room_overview(room, None).unwrap().interrupted.len(),
+            1
+        );
+        let unrelated = message(&mut store, room, agent);
+        store.claim_room_activation(unrelated, agent, NOW).unwrap();
+        store
+            .set_room_activation_status(unrelated, agent, "completed", NOW)
+            .unwrap();
+        assert_eq!(
+            store.room_overview(room, None).unwrap().interrupted.len(),
+            1
+        );
+        let continuation = RoomMessage {
+            id: RoomMessageId::new(),
+            room_id: room,
+            sender_type: MemberType::User,
+            sender_id: "july".into(),
+            body: "new continuation".into(),
+            mentions: vec![agent],
+            reply_to: Some(interrupted),
+            created_at: RESTART.into(),
+        };
+        store.append_room_message(&continuation).unwrap();
+        store
+            .claim_room_activation(continuation.id, agent, RESTART)
+            .unwrap();
+        store
+            .set_room_activation_status(continuation.id, agent, "completed", RESTART)
+            .unwrap();
+        assert!(
+            store
+                .room_overview(room, None)
+                .unwrap()
+                .interrupted
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn room_overview_interrupted_turns_are_bounded_and_exclude_other_rooms() {
+        let (mut store, room, agent) = fixture(Path::new(":memory:"));
+        let mut other = store.get_room(room).unwrap().unwrap();
+        other.id = RoomId::new();
+        other.name = "other".into();
+        store.create_room(&other).unwrap();
+        store.add_room_member(other.id, agent, None, NOW).unwrap();
+        let foreign = message(&mut store, other.id, agent);
+        store.claim_room_activation(foreign, agent, NOW).unwrap();
+        store
+            .set_room_activation_status(foreign, agent, "failed", NOW)
+            .unwrap();
+        let mut latest = foreign;
+        for _ in 0..25 {
+            latest = message(&mut store, room, agent);
+            store.claim_room_activation(latest, agent, NOW).unwrap();
+            store
+                .set_room_activation_status(latest, agent, "failed", NOW)
+                .unwrap();
+        }
+        let overview = store.room_overview(room, None).unwrap();
+        assert_eq!(overview.interrupted.len(), 20);
+        assert!(overview.interrupted_truncated);
+        assert_eq!(overview.interrupted[0].message_id, latest);
+        assert!(
+            overview
+                .interrupted
+                .iter()
+                .all(|turn| turn.message_id != foreign && turn.status == "failed")
+        );
     }
 
     #[test]

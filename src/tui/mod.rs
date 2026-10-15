@@ -26,6 +26,7 @@ pub mod app;
 pub(crate) mod bottom_pane;
 /// Finding workspace files for the composer's `@` popup.
 pub mod file_search;
+mod followups;
 mod markdown;
 /// Writing finished transcript rows into the terminal's scrollback.
 mod scrollback;

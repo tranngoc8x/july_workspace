@@ -7,4 +7,6 @@ mod sqlite;
 pub use error::StoreError;
 pub use sqlite::SqliteStore;
 
-pub(crate) use sqlite::{RoomActivationClaim, RoomRecoveryContext};
+pub(crate) use sqlite::{RoomActivationClaim, RoomOverview, RoomRecoveryContext};
+#[cfg(test)]
+pub(crate) use sqlite::{RoomInterruptedTurn, RoomOverviewWork};

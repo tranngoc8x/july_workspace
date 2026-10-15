@@ -26,7 +26,7 @@ impl ChatComposerHistory {
         let entries: Vec<_> = entries
             .into_iter()
             .map(|response| {
-                let entry = response.entry.map(|text| HistoryEntry::new(text));
+                let entry = response.entry.map(HistoryEntry::new);
                 if entry.is_some() {
                     self.fetched_history.insert(response.offset, entry.clone());
                 } else {

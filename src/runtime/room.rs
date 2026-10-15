@@ -4,10 +4,20 @@ use crate::transport::{
     PermissionRequest, PermissionRequestId, SessionRef, TransportEvent, TransportFailureKind,
 };
 
+/// Sanitized progress only; tool identifiers and titles remain private.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentActivity {
+    Working,
+    ToolRunning,
+    Writing,
+    WaitingPermission,
+}
+
 /// Control events and explicitly published shared messages only. Private traces stay in the owner.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RoomRuntimeEvent {
     SharedMessage(RoomMessage),
+    Activity(AgentActivity),
     PermissionRequested(PermissionRequest),
     /// One chunk of what this agent is writing, for a live view of the turn.
     ///
@@ -33,6 +43,7 @@ pub struct RoomActivation {
     message_id: RoomMessageId,
     agent_id: AgentId,
     cancelled: bool,
+    active_tools: std::collections::HashSet<String>,
     completion: Option<RoomCompletion>,
     publications: tokio::sync::mpsc::Receiver<RoomMessage>,
 }
@@ -59,6 +70,7 @@ impl RoomActivation {
             message_id,
             agent_id,
             cancelled: false,
+            active_tools: Default::default(),
             completion: None,
             publications,
         }
@@ -66,6 +78,14 @@ impl RoomActivation {
 
     pub fn agent_id(&self) -> AgentId {
         self.agent_id
+    }
+
+    pub fn activity_after_permission(&self) -> AgentActivity {
+        if self.active_tools.is_empty() {
+            AgentActivity::Working
+        } else {
+            AgentActivity::ToolRunning
+        }
     }
 
     pub fn session(&self) -> &SessionRef {
@@ -142,6 +162,18 @@ impl RoomActivation {
             let terminal = match event {
                 Some(TransportEvent::PermissionRequested(request)) => {
                     return Ok(Some(RoomRuntimeEvent::PermissionRequested(request)));
+                }
+                Some(TransportEvent::ToolCallStarted { tool_call_id, .. }) => {
+                    self.active_tools.insert(tool_call_id);
+                    return Ok(Some(RoomRuntimeEvent::Activity(AgentActivity::ToolRunning)));
+                }
+                Some(TransportEvent::ToolCallFinished { tool_call_id, .. }) => {
+                    if self.active_tools.remove(&tool_call_id) {
+                        return Ok(Some(RoomRuntimeEvent::Activity(
+                            self.activity_after_permission(),
+                        )));
+                    }
+                    continue;
                 }
                 Some(TransportEvent::AgentTextDelta { text, .. }) => {
                     return Ok(Some(RoomRuntimeEvent::TextDelta(text)));

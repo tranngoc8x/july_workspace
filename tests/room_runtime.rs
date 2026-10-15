@@ -287,6 +287,19 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
             tool_call_id: "tool".into(),
             title: "PRIVATE file".into(),
         },
+        TransportEvent::ToolCallStarted {
+            session: session.clone(),
+            tool_call_id: "second".into(),
+            title: "PRIVATE second".into(),
+        },
+        TransportEvent::ToolCallFinished {
+            session: session.clone(),
+            tool_call_id: "tool".into(),
+        },
+        TransportEvent::ToolCallFinished {
+            session: session.clone(),
+            tool_call_id: "second".into(),
+        },
         TransportEvent::TurnCompleted { session },
     ] {
         events.send(event).await.unwrap();
@@ -297,6 +310,16 @@ async fn room_activation_is_selective_durable_and_does_not_create_conversations(
         active.next_event(NOW.into()).await.unwrap(),
         Some(RoomRuntimeEvent::TextDelta("streamed answer".into()))
     );
+    for activity in [
+        july_workspace::runtime::AgentActivity::ToolRunning,
+        july_workspace::runtime::AgentActivity::ToolRunning,
+        july_workspace::runtime::AgentActivity::ToolRunning,
+        july_workspace::runtime::AgentActivity::Working,
+    ] {
+        let event = active.next_event(NOW.into()).await.unwrap();
+        assert!(!format!("{event:?}").contains("PRIVATE"));
+        assert_eq!(event, Some(RoomRuntimeEvent::Activity(activity)));
+    }
     assert_eq!(
         active.next_event(NOW.into()).await.unwrap(),
         Some(RoomRuntimeEvent::Completed)
@@ -778,6 +801,14 @@ async fn two_rooms_share_one_owner_but_private_traffic_cannot_block_or_cross_ses
     assert_ne!(a.session(), b.session());
     for _ in 0..100 {
         events
+            .send(TransportEvent::ToolCallStarted {
+                session: a.session().clone(),
+                tool_call_id: "private".into(),
+                title: "PRIVATE file".into(),
+            })
+            .await
+            .unwrap();
+        events
             .send(TransportEvent::AgentTextDelta {
                 session: a.session().clone(),
                 text: "private".into(),
@@ -816,6 +847,7 @@ async fn two_rooms_share_one_owner_but_private_traffic_cannot_block_or_cross_ses
     let terminal = loop {
         match a.next_event(NOW.into()).await.unwrap() {
             Some(RoomRuntimeEvent::TextDelta(text)) => assert_eq!(text, "private"),
+            Some(RoomRuntimeEvent::Activity(_)) => {}
             other => break other,
         }
     };
@@ -1093,7 +1125,7 @@ async fn real_acp_room_activation_handles_permission_and_keeps_reply_private() {
                     .unwrap(),
                 // A preview of what the agent is writing; the assertion below is that none of it
                 // reaches storage.
-                RoomRuntimeEvent::TextDelta(_) => {}
+                RoomRuntimeEvent::TextDelta(_) | RoomRuntimeEvent::Activity(_) => {}
                 RoomRuntimeEvent::Completed => break,
                 event => panic!("unexpected Room event: {event:?}"),
             }
