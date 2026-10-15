@@ -1,5 +1,7 @@
+use crate::runtime::AgentActivity;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Style;
@@ -8,6 +10,7 @@ use ratatui::text::{Line, Span, Text};
 use super::bottom_pane::events::{NoticeLevel, PaneEvent};
 use super::bottom_pane::slash_commands::commands_from_names;
 use super::bottom_pane::{BottomPane, BottomPaneParams, CancellationEvent, InputResult};
+use super::followups::{Followups, prepare as prepare_followup};
 use super::markdown::{MarkdownStream, render as render_markdown};
 use super::support::render::renderable::Renderable;
 use super::{AGENT_COLOR, CODE_COLOR, COMMAND_OUTPUT_COLOR, ERROR_COLOR, SYSTEM_COLOR, USER_COLOR};
@@ -128,6 +131,7 @@ pub enum CommandResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HistoryAuthor {
+    System,
     User,
     Agent,
 }
@@ -176,6 +180,10 @@ pub enum AppEvent {
     AgentStreamDelta {
         agent: AgentId,
         delta: String,
+    },
+    AgentActivity {
+        agent: AgentId,
+        activity: AgentActivity,
     },
     /// An agent finished; its cell is committed to the transcript and closed.
     AgentStreamFinished {
@@ -257,6 +265,25 @@ pub struct LiveCell {
     pub label: String,
     /// What has streamed so far.
     pub body: String,
+    pub activity: AgentActivity,
+    pub last_update: Instant,
+}
+
+impl LiveCell {
+    fn activity_label(&self, now: Instant) -> String {
+        let label = match self.activity {
+            AgentActivity::Working => "working",
+            AgentActivity::ToolRunning => "tool running",
+            AgentActivity::Writing => "writing",
+            AgentActivity::WaitingPermission => "waiting permission",
+        };
+        let seconds = now.saturating_duration_since(self.last_update).as_secs();
+        if seconds >= 60 {
+            format!("{label} · no update for {seconds}s")
+        } else {
+            format!("{label} · {seconds}s")
+        }
+    }
 }
 
 pub struct App {
@@ -266,6 +293,8 @@ pub struct App {
     viewport: Viewport,
     markdown: MarkdownStream,
     pending: Option<ContextId>,
+    followups: HashMap<ContextId, Followups>,
+    active_recipients: Option<String>,
     turn: TurnState,
     /// The permission request whose prompt is open in the pane, so a resolved request can close it.
     pending_permission: Option<ChatPermissionRequestId>,
@@ -303,6 +332,8 @@ impl App {
             viewport: Viewport::new(0, 0),
             markdown: MarkdownStream::default(),
             pending: None,
+            followups: HashMap::new(),
+            active_recipients: None,
             turn: TurnState::Idle,
             pending_permission: None,
             error: None,
@@ -351,6 +382,8 @@ impl App {
             return None;
         }
         // A real switch, so the previous scope's rows stop being what the user is looking at.
+        self.hold_followups();
+        self.active_recipients = None;
         self.scope_changed = true;
         let outgoing = self.capture_room_ui();
         self.room_ui.insert(self.context.id.clone(), outgoing);
@@ -489,10 +522,30 @@ impl App {
     /// Puts the current error on the composer's footer row, and hands the row back to the composer
     /// once the error clears so its own hints show through.
     fn sync_footer_hint(&mut self) {
-        let items = self
-            .error()
-            .map(|error| vec![("!".to_string(), error.to_string())]);
-        self.bottom_pane.set_footer_hint(items);
+        let queue = self
+            .followups
+            .get(&self.context.id)
+            .filter(|queue| queue.len() > 0);
+        let queue_hint = queue.map(|queue| {
+            if queue.held {
+                format!(
+                    "{} queued (held): /queue resume or /queue discard",
+                    queue.len()
+                )
+            } else {
+                format!(
+                    "{} queued · Tab: supplement · Enter: new request",
+                    queue.len()
+                )
+            }
+        });
+        let hint = match (self.error(), queue_hint) {
+            (Some(error), Some(queue)) => Some(format!("{error} · {queue}")),
+            (Some(error), None) => Some(error.to_owned()),
+            (None, queue) => queue,
+        };
+        self.bottom_pane
+            .set_footer_hint(hint.map(|hint| vec![("!".into(), hint)]));
     }
 
     /// Whether the bottom pane changed since the last draw, and clears the flag.
@@ -509,7 +562,8 @@ impl App {
     }
 
     pub fn reduce(&mut self, event: AppEvent) -> Vec<AppCommand> {
-        let commands = self.reduce_inner(event);
+        let mut commands = self.reduce_inner(event);
+        commands.extend(self.release_followup());
         // One place to keep the composer's footer in step with the app, rather than a call beside
         // each of the dozen assignments to `turn` and `error`.
         self.bottom_pane.set_task_running(self.turn_active());
@@ -542,6 +596,8 @@ impl App {
                     LiveCell {
                         label,
                         body: String::new(),
+                        activity: AgentActivity::Working,
+                        last_update: Instant::now(),
                     },
                 );
                 Vec::new()
@@ -549,6 +605,20 @@ impl App {
             AppEvent::AgentStreamDelta { agent, delta } => {
                 if let Some(cell) = self.live_cells.get_mut(&agent) {
                     cell.body.push_str(&delta);
+                    cell.last_update = Instant::now();
+                    if matches!(
+                        cell.activity,
+                        AgentActivity::Working | AgentActivity::Writing
+                    ) {
+                        cell.activity = AgentActivity::Writing;
+                    }
+                }
+                Vec::new()
+            }
+            AppEvent::AgentActivity { agent, activity } => {
+                if let Some(cell) = self.live_cells.get_mut(&agent) {
+                    cell.activity = activity;
+                    cell.last_update = Instant::now();
                 }
                 Vec::new()
             }
@@ -557,6 +627,7 @@ impl App {
                 Vec::new()
             }
             AppEvent::AgentStreamFailed { agent, reason } => {
+                self.hold_followups();
                 self.commit_live_cell(&agent, Some(reason));
                 Vec::new()
             }
@@ -674,39 +745,57 @@ impl App {
                 text,
                 text_elements,
             } => {
+                if self.room_busy() && !text.trim_start().starts_with('/') {
+                    if !self.enqueue_followup(&text, false) {
+                        self.bottom_pane.set_composer_text(text, text_elements);
+                    }
+                    return Vec::new();
+                }
+                let local_queue_command = self.queue_command(&text);
                 let commands = self.submit(text.clone());
                 // The composer clears the draft as it submits, so a submission July refuses - a
                 // turn is already in flight - has to be handed back or the text is lost.
-                if commands.is_empty() {
+                if commands.is_empty() && !local_queue_command {
                     self.bottom_pane.set_composer_text(text, text_elements);
                 }
                 commands
             }
             InputResult::Command(command) => {
-                let commands = self.submit(format!("/{}", command.command()));
-                self.finish_command_submission(&commands);
-                commands
+                self.dispatch_composer_command(format!("/{}", command.command()))
             }
             InputResult::CommandWithArgs(command, args, _) => {
-                let commands = self.submit(format!("/{} {args}", command.command()));
-                self.finish_command_submission(&commands);
-                commands
+                self.dispatch_composer_command(format!("/{} {args}", command.command()))
             }
-            // ponytail: the composer only queues when `set_queue_submissions` is on, and July never
-            // turns it on - a second submission is refused by `submit` instead. Map it to a
-            // submission if July ever wants a queue.
-            InputResult::Queued { .. } | InputResult::None => Vec::new(),
+            InputResult::Queued {
+                text,
+                text_elements,
+                pending_pastes,
+                ..
+            } => {
+                let (text, text_elements) = super::bottom_pane::ChatComposer::expand_pending_pastes(
+                    &text,
+                    text_elements,
+                    &pending_pastes,
+                );
+                if !self.room_busy() || !self.enqueue_followup(&text, true) {
+                    self.bottom_pane.set_composer_text(text, text_elements);
+                }
+                Vec::new()
+            }
+            InputResult::None => Vec::new(),
         }
     }
 
-    /// Clears a dispatched command out of the draft, leaving it alone if July refused it.
-    ///
-    /// The composer keeps the text of an inline command such as `/dm codex` after handing it over,
-    /// so without this the next command is typed onto the end of the last one.
-    fn finish_command_submission(&mut self, commands: &[AppCommand]) {
-        if !commands.is_empty() {
+    fn dispatch_composer_command(&mut self, input: String) -> Vec<AppCommand> {
+        let local = self.queue_command(&input);
+        let commands = self.submit(input.clone());
+        if !commands.is_empty() || local {
             self.bottom_pane.finish_command_submission();
+        } else {
+            self.bottom_pane.set_composer_text(input, Vec::new());
+            self.error = Some("Commands cannot be queued; wait until the turn finishes".into());
         }
+        commands
     }
 
     /// Carries out the side effects the pane queued while handling input.
@@ -757,6 +846,7 @@ impl App {
     fn cancel_or_exit(&mut self) -> Vec<AppCommand> {
         match self.turn {
             TurnState::Active => {
+                self.hold_followups();
                 self.turn = TurnState::Cancelling;
                 vec![AppCommand::CancelTurn]
             }
@@ -778,11 +868,55 @@ impl App {
         if text.trim().is_empty() {
             return Vec::new();
         }
+        if self.queue_command(&text) {
+            self.bottom_pane.finish_command_submission();
+            match text.trim() {
+                "/queue resume" => {
+                    if let Some(queue) = self.followups.get_mut(&self.context.id) {
+                        queue.held = false;
+                    }
+                    self.error = None;
+                    return self.release_followup();
+                }
+                "/queue discard" => {
+                    self.followups.remove(&self.context.id);
+                }
+                _ => {
+                    self.error = Some("Use /queue resume or /queue discard".into());
+                }
+            }
+            return Vec::new();
+        }
         self.error = None;
         // Leading blanks must not turn a command into chat.
         let command = text.trim_start().starts_with('/');
 
+        if command {
+            self.active_recipients = text
+                .trim_start()
+                .strip_prefix("/continue ")
+                .and_then(crate::cli::mention::parse)
+                .map(|mentions| {
+                    mentions
+                        .agents
+                        .iter()
+                        .map(|name| format!("@{name}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+        }
+
         if !command {
+            self.active_recipients = crate::cli::mention::parse(&text)
+                .map(|mentions| {
+                    mentions
+                        .agents
+                        .iter()
+                        .map(|name| format!("@{name}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .or_else(|| self.context_recipients());
             // A prompt consumes the draft; a command does not, so only a prompt clears what this
             // scope remembers.
             self.room_ui
@@ -804,6 +938,95 @@ impl App {
         } else {
             AppCommand::Submit { context, text }
         }]
+    }
+
+    fn room_busy(&self) -> bool {
+        self.context.id.0.starts_with("room:")
+            && self.active_recipients.is_some()
+            && (self.pending.is_some() || self.turn != TurnState::Idle)
+    }
+
+    fn queue_command(&self, text: &str) -> bool {
+        self.context.id.0.starts_with("room:")
+            && self.pending.is_none()
+            && self.turn == TurnState::Idle
+            && (text.trim() == "/queue" || text.trim_start().starts_with("/queue "))
+    }
+
+    fn context_recipients(&self) -> Option<String> {
+        self.context
+            .label
+            .rsplit_once(" → ")
+            .map(|(_, names)| names)
+            .filter(|names| names.starts_with('@'))
+            .map(str::to_owned)
+    }
+
+    fn enqueue_followup(&mut self, text: &str, supplement: bool) -> bool {
+        let mut recipients = self.active_recipients.clone();
+        if recipients.as_deref() == Some("@auto") {
+            recipients = if self.pending.is_none() {
+                self.context_recipients()
+            } else {
+                None
+            };
+            if recipients.is_none() && crate::cli::mention::parse(text).is_none() {
+                self.error =
+                    Some("Wait until @auto selects an agent, or name an agent explicitly".into());
+                return false;
+            }
+        }
+        let text = match prepare_followup(text, supplement, recipients.as_deref()) {
+            Ok(text) => text,
+            Err(error) => {
+                self.error = Some(error.into());
+                return false;
+            }
+        };
+        self.followups
+            .entry(self.context.id.clone())
+            .or_default()
+            .push(text);
+        self.room_ui
+            .entry(self.context.id.clone())
+            .or_default()
+            .draft = ComposerDraft::default();
+        self.error = None;
+        self.freeze_stream();
+        self.markdown.push_plain(
+            if supplement {
+                "Supplement queued; applies after the active turn."
+            } else {
+                "New request queued; sends after the active turn."
+            }
+            .into(),
+            SYSTEM_COLOR,
+        );
+        true
+    }
+
+    fn hold_followups(&mut self) {
+        self.followups
+            .entry(self.context.id.clone())
+            .or_default()
+            .held = true;
+    }
+
+    fn release_followup(&mut self) -> Vec<AppCommand> {
+        if self.turn != TurnState::Idle
+            || self.pending.is_some()
+            || self.pending_permission.is_some()
+        {
+            return Vec::new();
+        }
+        let Some(text) = self
+            .followups
+            .get_mut(&self.context.id)
+            .and_then(Followups::pop)
+        else {
+            return Vec::new();
+        };
+        self.submit(text)
     }
 
     fn reduce_command_result(&mut self, context: ContextId, result: CommandResult) {
@@ -839,10 +1062,12 @@ impl App {
                 self.turn = TurnState::Idle;
             }
             CommandResult::Failed(error) => {
+                self.hold_followups();
                 self.error = Some(error.trim_end().to_owned());
                 self.turn = TurnState::Idle;
             }
             CommandResult::FailedInContext { error, snapshot } => {
+                self.hold_followups();
                 let _ = self.apply_snapshot(snapshot);
                 self.error = Some(error.trim_end().to_owned());
                 self.turn = TurnState::Idle;
@@ -967,7 +1192,7 @@ impl App {
                 lines.push(Line::default());
             }
             lines.push(Line::from(Span::styled(
-                cell.label.clone(),
+                format!("{} · {}", cell.label, cell.activity_label(Instant::now())),
                 Style::default().fg(AGENT_COLOR),
             )));
             lines.extend(render_markdown(&cell.body).lines);
@@ -981,6 +1206,7 @@ impl App {
 
     fn push_history_entry(&mut self, entry: &HistoryEntry) {
         match entry.author {
+            HistoryAuthor::System => self.markdown.push_plain(entry.body.clone(), SYSTEM_COLOR),
             HistoryAuthor::User => self.push_user_entry(&entry.body),
             HistoryAuthor::Agent => {
                 self.markdown.push(&entry.body);
@@ -1024,12 +1250,14 @@ impl App {
                 self.finish_turn();
             }
             ChatEvent::TurnFailed(failure) => {
+                self.hold_followups();
                 self.freeze_stream();
                 self.markdown
                     .push_plain(format!("error: {}", failure_label(failure)), ERROR_COLOR);
                 self.finish_turn();
             }
             ChatEvent::Disconnected(reason) => {
+                self.hold_followups();
                 self.freeze_stream();
                 self.markdown
                     .push_plain(format!("error: {reason}"), ERROR_COLOR);
@@ -1424,6 +1652,49 @@ mod tests {
         assert_eq!(app.live_cell_body(&agent_order), Some(""));
         assert_eq!(app.live_cell_body(&agent(99)), None);
         assert!(!app.transcript_text_for_tests().contains("from nowhere"));
+    }
+
+    #[test]
+    fn activity_age_is_monotonic_and_does_not_claim_a_hang() {
+        let now = std::time::Instant::now();
+        let cell = LiveCell {
+            label: "pay".into(),
+            body: String::new(),
+            activity: AgentActivity::Working,
+            last_update: now,
+        };
+        assert_eq!(cell.activity_label(now), "working · 0s");
+        assert_eq!(
+            cell.activity_label(now + std::time::Duration::from_secs(59)),
+            "working · 59s"
+        );
+        assert_eq!(
+            cell.activity_label(now + std::time::Duration::from_secs(60)),
+            "working · no update for 60s"
+        );
+    }
+
+    #[test]
+    fn activity_is_agent_local_and_text_preserves_tools_and_permissions() {
+        let mut app = App::new(room("alpha"));
+        start(&mut app, agent(1), "pay");
+        start(&mut app, agent(2), "infra");
+        for activity in [AgentActivity::ToolRunning, AgentActivity::WaitingPermission] {
+            app.reduce(AppEvent::AgentActivity {
+                agent: agent(1),
+                activity,
+            });
+            delta(&mut app, agent(1), "text");
+            assert_eq!(app.live_cells[&agent(1)].activity, activity);
+            assert_eq!(app.live_cells[&agent(2)].activity, AgentActivity::Working);
+        }
+        app.reduce(AppEvent::AgentActivity {
+            agent: agent(99),
+            activity: AgentActivity::ToolRunning,
+        });
+        assert!(!app.live_cells.contains_key(&agent(99)));
+        app.reduce(AppEvent::AgentStreamFinished { agent: agent(1) });
+        assert!(!app.live_cells.contains_key(&agent(1)));
     }
 
     #[test]
@@ -2436,5 +2707,219 @@ curl --request POST 'https://example.com/v1/orders' \
 
         app.reduce(AppEvent::Key(ctrl_key(KeyCode::Char('c'))));
         assert!(app.exit_requested());
+    }
+}
+
+#[cfg(test)]
+mod followup_tests {
+    use super::*;
+
+    fn running() -> App {
+        let mut app = App::new(Context::new(
+            ContextId::new("room:test"),
+            "room::test → @order",
+        ));
+        assert_eq!(app.submit("@order original".into()).len(), 1);
+        app
+    }
+
+    fn queue(app: &mut App, text: &str, supplement: bool) {
+        app.bottom_pane.set_task_running(true);
+        app.bottom_pane.set_composer_text(text.into(), vec![]);
+        let key = if supplement {
+            KeyCode::Tab
+        } else {
+            KeyCode::Enter
+        };
+        let commands = app.reduce(AppEvent::Key(KeyEvent::new(key, KeyModifiers::NONE)));
+        assert!(commands.is_empty());
+    }
+
+    fn acknowledged(app: &mut App) -> Vec<AppCommand> {
+        app.reduce(AppEvent::CommandFinished {
+            context: app.context.id.clone(),
+            result: CommandResult::Submitted,
+        })
+    }
+
+    fn submitted_text(commands: &[AppCommand]) -> &str {
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        match &commands[0] {
+            AppCommand::Submit { text, .. } => text,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn followup_waits_for_terminal_and_ack_in_either_order() {
+        for ack_first in [false, true] {
+            let mut app = running();
+            queue(&mut app, "more detail", true);
+            assert_eq!(app.input(), "");
+            let commands = if ack_first {
+                assert!(acknowledged(&mut app).is_empty());
+                app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))
+            } else {
+                assert!(
+                    app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))
+                        .is_empty()
+                );
+                acknowledged(&mut app)
+            };
+            let text = submitted_text(&commands);
+            assert!(text.starts_with("@order Supplement"), "{text}");
+            assert!(text.ends_with("more detail"));
+            assert!(app.reduce(AppEvent::Tick).is_empty());
+        }
+    }
+
+    #[test]
+    fn followup_enter_and_tab_keep_fifo_and_original_recipient() {
+        let mut app = running();
+        queue(&mut app, "@pay new task", false);
+        queue(&mut app, "extra requirement", true);
+        acknowledged(&mut app);
+        assert_eq!(
+            submitted_text(&app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))),
+            "@pay new task"
+        );
+        acknowledged(&mut app);
+        let next = app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        assert!(submitted_text(&next).starts_with("@order Supplement"));
+    }
+
+    #[test]
+    fn followup_failure_then_global_completion_holds_until_resume() {
+        let mut app = running();
+        queue(&mut app, "saved", false);
+        acknowledged(&mut app);
+        app.reduce(AppEvent::AgentStreamFailed {
+            agent: AgentId::new(),
+            reason: "startup failed".into(),
+        });
+        assert!(
+            app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))
+                .is_empty()
+        );
+        assert!(app.reduce(AppEvent::Tick).is_empty());
+        let commands = app.submit("/queue resume".into());
+        assert_eq!(submitted_text(&commands), "@order saved");
+    }
+
+    #[test]
+    fn followup_cancel_holds_and_discard_is_local() {
+        let mut app = running();
+        queue(&mut app, "saved", false);
+        acknowledged(&mut app);
+        assert_eq!(app.cancel_or_exit(), vec![AppCommand::CancelTurn]);
+        app.reduce(AppEvent::CancelFinished(Ok(())));
+        assert!(
+            app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))
+                .is_empty()
+        );
+        assert!(app.submit("/queue discard".into()).is_empty());
+        assert!(app.submit("/queue resume".into()).is_empty());
+    }
+
+    #[test]
+    fn followup_pending_paste_is_preserved_and_command_is_restored() {
+        let mut app = running();
+        app.reduce(AppEvent::Paste("pasted pending text".into()));
+        let commands = app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(commands.is_empty());
+        assert_eq!(app.input(), "");
+        queue(&mut app, " /exit", true);
+        assert_eq!(app.input(), "/exit");
+        acknowledged(&mut app);
+        assert_eq!(
+            submitted_text(&app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))),
+            "@order pasted pending text"
+        );
+    }
+}
+
+#[cfg(test)]
+mod followup_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_followup_targets_continued_agent_even_before_ack() {
+        let mut app = App::new(Context::new(ContextId::new("room:a"), "room::a → @order"));
+        app.active_recipients = Some("@order".into());
+        app.submit("/continue @pay".into());
+        assert!(app.enqueue_followup("verify only", true));
+        let text = app
+            .followups
+            .get_mut(&app.context.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(text.starts_with("@pay Supplement"), "{text}");
+    }
+
+    #[test]
+    fn large_tab_paste_is_expanded_before_queuing() {
+        let mut app = App::new(Context::new(ContextId::new("room:a"), "room::a → @order"));
+        app.submit("@order first".into());
+        app.reduce(AppEvent::Tick);
+        let pasted = "long pasted requirement ".repeat(200);
+        app.reduce(AppEvent::Paste(pasted.clone()));
+        assert!(
+            app.reduce(AppEvent::Key(KeyEvent::new(
+                KeyCode::Tab,
+                KeyModifiers::NONE
+            )))
+            .is_empty()
+        );
+        app.reduce(AppEvent::CommandFinished {
+            context: app.context.id.clone(),
+            result: CommandResult::Submitted,
+        });
+        let commands = app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted));
+        match commands.as_slice() {
+            [AppCommand::Submit { text, .. }] => {
+                assert!(text.contains(pasted.trim_end()), "{text}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_work_never_crosses_context_and_requires_resume_when_returning() {
+        let first = Context::new(ContextId::new("room:a"), "room::a → @order");
+        let mut app = App::new(first.clone());
+        app.submit("@order first".into());
+        assert!(app.enqueue_followup("saved", false));
+        let _ = app.set_context(Context::new(ContextId::new("room:b"), "room::b → @pay"));
+        app.pending = None;
+        app.finish_turn();
+        assert!(app.reduce(AppEvent::Tick).is_empty());
+        let _ = app.set_context(first);
+        assert!(app.reduce(AppEvent::Tick).is_empty());
+        assert!(
+            matches!(app.submit("/queue resume".into()).as_slice(), [AppCommand::Submit {context, text}] if context == &ContextId::new("room:a") && text == "@order saved")
+        );
+    }
+
+    #[test]
+    fn dispatch_failure_keeps_queue_held_after_late_completion() {
+        let mut app = App::new(Context::new(ContextId::new("room:a"), "room::a → @order"));
+        app.submit("@order first".into());
+        assert!(app.enqueue_followup("saved", false));
+        assert!(
+            app.reduce(AppEvent::CommandFinished {
+                context: app.context.id.clone(),
+                result: CommandResult::Failed("unavailable".into())
+            })
+            .is_empty()
+        );
+        assert!(
+            app.reduce(AppEvent::Chat(ChatEvent::TurnCompleted))
+                .is_empty()
+        );
+        assert_eq!(app.followups[&app.context.id].len(), 1);
     }
 }

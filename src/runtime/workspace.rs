@@ -647,11 +647,16 @@ async fn run_owner<T: AgentTransport>(
                         if route.session != *session {
                             continue;
                         }
-                        // What the agent is writing feeds the caller's live view of the turn, but
-                        // only as an offer: it never becomes a pending delivery, so a consumer that
-                        // stops draining loses chunks instead of stalling this agent's other
-                        // sessions behind the bounded queue.
-                        if route.room && matches!(event, TransportEvent::AgentTextDelta { .. }) {
+                        // Preview/activity are best effort: a stalled view must never block this
+                        // agent's other sessions. RoomActivation strips private tool metadata.
+                        if route.room
+                            && matches!(
+                                event,
+                                TransportEvent::AgentTextDelta { .. }
+                                    | TransportEvent::ToolCallStarted { .. }
+                                    | TransportEvent::ToolCallFinished { .. }
+                            )
+                        {
                             let _ = route.events.try_send(event);
                             continue;
                         }
@@ -661,8 +666,6 @@ async fn run_owner<T: AgentTransport>(
                             && matches!(
                                 event,
                                 TransportEvent::AgentMessageCompleted { .. }
-                                    | TransportEvent::ToolCallStarted { .. }
-                                    | TransportEvent::ToolCallFinished { .. }
                                     | TransportEvent::UsageReported { .. }
                                     | TransportEvent::TurnStarted { .. }
                             )

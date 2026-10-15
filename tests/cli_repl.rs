@@ -24,6 +24,171 @@ struct TestWorkspace {
 
 const NOW: &str = "2026-08-24T00:00:00Z";
 
+#[tokio::test]
+async fn room_queued_supplement_reaches_same_agent_once_after_permission_and_completion() {
+    use july_workspace::runtime::AgentActivity;
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("queue-room");
+    let agent = workspace.seed_acp_agent("pay", &[]);
+    workspace.add_member(&room, &agent);
+    let mut bridge = InactiveTuiBridge::open(&workspace.database).await.unwrap();
+    let mut app = App::new(bridge.initial_context());
+    let opened = bridge
+        .execute(tui_command(&mut app, "/room queue-room"))
+        .await
+        .unwrap();
+    app.reduce(opened);
+    bridge
+        .dispatch(tui_command(&mut app, "@pay original request"))
+        .unwrap();
+    app.reduce(AppEvent::Paste("extra requirement".into()));
+    assert!(
+        app.reduce(AppEvent::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        )))
+        .is_empty()
+    );
+    assert!(app.transcript().contains("Supplement queued"));
+    let mut completed = 0;
+    let mut permissions = 0;
+    let mut waiting_activity = false;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while app.turn_active() {
+            let event = bridge.next_event().await.unwrap().unwrap();
+            match &event {
+                AppEvent::Chat(ChatEvent::TurnCompleted) => completed += 1,
+                AppEvent::AgentActivity {
+                    activity: AgentActivity::WaitingPermission,
+                    ..
+                } => waiting_activity = true,
+                _ => {}
+            }
+            for command in app.reduce(event) {
+                bridge.dispatch(command).unwrap();
+            }
+            if app.permission().is_some() {
+                permissions += 1;
+                for command in app.reduce(AppEvent::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))) {
+                    bridge.dispatch(command).unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(completed, 2);
+    assert_eq!(permissions, 2);
+    assert!(waiting_activity);
+    let messages = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 50)
+        .unwrap()
+        .0;
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].mentions, vec![agent.id]);
+    assert!(messages[1].body.contains("Supplement"));
+    assert!(messages[1].body.ends_with("extra requirement"));
+    let count: i64 = Connection::open(&workspace.database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_bindings WHERE room_id=?1 AND agent_id=?2",
+            [room.id.to_string(), agent.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    bridge.shutdown().await.unwrap();
+}
+
+#[test]
+fn room_continue_requires_explicit_member_and_does_not_create_empty_work() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("resume-room");
+    let agent = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    workspace.add_member(&room, &agent);
+    let output = workspace.repl(
+        "/continue @pay\n/room resume-room\n/continue\n/continue @missing\n/continue @pay\n/quit\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("Room overview"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("Nothing to continue"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("unavailable in root"),
+        "{}",
+        stderr(&output)
+    );
+    let messages = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 50)
+        .unwrap()
+        .0;
+    assert!(
+        messages.is_empty(),
+        "invalid/empty continuation must not become chat"
+    );
+}
+
+#[test]
+fn room_continue_creates_fresh_reconciliation_request_without_replaying_interruption() {
+    let workspace = TestWorkspace::new();
+    let room = workspace.seed_room("resume-room");
+    let agent = workspace.seed_acp_agent("pay", &["--no-permission"]);
+    workspace.add_member(&room, &agent);
+    let setup = workspace.repl("/room resume-room\n@pay uncertain old operation\n/quit\n");
+    assert!(setup.status.success(), "{}", stderr(&setup));
+    let original = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 50)
+        .unwrap()
+        .0
+        .remove(0);
+    Connection::open(&workspace.database).unwrap().execute(
+        "UPDATE room_message_activations SET status='failed' WHERE message_id=?1 AND agent_id=?2",
+        [original.id.to_string(), agent.id.to_string()]).unwrap();
+    let output = workspace.repl("/room resume-room\n/continue @pay\n/continue @pay\n/quit\n");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let messages = SqliteStore::open(&workspace.database)
+        .unwrap()
+        .list_recent_room_messages(room.id, 50)
+        .unwrap()
+        .0;
+    assert_eq!(
+        messages.len(),
+        2,
+        "a completed continuation must not repeat: {messages:?}"
+    );
+    let fresh = messages
+        .iter()
+        .find(|message| message.id != original.id)
+        .unwrap();
+    assert_eq!(fresh.mentions, vec![agent.id]);
+    assert!(fresh.body.contains("reconcile"), "{}", fresh.body);
+    assert!(fresh.body.contains("Do not replay"), "{}", fresh.body);
+    assert!(!fresh.body.contains("uncertain old operation"));
+    let connection = Connection::open(&workspace.database).unwrap();
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM room_message_activations WHERE message_id=?1 AND agent_id=?2",
+            [original.id.to_string(), agent.id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+}
+
 impl TestWorkspace {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("july-cli-repl-{}", ulid::Ulid::generate()));
@@ -1153,6 +1318,9 @@ async fn inactive_tui_bridge_projects_visible_commands_for_root_room_dm_and_work
         "/work",
         "/status",
         "/new",
+        "/continue",
+        "/queue resume",
+        "/queue discard",
         "/delivery retry",
         "/help",
         "/exit",
@@ -1419,7 +1587,9 @@ async fn inactive_tui_bridge_replaces_history_by_exact_conversation() {
         .await
         .unwrap();
     app.reduce(event);
-    assert!(app.transcript().is_empty());
+    assert!(app.transcript().contains("Room overview"));
+    assert!(!app.transcript().contains("thread-user"));
+    assert!(!app.transcript().contains("dm-user"));
     bridge.shutdown().await.unwrap();
 }
 
@@ -1471,6 +1641,7 @@ async fn inactive_tui_bridge_hydrates_room_history_with_explicit_sender_labels()
     assert!(transcript.contains("[user:july] room-01"));
     assert!(transcript.contains(&format!("[agent:{}]\n\nroom-50", agent.name)));
     assert_eq!(transcript.matches("room-").count(), 50);
+    assert!(transcript.contains("Room overview"));
     bridge.shutdown().await.unwrap();
 }
 

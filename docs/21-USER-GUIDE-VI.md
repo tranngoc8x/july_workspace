@@ -639,6 +639,30 @@ xem mục 5, bước 6.
 
 TUI và line REPL dùng cùng context model và cùng slash-command registry.
 
+### Theo dõi và tiếp tục công việc trong Room
+
+Trong TUI, khi agent đang xử lý một yêu cầu:
+
+- Gõ nội dung rồi nhấn `Tab` để xếp một yêu cầu bổ sung; July xác nhận đã nhận
+  và gửi sau khi lượt hiện tại kết thúc. Yêu cầu này không sửa lượt đang chạy.
+- Nhấn `Enter` để xếp một yêu cầu mới. Các tin nhắn chờ gửi lần lượt, giữ agent
+  được chọn lúc xếp hàng; mention mới chọn đích riêng cho tin nhắn đó.
+- Nếu lượt hiện tại lỗi hoặc bị hủy, hàng đợi được giữ lại. Dùng `/queue resume`
+  để gửi tiếp hoặc `/queue discard` để bỏ các tin đang chờ trong Room hiện tại.
+  Hàng đợi chỉ tồn tại trong phiên TUI; thoát July sẽ mất các tin chưa gửi.
+
+Mỗi agent đang chạy có dòng trạng thái gần nhất July nhận được: `working`, `writing`, `tool running`
+hoặc `waiting permission`, kèm số giây từ cập nhật gần nhất. Sau 60 giây không
+có sự kiện, July hiện `no update for ...`; đây không phải kết luận agent bị treo.
+Tên và nội dung tool riêng không xuất hiện trong dòng trạng thái.
+
+Khi vào lại Room, July hiện **Room overview** từ Work, Result và các lượt bị
+gián đoạn đã lưu. Lệnh `/continue @agent` yêu cầu agent đối chiếu trạng thái,
+giữ phần đã hoàn thành và kiểm tra tác động chưa rõ trước khi làm tiếp.
+Mỗi lần tiếp tục chỉ liên kết một lượt gián đoạn; các lượt khác vẫn được giữ để
+xử lý riêng. Mở Room không tự gửi lại yêu cầu cũ. Work thất bại hoặc đã hủy
+không được tự mở lại.
+
 ### Phím TUI
 
 | Phím                             | Hành vi                                     |

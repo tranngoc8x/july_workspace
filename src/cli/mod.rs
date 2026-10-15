@@ -33,9 +33,10 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, oneshot};
 
 mod keys;
-mod mention;
+pub(crate) mod mention;
 mod reconcile;
 pub mod registry;
+mod room_resume;
 mod route;
 mod setup;
 mod update;
@@ -1293,6 +1294,37 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         };
         let context_depth = contexts.len();
         let scope = contexts.last().unwrap().scope();
+        let mut continuation_reply_to = None;
+        let line = if let Some((spec, arguments)) = registry::resolve(&line)
+            && spec.name == "/continue"
+        {
+            if !spec.available_in(scope) {
+                repl_write(stderr, format_args!("{}\n", spec.scope_error(scope)))?;
+                continue;
+            }
+            let ReplContext::Room { room_id, .. } = contexts.last().unwrap() else {
+                unreachable!()
+            };
+            match prepare_room_continuation(service, workspace, *room_id, arguments).await {
+                Ok(Some((prompt, reply_to))) => {
+                    continuation_reply_to = reply_to;
+                    prompt
+                }
+                Ok(None) => {
+                    repl_write(
+                        stdout,
+                        format_args!("Nothing to continue for this agent.\n"),
+                    )?;
+                    continue;
+                }
+                Err(error) => {
+                    repl_write(stderr, format_args!("{error}\n"))?;
+                    continue;
+                }
+            }
+        } else {
+            line
+        };
         let Some((spec, arguments)) = registry::resolve(&line) else {
             // Not a registered command: chat sends it, other contexts reject it.
             if line.trim().is_empty() {
@@ -1348,7 +1380,7 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                         sender_id: TRUSTED_LOCAL_USER_ID.into(),
                         body: line,
                         mentions: recipients.clone(),
-                        reply_to: None,
+                        reply_to: continuation_reply_to,
                         created_at: timestamp(),
                     },
                 };
@@ -1440,9 +1472,13 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             activations.push((name, activation));
                         }
                         Ok((_, None)) => {}
-                        Err(error) => {
-                            room_status(format!("{agent_id}: failed: {error}"), stderr, tui_events)?
-                        }
+                        Err(error) => agent_stream_end(
+                            *agent_id,
+                            format!("{agent_id}: failed: {error}"),
+                            true,
+                            stderr,
+                            tui_events,
+                        )?,
                     }
                 }
                 if !message.mentions.is_empty() {
@@ -1546,6 +1582,12 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
         let arguments = arguments.to_owned();
         let arguments = arguments.as_str();
         match spec.name {
+            "/queue resume" | "/queue discard" => {
+                repl_write(
+                    stderr,
+                    format_args!("{} is available in the interactive TUI only\n", spec.name),
+                )?;
+            }
             "/exit" if arguments.is_empty() => {
                 if let Some(events) = tui_events {
                     let _ = events.send(crate::tui::app::AppEvent::Exit);
@@ -2207,6 +2249,21 @@ async fn interact_repl_loop<R: crate::application::CollaborationRuntime>(
                             room_id: room.id,
                             recipients: Vec::new(),
                         });
+                        if tui_events.is_none() {
+                            match workspace.storage().room_overview(room.id, None).await {
+                                Ok(overview) => repl_write(
+                                    stdout,
+                                    format_args!(
+                                        "{}\n",
+                                        room_resume::render_room_overview(&overview)
+                                    ),
+                                )?,
+                                Err(error) => repl_write(
+                                    stderr,
+                                    format_args!("Room overview unavailable: {error}\n"),
+                                )?,
+                            }
+                        }
                     }
                     Err(error) => repl_write(stderr, format_args!("{error}\n"))?,
                 },
@@ -3110,7 +3167,7 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                             activations.push(Some((name, active)));
                         }
                     }
-                    Err(error) => room_status(format!("{target}: failed: {error}"), stderr, tui_events)?,
+                    Err(error) => agent_stream_end(target, format!("{target}: failed: {error}"), true, stderr, tui_events)?,
                 }
             }
             (index, event) = next => {
@@ -3140,6 +3197,15 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                             let _ = events.send(AppEvent::AgentStreamDelta { agent, delta: text });
                         }
                     }
+                    Ok(Some(RoomRuntimeEvent::Activity(activity))) => {
+                        if let Some(events) = tui_events {
+                            let agent = activations[index].as_ref().unwrap().1.agent_id();
+                            let activity = if permissions.iter().any(|(owner, _)| *owner == index) {
+                                crate::runtime::AgentActivity::WaitingPermission
+                            } else { activity };
+                            let _ = events.send(AppEvent::AgentActivity { agent, activity });
+                        }
+                    }
                     Ok(Some(RoomRuntimeEvent::PermissionRequested(request))) => {
                         if cancelled_agents.contains(&index) {
                             // Events may already be audited by cancel_turn, or arrive after it.
@@ -3148,7 +3214,13 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                                 Ok(()) | Err(crate::runtime::RuntimeError::PermissionRequestNotFound(_)) => {},
                                 Err(error) => return Err(error.into()),
                             }
-                        } else { permissions.push_back((index, request)); }
+                        } else {
+                            if let Some(events) = tui_events {
+                                let agent = activations[index].as_ref().unwrap().1.agent_id();
+                                let _ = events.send(AppEvent::AgentActivity { agent, activity: crate::runtime::AgentActivity::WaitingPermission });
+                            }
+                            permissions.push_back((index, request));
+                        }
                     }
                     terminal => {
                         let (name, finished) = activations[index].take().unwrap();
@@ -3227,6 +3299,14 @@ async fn drain_room_turn<R: crate::application::CollaborationRuntime>(
                             let _ = events.send(AppEvent::PermissionFinished(result.as_ref().map(|_| ()).map_err(ToString::to_string)));
                             if result.is_ok() {
                                 let _ = events.send(AppEvent::RoomPermissionDismissed(id));
+                                let activation = &activations[index].as_ref().unwrap().1;
+                                let activity = if permissions.iter().any(|(owner, _)| *owner == index) {
+                                    crate::runtime::AgentActivity::WaitingPermission
+                                } else { activation.activity_after_permission() };
+                                let _ = events.send(AppEvent::AgentActivity {
+                                    agent: activation.agent_id(),
+                                    activity,
+                                });
                             }
                         }
                         result?;
@@ -3487,6 +3567,43 @@ async fn room_recipient_label<R: crate::application::CollaborationRuntime>(
         .join(" ")
 }
 
+async fn prepare_room_continuation<R: crate::application::CollaborationRuntime>(
+    service: &mut CollaborationService<R>,
+    workspace: &WorkspaceRuntime<AcpTransport>,
+    room: RoomId,
+    arguments: &str,
+) -> Result<Option<(String, Option<RoomMessageId>)>, CliError> {
+    let parsed = mention::parse(arguments).ok_or(CliError::InvalidCommand)?;
+    if parsed.agents.len() != 1
+        || !parsed.prompt.is_empty()
+        || arguments.split_whitespace().count() != 1
+    {
+        return Err(CliError::InvalidCommand);
+    }
+    let agent = service.resolve_agent(agent_ref(parsed.agents[0])?).await?;
+    let members = service.list_room_members(RoomRef::Id(room)).await?;
+    if !members
+        .iter()
+        .any(|member| member.agent_id == agent.id && member.left_at.is_none())
+    {
+        return Err(CliError::Runtime(
+            "continuation target is not an active Room member".into(),
+        ));
+    }
+    let overview = workspace
+        .storage()
+        .room_overview(room, Some(agent.id))
+        .await?;
+    Ok(
+        room_resume::continuation_request(&overview, agent.id).map(|prompt| {
+            (
+                format!("@{} {prompt}", agent.name),
+                overview.interrupted.first().map(|turn| turn.message_id),
+            )
+        }),
+    )
+}
+
 async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
     service: &mut CollaborationService<R>,
     workspace: &WorkspaceRuntime<AcpTransport>,
@@ -3497,7 +3614,7 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
 
     let context = project_repl_context(service, contexts).await?;
     let names = agent_names(service).await;
-    let history = match contexts.last() {
+    let mut history = match contexts.last() {
         Some(ReplContext::Room { room_id, .. }) => service
             .list_recent_room_messages(*room_id, TUI_HISTORY_LIMIT)
             .await
@@ -3541,6 +3658,19 @@ async fn project_context_snapshot<R: crate::application::CollaborationRuntime>(
             truncated: false,
         }),
     };
+    if history_fallback.is_none()
+        && let Some(ReplContext::Room { room_id, .. }) = contexts.last()
+        && let Ok(history) = &mut history
+    {
+        let body = match workspace.storage().room_overview(*room_id, None).await {
+            Ok(overview) => room_resume::render_room_overview(&overview),
+            Err(error) => format!("Room overview unavailable: {error}"),
+        };
+        history.entries.push(HistoryEntry {
+            author: HistoryAuthor::System,
+            body,
+        });
+    }
     Ok(ContextSnapshot {
         context,
         history,
