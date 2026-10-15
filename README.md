@@ -1,597 +1,314 @@
 # July Workspace
 
-> **Status:** Actively developed and usable today. The core multi-project agent workflow is implemented and ready for hands-on use, while advanced collaboration capabilities continue to evolve.
+July is a local-first terminal workspace for working with persistent coding agents across multiple repositories. Give each project an agent, talk to it directly, or bring several agents into a Room to coordinate a shared task.
 
-July Workspace is a local-first workspace for coordinating persistent coding agents across multiple software projects.
+July owns identity, conversation routing, durable work and session recovery. Coding-agent runtimes own reasoning and execution. Explicit mentions route directly without a supervisor model; optional `@auto` routing can ask a judgment service to choose an agent.
 
-It is built for developers who use Codex, Claude Code, ACP-compatible runtimes, or other coding agents across multiple repositories and want those agents to behave more like a persistent engineering team than isolated chat sessions.
+> **Status:** Under active development. The repository implements DM and Room conversations, structured collaboration, ACP runtime integration, a terminal UI, and recovery workflows. Provider access still requires a configured, authenticated runtime.
 
-July gives each project a durable agent identity, keeps working contexts isolated, and lets agents collaborate through explicit Results, Artifacts, Decisions, Work, and Dependencies instead of sharing entire transcripts.
+[Hướng dẫn tiếng Việt](docs/21-USER-GUIDE-VI.md)
 
-**The problem July focuses on is coordination, not coding intelligence.**
-
-Instead of putting another supervisor LLM in front of Claude, Codex, or other coding agents, July gives each project its own persistent agent and provides the workspace around them:
-
-- direct conversations with project agents;
-- Rooms and isolated Threads;
-- cross-agent collaboration;
-- Work, Results, Artifacts, Decisions, and Dependencies;
-- session recovery;
-- durable local state;
-- runtime-independent agent identity;
-- Room-scoped communication between July-managed agents through A2A.
-
-July is intended for developers who work across multiple repositories and want coding agents to behave more like a persistent engineering team rather than isolated chat sessions.
-
-Hướng dẫn tiếng Việt: [docs/21-USER-GUIDE-VI.md](docs/21-USER-GUIDE-VI.md)
-
----
-
-## Installation
-
-July is currently installed from source.
-
-### Build from source
+## Install from source
 
 Requirements:
 
-- Rust toolchain
-- Cargo
-- SQLite
-- a supported coding-agent runtime / ACP-compatible setup
+- Rust **1.96.0**, pinned in [rust-toolchain.toml](rust-toolchain.toml), with Cargo and a native build toolchain.
+- Node.js/npm for the npm-based ACP adapters, or Cargo for `claude-rust`.
+- Authentication and any runtime prerequisites required by your chosen adapter.
 
-Clone the repository:
+SQLite is bundled through `rusqlite`; a separate SQLite installation is not required.
 
 ```bash
 git clone https://github.com/tranngoc8x/july_workspace.git
 cd july_workspace
+cargo install --path . --locked
 ```
 
-Build:
+Ensure Cargo's binary directory is on `PATH`. Alternatively, `bash scripts/install.sh` builds a standalone installation in `~/.local/bin` with an ownership receipt for self-update; add that directory to `PATH`. Set `JULY_PREFIX` or pass `--prefix <directory>` to change its prefix.
+
+For development, use `cargo run --` in this repository instead of the installed `july` binary.
+
+### Install an ACP adapter
 
 ```bash
-cargo build --release
+july setup
 ```
 
-Run directly:
+Or select adapters explicitly:
 
 ```bash
-cargo run
+july setup --adapters codex,claude
 ```
 
-Or install the binary locally:
+The current [adapter catalog](src/adapter/catalog.rs) contains:
 
-```bash
-cargo install --path .
-```
+| Adapter ID | Package | Installer |
+| --- | --- | --- |
+| `codex` | `@agentclientprotocol/codex-acp` | npm |
+| `claude` | `@agentclientprotocol/claude-agent-acp` | npm |
+| `claude-rust` | `claude-code-acp-rs` | Cargo |
+| `deepseek` | `@openma/deepseek-harness-acp` | npm; experimental |
 
-Then start July:
-
-```bash
-july
-```
-
-With both standard streams attached to a terminal, this opens the full-screen
-TUI. Piped or redirected use keeps the line REPL for script compatibility.
-
----
-
-## Who is July for?
-
-July is useful when you:
-
-- work across multiple repositories with coding agents;
-- want each project to keep a persistent logical agent identity;
-- need isolated conversations instead of one growing shared context;
-- want agents to exchange explicit results and artifacts without leaking full working transcripts;
-- want coordination state to survive runtime restarts or session replacement.
-
-Typical examples include coordinating backend, frontend, infrastructure, and integration work across separate repositories, or keeping long-running coding-agent workflows organized without introducing another supervisor LLM.
-
----
+Setup detects compatible installations and installs managed adapters when needed. Installing an adapter does not replace provider authentication.
 
 ## Quick start
 
-### 1. Add a project agent
+### 1. Register a project
 
-Each project has a persistent logical agent.
-
-Example:
+From an existing project directory, run the interactive wizard:
 
 ```bash
-july agent add agent_order \
-  --project ~/work/agent_order \
-  --runtime codex
+cd ~/work/order
+july init
 ```
 
-Adding an agent registers the project and agent identity in July.
+It asks for an agent name and an installed adapter, then starts a short agent turn to suggest an agent description. You can accept or edit the description, or enter one if the agent cannot provide it. Descriptions help optional agent routing.
 
-It does **not** immediately start a model session.
+For explicit registration without starting a model session:
 
-### 2. Start July
+```bash
+july agent add order --project "$HOME/work/order" --adapter codex \
+  --description "Order service, checkout and refund orchestration"
+```
+
+Use a project directory that already exists. Repeat registration for other projects:
+
+```bash
+july agent add pay --project "$HOME/work/pay" --adapter claude \
+  --description "Payments, provider callbacks and refunds"
+```
+
+### 2. Talk to one agent
 
 ```bash
 july
 ```
 
-### 3. Open a DM with an agent
+Inside July:
 
 ```text
-/dm agent_order
+/dm order
+Explain the checkout flow and its main entry points.
 ```
 
-July resolves the logical agent and lazily creates or resumes the runtime session when necessary.
+Bare `july` opens the terminal UI when both stdin and stdout are terminals; otherwise it uses the line REPL. The TUI uses the normal terminal screen and scrollback, with a composer at the bottom.
 
-### 4. Create or enter a Room
+`july dm order` is also available as a standalone conversation stream. Use bare `july` for workspace navigation and the full slash-command interface.
 
-```text
-/room vna
+### 3. Bring agents into a Room
+
+Run these administrative commands from your shell:
+
+```bash
+july room create commerce
+july room member add commerce order
+july room member add commerce pay
+july
 ```
 
-### 5. Create a Thread
+Inside July:
 
 ```text
-/thread new "Refund flow"
+/room commerce
+@order @pay review the refund flow across both projects
 ```
 
-Then work inside the isolated Thread context.
+A Room must exist before `/room` can enter it. Plain Room conversation does not require creating a Thread or Work item first.
 
-### 6. Get help
-
-```text
-/help
-```
-
-or:
+### 4. Continue the conversation
 
 ```text
-/help thread
-```
-
----
-
-## Main features
-
-### Persistent project agents
-
-A project owns a persistent logical agent.
-
-The agent identity survives runtime restarts and session replacement.
-
-```text
-Project
-  └── Agent
-        ├── DM session
-        ├── Thread session
-        └── replacement runtime session
-```
-
-This means:
-
-```text
-Agent != AgentSession
-```
-
-A Codex, Claude, ACP, or future runtime session is an execution detail, not the agent's identity.
-
----
-
-### Direct messages
-
-Use a DM when you want to work directly with one project agent.
-
-```text
-/dm agent_order
-```
-
-DMs preserve durable conversation/workspace state while runtime sessions may be resumed or recreated as needed.
-
----
-
-### Rooms
-
-Rooms organize agents around a product, business area, or workstream.
-
-Example:
-
-```text
-Room: VNA
-
-members:
-- agent_order
-- pay
-- infra
-```
-
-A Room is a collaboration namespace.
-
-It is **not** one shared LLM context.
-
----
-
-### Isolated Threads
-
-Threads are concrete collaboration contexts inside a Room.
-
-Example:
-
-```text
-VNA
-├── payment-callback
-├── refund
-└── voucher-pending
-```
-
-Each Thread is an independent context boundary.
-
-This avoids feeding every project agent the full history of every discussion in the Room.
-
----
-
-### Cross-agent collaboration
-
-Project agents can collaborate through explicit July domain state rather than hidden transcript sharing.
-
-The collaboration flow can include:
-
-```text
-Request
-  ↓
-Accept / Reject / Counter / Clarify
-  ↓
-Work
-  ↓
-Result
-  ↓
-Decision / Completion
-```
-
-Agents do not automatically have authority over other project agents.
-
-They can reject, clarify, counter, or challenge cross-project work.
-
----
-
-### Work and dependencies
-
-July keeps durable coordination state for engineering work.
-
-This includes concepts such as:
-
-- Work / Task
-- Result
-- Artifact
-- Decision
-- Dependency
-
-Example:
-
-```text
-auth-api
-   ↓ READY
-agent_order integration
-   ↓ READY
-E2E
-```
-
-The workspace can track dependencies without requiring a supervisor LLM to reason about every transition.
-
----
-
-### Results instead of transcript sharing
-
-A central July rule is:
-
-> **Results cross boundaries; transcripts don't.**
-
-Example:
-
-```text
-Thread A
-  ├── messages
-  ├── experiments
-  └── Result #42
-        │
-        ▼
-Thread B references Result #42
-```
-
-Thread B receives the explicit result or artifact, not Thread A's private working transcript.
-
-This helps reduce context growth and keeps collaboration traceable.
-
----
-
-### Session recovery
-
-July owns durable workspace state while agents own their active model context.
-
-If a runtime session disappears, July can preserve the logical agent and conversation and recreate the runtime session from durable state such as:
-
-```text
-Agent identity
-+ project
-+ current work
-+ checkpoint
-+ bounded recent messages
-+ Results / Decisions / Artifacts
-```
-
-A full historical transcript replay should not be required.
-
----
-
-### Local-first storage
-
-July uses SQLite as its canonical local persistence layer.
-
-Durable state can include:
-
-- projects;
-- agents;
-- conversations;
-- Rooms;
-- Threads;
-- Work;
-- Results;
-- Artifacts;
-- Decisions;
-- Dependencies;
-- runtime bindings;
-- recovery metadata.
-
-The workspace is designed to remain lightweight and local-first.
-
----
-
-### Runtime abstraction
-
-July separates logical agents from their execution transport.
-
-Conceptually:
-
-```text
-July
-  ↓
-Agent Gateway
-  ├── ACP
-  └── native / SDK adapters (future)
-```
-
-The core workspace should not depend on provider-specific session IDs or runtime details.
-
-ACP executes agent runtimes. A2A carries agent-to-agent interactions inside a Room through July’s collaboration bridge. RoomMessage and July Work remain canonical.
-
----
-
-## Slash commands
-
-July keeps the interactive command surface intentionally small.
-
-### Navigation
-
-```text
-/dm <agent>
-/room <room>
-/thread <thread>
-/thread new <title>
-/new @agent  # Room: start a new session for one agent
+Check duplicate callbacks too.
+@pay focus on provider retry behavior
 /back
 ```
 
-### Inspection
+- Leading mentions select Room members. Follow-ups without mentions go to the same selected agents.
+- A new mention replaces the selection. Each agent retains its own Room session when you switch recipients.
+- Entering a Room starts with no selection. Messages without recipients are saved without waking agents.
+- `/back` clears the selection first; with no selection, it returns to the previous context.
+- `/new @pay` starts a fresh session generation for that agent and selects it. Room history and other agents' sessions remain intact; the runtime session starts on the next prompt.
+
+Use `/help` for commands available in the current context, `/help <command>` for details, and `/exit` (or `/quit`) to leave.
+
+## Working in the terminal UI
+
+The TUI provides streamed Markdown, multiline input, command and mention completion, permission prompts, context history, and per-agent activity indicators. Activity shows whether an agent is working, running a tool, writing, or waiting for permission, together with time since its last update.
+
+While a Room turn is running:
+
+- **Enter** queues a new request.
+- **Tab** queues a supplement to the active request; it applies after that turn, rather than changing an in-flight prompt.
+- Queued follow-ups keep their recipients and run in order after the active turn finishes.
+- Cancellation or failure holds the queue. Use `/queue resume` or `/queue discard` explicitly.
+
+Completion popups and permission prompts handle their keys first. Follow-up queues are in memory for the current TUI process, not a durable background job queue.
+
+On entering a Room, July shows a bounded overview of completed, failed/cancelled, unfinished, and interrupted work. Use:
 
 ```text
-/agents
-/rooms
-/members
-/work
-/results
+/continue @pay
 ```
 
-### Control
+This sends a new request to reconcile that agent's unfinished responsibilities from durable Room state. It asks the agent to verify uncertain external effects before acting; it does not blindly replay interrupted messages or automatically reopen failed/cancelled Work.
+
+## Optional agent selection
+
+Inside a Room:
 
 ```text
-/publish <result>
-/restart
+/route implement Redis caching for checkout
+@auto implement Redis caching for checkout
 ```
 
-### General
+`/route` previews a choice without dispatching the task. `@auto` requests dispatch to one eligible Room member. Explicit `@order` mentions bypass judgment. With one eligible candidate, selection is deterministic; choosing among multiple candidates uses the TypeSafe JEV adapter.
 
-```text
-/help
-/help <command>
-/quit
-```
+Configure `TYPESAFE_API_KEY` in the process environment or in `~/.july/.env` (`$JULY_HOME/.env` when overridden). `JULY_JEV_BASE_URL` and `JULY_JEV_MODEL` can also be set there; process environment values take precedence. The client uses `curl`.
 
-Slash commands are primarily a workspace/navigation interface.
+Routing policy uses process environment variables:
 
-They are not the agent-to-agent collaboration protocol.
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `JULY_ROUTING_MODE` | `suggest` | `disabled`, `suggest`, or `automatic` |
+| `JULY_ROUTING_AUTO_THRESHOLD` | `0.85` | Minimum judgment confidence for automatic selection |
+| `JULY_ROUTING_SUGGEST_THRESHOLD` | `0.65` | Minimum confidence for a suggestion |
 
----
+`@auto` is an explicit request to choose, so it can dispatch a confident selection even in `suggest` mode. `disabled` blocks automatic routing. Low confidence or a provider error does not dispatch a guessed target. Plain messages retain the Room recipient behavior described above.
 
-## Administrative CLI
-
-Administrative and scripting operations live outside the interactive REPL.
-
-Examples:
+An agent literally named `auto` takes precedence over the routing keyword. Update an agent's description with:
 
 ```bash
-july agent add ...
-july agent list
-july agent show ...
-july agent remove ...
-
-july room create ...
-july room list
-july room member add ...
-july room member remove ...
-
-july thread create ...
-july thread list ...
+july agent update order --description "Order service and checkout APIs"
 ```
 
-The REPL and CLI do not need identical command sets.
+## Collaboration and isolation
 
-Both should operate through the same application/domain layer.
+An agent is a persistent logical identity, not a provider session ID. DM, Room-agent and Thread sessions have separate context boundaries. Runtime sessions may resume or be replaced while July retains workspace state.
 
----
+Room members share explicitly published Room messages. Their private runtime transcripts are not shared wholesale. July's Room bridge carries agent-to-agent interactions through A2A; ACP connects July to the coding-agent runtime:
 
-## Project structure
+```text
+User / project agent
+        │ shared Room message
+        ▼
+July Room bridge ── A2A ──► target logical agent
+                                    │ ACP
+                                    ▼
+                              coding runtime
+```
 
-The exact directory names may evolve, but the project is organized around a few main responsibilities:
+Structured collaboration adds Work, Results, Artifacts, Decisions and Dependencies. Agents can accept, reject, counter or clarify requests; one agent has no implicit authority over another. Results and explicit artifacts can cross context boundaries without copying private transcripts.
+
+### Work and advanced Threads
+
+Use `/work` in a Room to inspect/open work contexts. Within a work context, July exposes work assignment/status/results and publication commands. Threads remain the underlying isolated conversation contexts; the older `/thread` commands are supported but hidden from the default help.
+
+For an explicit isolated Thread, create it from the shell:
+
+```bash
+july thread create "Refund flow" --room commerce --member order --member pay
+july thread list --room commerce
+```
+
+Then, inside the Room, open the returned Thread ID:
+
+```text
+/thread <thread-id> --agent order
+```
+
+`/thread new "Refund flow"` only creates a Thread with the local user; it does not enter it or add agents. Use the administrative command above when agent membership is needed.
+
+## Command reference
+
+Commands are context-sensitive. The [command registry](src/cli/registry.rs) drives interactive parsing and help.
+
+| Context | Commands |
+| --- | --- |
+| All | `/dm <agent> [message]`, `/room <room>`, `/back`, `/agents`, `/rooms`, `/status`, `/help [command]`, `/exit` |
+| Room or Work | `/members`, `/work [work]` |
+| Room | `/route <task>`, `/new @agent`, `/continue @agent` |
+| Room TUI | `/queue resume`, `/queue discard` |
+| DM or Work | `/restart` |
+| Work | `/results`, `/publish <result> [--to <thread>]` |
+| Work | `/work assign <work-id> --agent <agent>`, `/work status <work-id> <status>`, `/work result <work-id> --status <status> --summary <summary>` |
+| All | `/deliveries`, `/delivery retry <message-id> --agent <agent>`, `/decisions` |
+| All | `/decision accept`, `/decision reject`, `/decision work` — use `/help` for required arguments |
+
+Administrative commands run from the shell:
+
+```bash
+july agent list
+july agent show order
+july room list
+july room members commerce
+july room member remove commerce pay
+july thread list --room commerce
+july --json agent list
+```
+
+`--json` is for finite commands, not interactive chat. Membership removal changes who can participate; it is not needed to leave a Room in the UI.
+
+## Local state and updates
+
+| Location / variable | Purpose |
+| --- | --- |
+| `~/.july/workspace.db` | Default SQLite workspace database |
+| `JULY_WORKSPACE_DB` | Override the database file path |
+| `~/.july/` | Default adapter and runtime-management state root |
+| `JULY_HOME` | Override that state root; **does not relocate the database** |
+| `$JULY_HOME/.env` or `~/.july/.env` | Optional JEV provider configuration |
+
+SQLite persists agents, membership, messages, Work, Results, Decisions, Dependencies, session bindings and recovery metadata. On restart, an explicit request can resume or replace the runtime session using bounded context. Interrupted prompts are not automatically resent.
+
+`july update` checks the latest stable release, installs an available upgrade for a recognized standalone installation, then migrates the database and reconciles adapters. Reconciliation also runs when July is already current. Managed installations are directed to their package manager for a binary upgrade. Availability depends on installation ownership and release artifacts. For a source installation, rebuild/install from the desired checkout:
+
+```bash
+cargo install --path . --locked --force
+```
+
+## Codebase
 
 ```text
 src/
-├── domain/          core July entities and state rules
-├── application/     use cases and application services
-├── storage/         SQLite persistence
-├── runtime/         agent sessions and lifecycle
-├── adapters/        ACP / runtime integrations
-├── collaboration/   Work, Result, Decision, Dependency flows
-├── commands/        CLI / REPL command handling
-└── main.rs          application entry point
+├── domain/          entities, IDs and invariants
+├── application/     use cases, collaboration and routing policy
+├── storage/         SQLite persistence and migrations
+├── runtime/         sessions, Room messaging, recovery and MCP bridge
+├── transport/       ACP integration and A2A message mappings
+├── adapter/         adapter catalog/installations and JEV client
+├── cli/             shell commands, REPL, onboarding and updates
+├── tui/             terminal UI, composer, rendering and follow-ups
+├── update/          release discovery, installation and handoff
+├── lib.rs           public module boundaries
+└── main.rs          executable entry point
 
-tests/
-└── integration and architecture-level tests
-
-docs/
-└── design and architecture documentation
+tests/               integration and boundary tests
+docs/                user guide, architecture, plans and evaluations
 ```
 
-The important boundary is:
+The implementation uses Rust, Tokio, SQLite/rusqlite, the ACP SDK, Ratatui/Crossterm, Markdown rendering, JSON and tracing. CLI parsing is implemented in the repository rather than using Clap.
 
-```text
-REPL / CLI
-    ↓
-Application Services
-    ↓
-Domain
-    ↓
-Storage / Runtime adapters
+### Development checks
+
+The [CI workflow](.github/workflows/ci.yml) runs:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo build --release
 ```
 
-The command layer should not become an orchestration layer.
+Deterministic tests use mock/test runtimes; passing those checks does not prove live provider authentication or delivery.
 
----
+## Further reading
 
-## Architecture in brief
+- [Vietnamese user guide](docs/21-USER-GUIDE-VI.md)
+- [Architecture](docs/01-ARCHITECTURE.md)
+- [Domain model](docs/02-DOMAIN-MODEL.md)
+- [Room agent communication via A2A](<docs/24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>)
+- [Implementation roadmap](docs/11-IMPLEMENTATION-ROADMAP.md)
 
-July follows several core rules:
-
-1. A project owns a persistent logical agent.
-2. Agent identity is independent from runtime sessions.
-3. Threads are context-isolation boundaries.
-4. Rooms do not imply shared model context.
-5. Transcripts do not implicitly cross Thread or project boundaries.
-6. Results and explicit artifacts may cross boundaries.
-7. Cross-agent work uses explicit collaboration semantics.
-8. No project agent has implicit authority over another project agent.
-9. Runtime/provider-specific concepts stay outside the core domain.
-10. Structured references are preferred over copied context.
-
-The responsibility split is:
-
-```text
-Agents
-  own reasoning and active model context
-
-July
-  owns durable workspace state,
-  coordination,
-  routing,
-  lifecycle,
-  isolation,
-  and references
-```
-
----
-
-## Technology
-
-July is implemented primarily in Rust.
-
-Core technologies include:
-
-```text
-Rust
-├── Tokio
-├── SQLite
-├── rusqlite
-├── serde / serde_json
-├── clap
-├── tracing
-└── ACP integration
-```
-
----
-
-## Current status
-
-July is under active development, but the core workflow is usable today.
-
-The main architecture, July Next work, and the Phase 10 interactive TUI are implemented. The TUI provides application-owned scrollback, progressive Markdown, multiline input, context navigation, permission handling, and cancel-once active-turn behavior while preserving the existing CLI contracts.
-
-```text
-july                         both streams TTY → TUI
-july                         either stream non-TTY → line REPL
-july dm ...                  standalone stream
-july thread open ...         standalone stream
-finite command / --json      unchanged CLI output
-```
-
-The TUI deliberately has no mouse workflow, theme/plugin system, syntax
-highlighting, daemon, new command grammar or transcript replay.
-
-Room collaboration follows [Room agent communication via A2A](<docs/24-JULY WORKSPACE — ROOM AGENT COMMUNICATION VIA A2A.md>).
-
-```text
-RoomMessage → July Room bridge → A2A → target logical Agent
-                                           ↓ ACP
-                                     coding-agent runtime
-```
-
-Leading user mentions select Room members; later unmentioned messages activate
-the same selected recipients. A new mention replaces that selection. Entering
-a Room starts unselected: messages are saved without waking an agent. `/back`
-clears a selection first, then returns to the previous context. Agent A2A
-mentions never change the user selection.
-
-Each agent keeps its current session in that Room across recipient switches.
-`/new @pay` starts a durable new session generation for pay and selects it;
-it accepts exactly one Room member and rejects invalid or busy targets. The
-runtime session is created lazily on the next prompt. Room history, cursors,
-and other agents’ sessions remain intact; shared context stays bounded and
-incremental.
-
-Agents publish shared replies
-through the Room messaging tool; private runtime transcripts stay isolated.
-Plain conversation requires no Thread or Work. Structured requests can attach
-canonical Work and Results, with A2A Task IDs stored as bindings.
-
-After restart, a new explicit message resumes or replaces the ACP session with
-bounded shared context. Interrupted messages are not automatically resent.
-External agents, cross-Room routing and agent-agent DM remain deferred.
-See the [implementation roadmap](docs/11-IMPLEMENTATION-ROADMAP.md) for validation status.
-
----
-
-## What July is not
-
-July is not:
-
-- a supervisor LLM that re-reasons every user request;
-- a shared transcript for every agent;
-- a terminal multiplexer;
-- a generic agent chat application;
-- an ACP-specific shell;
-- an A2A-specific shell;
-- a replacement for coding-agent intelligence.
-
-July exists to make strong coding agents easier to coordinate across real engineering work.
-
----
-
-## Guiding principle
+Design and roadmap documents include historical phases and proposed behavior; use the current code and command registry to resolve differences. The collaboration scope is July-managed agents in the same Room; external-agent federation, cross-Room A2A routing and agent-to-agent DM are not exposed as supported workflows.
 
 > **July routes conversations; agents own reasoning; results cross boundaries, transcripts don't.**
