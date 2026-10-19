@@ -2,6 +2,13 @@
 
 Tài liệu này hướng dẫn cách cài đặt và sử dụng **July Workspace 0.1.0** theo
 đúng command surface đang được triển khai trong repository hiện tại.
+Tài liệu được đối chiếu với mã nguồn ngày **19/10/2026**; phiên bản package
+không đồng nghĩa mọi bản binary đã cài đều chứa cùng thay đổi.
+
+Đọc nhanh: [Cài đặt](#3-cài-đặt) · [Quick start](#5-quick-start) ·
+[TUI và REPL](#9-sử-dụng-tui-và-repl) ·
+[Work và Result](#10-work-result-và-publish) ·
+[Troubleshooting](#13-troubleshooting).
 
 Sau khi hoàn thành phần Quick start, bạn sẽ có:
 
@@ -38,7 +45,8 @@ Bên dưới, July còn giữ `Result` (kết quả có cấu trúc của Work) 
 
 - `Agent` không phải là một process Codex/Claude đang chạy.
 - Thêm Agent không tự khởi động model session.
-- Room là nơi khởi động việc, không phải một shared prompt chứa toàn bộ lịch sử.
+- Room là nơi trao đổi chung; mỗi agent có session riêng, không chia sẻ toàn bộ
+  transcript riêng tư. Chat trong Room không cần tạo Work/Thread trước.
 - Work là ranh giới ngữ cảnh; transcript không tự chảy sang Work khác.
 - Result có thể được publish qua ranh giới; transcript thì không.
 
@@ -94,14 +102,14 @@ claude --version  # nếu dùng Claude Code
 ```bash
 git clone https://github.com/tranngoc8x/july_workspace.git
 cd july_workspace
-cargo build --release
+cargo build --release --locked
 ./target/release/july --version
 ```
 
 ### Cài binary vào Cargo bin directory
 
 ```bash
-cargo install --path .
+cargo install --path . --locked
 july --version
 ```
 
@@ -142,7 +150,7 @@ Mặc định July sử dụng:
 └── state/             state directory riêng của agent runtime
 ```
 
-Hai biến môi trường hữu ích:
+Các biến môi trường hữu ích:
 
 | Biến                | Tác dụng                                                                                                                                                               |
 | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -157,7 +165,9 @@ export JULY_HOME=/tmp/july-demo-home
 export JULY_WORKSPACE_DB=/tmp/july-demo-workspace.db
 ```
 
-Không đặt hai biến này nếu bạn muốn dùng dữ liệu mặc định trong `~/.july`.
+`JULY_HOME` **không đổi đường dẫn database**. Muốn tách hoàn toàn môi trường,
+đặt cả `JULY_HOME` và `JULY_WORKSPACE_DB` như ví dụ trên. Không đặt hai biến này
+nếu bạn muốn dùng dữ liệu mặc định trong `~/.july`.
 
 ## 5. Quick start
 
@@ -215,7 +225,12 @@ july init
 July hiển thị tên mặc định lấy từ tên thư mục hiện tại. Chữ Latin Unicode được
 chuyển về không dấu và khoảng trắng thành `_`; ví dụ `Dự án Thanh Toán` thành
 `Du_an_Thanh_Toan`. Nhấn `Enter` để dùng tên mặc định, hoặc nhập tên khác. Sau
-đó dùng `↑` / `↓` và `Enter` để chọn một adapter đã cài.
+đó dùng `↑` / `↓` và `Enter` để chọn một adapter đã cài. July chạy một lượt
+ngắn để agent đề xuất mô tả phạm vi phụ trách; bạn có thể nhận, sửa hoặc tự
+nhập mô tả nếu agent không trả lời được. Mô tả giúp tính năng chọn agent tự động.
+Lượt đề xuất cần runtime đã xác thực; nếu không lấy được đề xuất, bạn vẫn có
+thể nhập mô tả thủ công. `july agent add` chỉ đăng ký Agent và không tự bắt đầu
+model session.
 
 Cho script hoặc automation, dùng dạng đầy đủ không tương tác:
 
@@ -294,15 +309,21 @@ july room members VNA
 july
 ```
 
-Nếu stdin và stdout đều là TTY, July mở full-screen TUI. Nếu một trong hai bị
-pipe hoặc redirect, July dùng line REPL tương thích script.
+Nếu stdin và stdout đều là TTY, July mở TUI trên màn hình terminal thường,
+giữ scrollback. Nếu một trong hai bị pipe hoặc redirect, July dùng line REPL
+tương thích script.
 
 ### Bước 6: Chat với agent trong Room
 
-Thêm các agent vào Room trước khi gọi:
+Agent `pay` phải được đăng ký trước (tương tự bước 2, với project của pay).
+Chạy các lệnh sau trong shell của hệ điều hành (dùng `/exit` để rời July nếu
+đang ở bước 5), rồi mở lại July:
 
 ```bash
+july agent add pay --project /absolute/path/to/pay --adapter codex \
+  --description "Payment service và callback hoàn tiền"
 july room member add VNA pay
+july
 ```
 
 ```text
@@ -328,6 +349,11 @@ session của các agent khác được giữ nguyên.
 Khi vừa vào hoặc quay lại Room, chưa có người nhận: câu chat vẫn được lưu nhưng
 không kích hoạt agent nào.
 
+Quick start thành công khi `july agent list` có agent vừa tạo,
+`july room members VNA` có các thành viên đã thêm, và một prompt trong Room
+nhận được phản hồi từ agent đã chọn. Việc setup thành công riêng lẻ chưa chứng
+minh provider đăng nhập và trả lời được.
+
 ## 6. Quản lý adapter và Agent
 
 ### Danh sách command Agent
@@ -337,6 +363,7 @@ july agent add <name> --project <path> --adapter <id> [--runtime <runtime>]
 july agent add <name> --project <path> --transport <type> --config <file> [--runtime <runtime>]
 july agent update <agent> --adapter <id>
 july agent update <agent> --config <file>
+july agent update <agent> --description <text>
 july agent list
 july agent show <agent>
 july agent remove <agent>
@@ -350,6 +377,12 @@ july agent show agent_order --json
 ```
 
 Chỉ dùng `--json` một lần.
+
+`agent add` cũng nhận `--description <text>`. Ví dụ:
+
+```bash
+july agent update agent_order --description "Order service, checkout và điều phối hoàn tiền"
+```
 
 ### Ý nghĩa của `agent remove`
 
@@ -382,6 +415,7 @@ cấu hình sinh từ `--adapter`.
 july update
 ```
 
+Output dưới đây chỉ minh họa, không xác nhận release `0.9.0` đang tồn tại.
 Lệnh đọc bản phát hành ổn định mới nhất của July trên GitHub Releases, so sánh
 theo SemVer với phiên bản đang chạy, rồi chọn asset đúng nền tảng:
 
@@ -631,17 +665,19 @@ xem mục 5, bước 6.
 
 | Cách chạy                           | Kết quả                  |
 | ----------------------------------- | ------------------------ |
-| `july` trong terminal               | Full-screen TUI          |
+| `july` trong terminal               | TUI với scrollback       |
 | `printf '/status\n/quit\n' \| july` | Line REPL                |
 | `july dm <agent>`                   | DM stream độc lập        |
 | `july thread open ...`              | Work stream độc lập      |
 | Command quản trị                    | Output hữu hạn rồi thoát |
 
 TUI và line REPL dùng cùng context model và cùng slash-command registry.
+Hàng đợi follow-up và các phím tắt bên dưới chỉ áp dụng cho TUI; line REPL
+không cung cấp hàng đợi tương tác này.
 
 ### Theo dõi và tiếp tục công việc trong Room
 
-Trong TUI, khi agent đang xử lý một yêu cầu:
+Trong TUI, khi agent trong Room đang xử lý một yêu cầu:
 
 - Gõ nội dung rồi nhấn `Tab` để xếp một yêu cầu bổ sung; July xác nhận đã nhận
   và gửi sau khi lượt hiện tại kết thúc. Yêu cầu này không sửa lượt đang chạy.
@@ -650,6 +686,10 @@ Trong TUI, khi agent đang xử lý một yêu cầu:
 - Nếu lượt hiện tại lỗi hoặc bị hủy, hàng đợi được giữ lại. Dùng `/queue resume`
   để gửi tiếp hoặc `/queue discard` để bỏ các tin đang chờ trong Room hiện tại.
   Hàng đợi chỉ tồn tại trong phiên TUI; thoát July sẽ mất các tin chưa gửi.
+
+Popup hoàn thành lệnh/tên agent và hộp thoại permission được xử lý phím trước
+hàng đợi. Nếu `@auto` chưa chọn xong agent, hãy đợi kết quả hoặc mention rõ
+agent trước khi xếp follow-up.
 
 Mỗi agent đang chạy có dòng trạng thái gần nhất July nhận được: `working`, `writing`, `tool running`
 hoặc `waiting permission`, kèm số giây từ cập nhật gần nhất. Sau 60 giây không
@@ -668,7 +708,7 @@ không được tự mở lại.
 | Phím                             | Hành vi                                     |
 | -------------------------------- | ------------------------------------------- |
 | `Enter`                          | Gửi input hiện tại                          |
-| `Tab`                            | Hoàn thành tên agent đang gõ sau`@`         |
+| `Tab` | Hoàn thành tên trong popup; khi Room đang chạy và không có popup, xếp nội dung bổ sung |
 | `Alt+Enter`                      | Xuống dòng trong editor                     |
 | `PageUp` / `PageDown`            | Cuộn transcript                             |
 | `End`                            | Trở lại cuối transcript và bật follow-tail  |
@@ -726,6 +766,36 @@ Quy tắc bổ sung:
   mới khởi tạo ở prompt tiếp theo, dùng ngữ cảnh chung tăng dần có giới hạn,
   không replay toàn bộ lịch sử hay chia sẻ transcript riêng.
 
+### Chọn agent tự động (tùy chọn)
+
+Trong Room:
+
+```text
+/route kiểm tra callback thanh toán bị trùng
+@auto kiểm tra callback thanh toán bị trùng
+```
+
+`/route` chỉ xem trước đề xuất. `@auto` yêu cầu chọn một thành viên đủ điều kiện
+và gửi prompt; mention cụ thể như `@pay` bỏ qua dịch vụ phán đoán. Một ứng viên
+được chọn trực tiếp; nhiều ứng viên dùng TypeSafe JEV. Agent có tên thật là
+`auto` được ưu tiên hơn từ khóa này.
+
+Đặt `TYPESAFE_API_KEY` trong môi trường process hoặc `~/.july/.env`
+(`$JULY_HOME/.env` nếu đã đổi thư mục). Có thể đặt `JULY_JEV_BASE_URL` và
+`JULY_JEV_MODEL` ở đó; giá trị môi trường process ưu tiên hơn file. Client cần
+`curl`. Không cần cấu hình JEV để gọi agent bằng tên cụ thể.
+
+| Biến môi trường process | Mặc định | Ý nghĩa |
+| --- | --- | --- |
+| `JULY_ROUTING_MODE` | `suggest` | `disabled`, `suggest` hoặc `automatic` |
+| `JULY_ROUTING_AUTO_THRESHOLD` | `0.85` | Ngưỡng tin cậy để tự chọn |
+| `JULY_ROUTING_SUGGEST_THRESHOLD` | `0.65` | Ngưỡng tin cậy để đề xuất |
+
+`@auto` là yêu cầu chọn rõ ràng nên có thể gửi tới agent khi đủ tin cậy ngay
+trong chế độ `suggest`; `disabled` chặn routing tự động. Khi độ tin cậy thấp
+hoặc provider lỗi, July không đoán đích để gửi. Text không mention vẫn tuân theo
+nhóm người nhận hiện tại của Room.
+
 ### Slash commands
 
 | Command                             | Context hợp lệ       | Mục đích                                                                                                    |
@@ -737,6 +807,18 @@ Quy tắc bổ sung:
 | `/dm <agent> [câu hỏi]`             | mọi context          | Mở việc trực tiếp; có câu hỏi thì gửi luôn (tương đương`@agent [câu hỏi]`). Tên agent nhận cả dạng `@agent` |
 | `/back`                             | mọi context          | Bỏ chọn nhóm trong Room; nếu chưa chọn thì quay lại context trước                                                                                      |
 | `/new @agent` | Room | Bắt đầu session mới cho một agent và chọn agent đó |
+| `/route <task>` | Room | Xem trước lựa chọn agent, không gửi việc |
+| `/continue @agent` | Room | Đối chiếu và tiếp tục một lượt gián đoạn của agent |
+| `/queue resume`, `/queue discard` | Room TUI | Gửi tiếp hoặc bỏ hàng đợi đang giữ |
+| `/work assign <item-id> --agent <agent>` | Work | Giao work item cho agent |
+| `/work status <item-id> <status>` | Work | Chuyển trạng thái work item |
+| `/work result <item-id> --status <status> --summary <text>` | Work | Ghi nhận Result cho work item |
+| `/deliveries` | mọi context | Liệt kê lượt giao tin thất bại |
+| `/delivery retry <message-id> --agent <agent>` | mọi context | Thử giao lại một tin thất bại |
+| `/decisions` | mọi context | Liệt kê quyết định đang chờ người dùng |
+| `/decision accept <id> --decision <text> [--reason <text>]` | mọi context | Chốt quyết định thuộc người dùng |
+| `/decision reject <id> --reason <text>` | mọi context | Hủy quyết định thuộc người dùng |
+| `/decision work <id> --work-id <item-id> --title <text> [--agent <agent>]` | mọi context | Tạo work item từ quyết định đã chốt |
 | `/rooms`                            | mọi context          | Liệt kê Room                                                                                                |
 | `/agents`                           | mọi context          | Liệt kê Agent                                                                                               |
 | `/members`                          | Room, Work           | Liệt kê thành viên active                                                                                   |
@@ -783,11 +865,46 @@ Mỗi Work được tạo cùng một primary work item; khi tạo bằng CLI,
 `july thread create` trả về cả `<work-id>` lẫn `<primary-work-id>`. Trong
 command surface hiện tại:
 
-- `/work` chỉ đọc, không tạo và không đổi trạng thái;
-- `/results` chỉ đọc Result;
-- state transition của Work và việc tạo Result hiện chỉ có ở Rust application
-  API; command surface và ACP/chat event surface hiện tại chưa expose mutation;
-- chưa có top-level command để người dùng tạo Work hoặc Result thủ công.
+- `/work` không đối số chỉ liệt kê; `/work <work-id>` mở context;
+- `/work assign`, `/work status`, `/work result` thao tác **item-id** trong
+  context Work, không dùng Thread ID ở đây;
+- `/results` liệt kê Result của context hiện tại;
+- `/decision work` tạo work item từ một quyết định đã chốt;
+- chưa có top-level `july work` hay `july result`; tạo context riêng bằng
+  `july thread create`, rồi dùng slash command bên trong workspace.
+
+Ví dụ sau khi đã vào đúng Work:
+
+```text
+/work
+/work assign <item-id> --agent agent_order
+/work status <item-id> working
+/work result <item-id> --status accepted --summary Đã kiểm tra callback contract
+/results
+```
+
+Trạng thái work item gồm `open`, `working`, `blocked`, `ready`, `done`,
+`failed`, `cancelled`; luồng thường là `open → working → ready → done`.
+`--status` của Result là chuỗi mô tả kết quả (ví dụ `accepted`), không phải
+danh sách trạng thái work item.
+
+Các thao tác vẫn phải thỏa điều kiện owner, membership và chuyển trạng thái
+hợp lệ; không phải mọi trạng thái đều chuyển trực tiếp sang nhau. Dùng
+`/help work status` và `/help work result` để kiểm tra cú pháp.
+
+Quyết định và giao tin lỗi có luồng xử lý riêng:
+
+```text
+/decisions
+/decision accept <decision-id> --decision "Giữ contract hiện tại" --reason "Kiểm thử đạt"
+/deliveries
+/delivery retry <message-id> --agent agent_order
+```
+
+`/delivery retry` chủ động gửi lại một delivery thất bại; khác với `/continue`
+là yêu cầu đối chiếu công việc gián đoạn. Chọn đúng tin và agent từ danh sách
+trước khi retry. CLI tương ứng là `july delivery list` và
+`july delivery retry <message-id> --agent <agent>`.
 
 Publish một Result từ CLI:
 
@@ -838,7 +955,8 @@ layer, chưa có top-level `july memory ...`, `july checkpoint ...` hoặc
 - `agent add/list/show/remove/update`;
 - `room create/list/members/member add/member remove`;
 - `thread create/list/members/member add/member remove`;
-- `publish`.
+- `publish`;
+- `delivery list/retry`.
 
 Parser chấp nhận đúng một `--json` ở bất kỳ vị trí nào, nhưng nên đặt nhất quán
 ngay sau `july` hoặc ở cuối command để script dễ đọc.
@@ -897,7 +1015,13 @@ Shape để viết script:
 | `thread list`                  | array:`thread_id`, `room_id`, `title`, `goal`, `status`, `created_at`, `updated_at`                  |
 | `thread members`               | array:`thread_id`, `member_type`, `member_id`, `generation`, `joined_at`, `left_at`, `state`         |
 | `thread member add/remove`     | object:`state`, `changed`                                                                            |
+| `delivery list` | array: `message_id`, `conversation_id`, `conversation_kind`, `sender_id`, `target_agent_id`, `status`, `capsule_delivered_at`, `updated_at`, `body` |
+| `delivery retry` | object: `message_id`, `target_agent_id`, `status` (`delivered`) |
 | `publish`                      | object:`publish_id`, `result_id`, `source_conversation_id`, `target_conversation_id`, `published_at` |
+
+`delivery retry` thực hiện giao lại tin, kể cả khi có `--json`; đây không phải
+lệnh chỉ đọc. Agent JSON hiện không xuất trường `description`, dù CLI cho phép
+cập nhật mô tả.
 
 Không dùng `--json` với:
 
@@ -988,7 +1112,9 @@ Trong workspace shell, phải vào đúng Room trước:
 /work <work-id> --agent <agent>
 ```
 
-Với Work tạo bằng `@agent`, membership đã được lo sẵn.
+Mention trong Room không tự tạo Work hoặc membership. Nếu chỉ cần trao đổi
+chung, quay lại Room và mention một thành viên đã có; nếu cần context Work
+riêng, tạo Thread và thêm membership rõ ràng như mục 8.
 
 ### Command hợp lệ nhưng báo unavailable
 
@@ -1013,15 +1139,17 @@ july agent list --json
 Command surface hiện tại không có:
 
 - daemon/background service;
-- mouse, theme, plugin hoặc syntax highlighting trong TUI;
+- cấu hình theme/plugin qua command người dùng;
 - semantic/vector memory;
 - full-transcript recovery;
 - top-level `work`, `result`, `memory`, `checkpoint` hoặc `session` commands;
-- tự động publish hoặc tự đoán target bằng LLM;
+- tự động publish hoặc dùng LLM đoán target publish;
 - shared transcript giữa các Work.
 
-Các giới hạn này là chủ ý của phiên bản hiện tại, không phải bước cấu hình còn
-thiếu.
+Các mục trên không được cung cấp bởi command surface hiện tại. Tài liệu thiết
+kế và roadmap có thể mô tả tính năng dự kiến; khi có khác biệt, đối chiếu
+[registry slash command](../src/cli/registry.rs),
+[CLI parser](../src/cli/mod.rs) và [README](../README.md).
 
 ## 15. Cheat sheet
 
@@ -1062,6 +1190,10 @@ july thread list --room VNA --json
 @agent_order @pay implement refund flow      chọn hai agent trong Room
 support partial refund too                 tiếp tục với hai agent đã chọn
 /new @pay                                 session pay mới, chọn pay
+/route kiểm tra callback                   xem trước agent được chọn
+@auto kiểm tra callback                    chọn agent và gửi yêu cầu
+/continue @pay                             đối chiếu việc gián đoạn
+/queue resume                              gửi tiếp hàng đợi TUI đang giữ
 
 # Điều hướng và tra cứu
 /help
