@@ -322,14 +322,18 @@ mod tests {
         )));
 
         // The surface the composer paints is derived from the terminal's own background, so the
-        // test pins one rather than depending on what the terminal running the test reports.
+        // test pins one for both rendering and the expected color rather than depending on what
+        // the terminal running the test reports.
         let terminal_bg = (0, 0, 0);
-        with_test_default_colors(
+        let expected_surface = with_test_default_colors(
             DefaultColors {
                 fg: (204, 204, 204),
                 bg: terminal_bg,
             },
-            || terminal.draw(|frame| render(frame, &app)).unwrap(),
+            || {
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                user_message_bg(terminal_bg)
+            },
         );
 
         let buffer = terminal.backend().buffer();
@@ -341,8 +345,7 @@ mod tests {
         // the draft row sitting on bare terminal background.
         let surface = buffer.cell((0, draft)).unwrap().bg;
         assert_eq!(
-            surface,
-            user_message_bg(terminal_bg),
+            surface, expected_surface,
             "the band lifts off the terminal background"
         );
         let band = composer_rows(&app, 12);
