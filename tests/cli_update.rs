@@ -98,6 +98,8 @@ sys.exit(1)
     let tools = root.join("tools");
     std::fs::create_dir(&tools).unwrap();
     std::os::unix::fs::symlink("/usr/bin/tar", tools.join("tar")).unwrap();
+    // GNU tar launches gzip through PATH; keep it available without exposing other host tools.
+    std::os::unix::fs::symlink("/usr/bin/gzip", tools.join("gzip")).unwrap();
     std::fs::write(tools.join("curl"), r#"#!/usr/bin/python3
 import sys, os, shutil
 if '--output' in sys.argv:
